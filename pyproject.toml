@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protobus"
+version = "1.1.1"
+description = "The Protobus micro-services framework - Python port"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Ariel Laub", email = "ariel@laub.co.il"}
+]
+keywords = ["micro services", "bus", "amqp", "rabbitmq", "protobuf", "scalable"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "aio-pika>=9.0.0",
+    "protobuf>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ArielLaub/protobus-py"
+Repository = "https://github.com/ArielLaub/protobus-py"
+Issues = "https://github.com/ArielLaub/protobus-py/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["protobus*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
