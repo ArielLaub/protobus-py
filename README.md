@@ -151,6 +151,10 @@ Run it:
 python sample/combatGame/game_runner.py
 ```
 
+## Cross-Language Compatibility
+
+This library is fully wire-compatible with the original [TypeScript Protobus](https://github.com/ArielLaub/protobus). Services written in Python and TypeScript can communicate seamlessly on the same message bus, thanks to Protocol Buffers' language-agnostic serialization format.
+
 ## Original Project
 
 This is the Python port of [Protobus](https://github.com/ArielLaub/protobus) (TypeScript). The original project provides identical functionality for Node.js/TypeScript environments.
