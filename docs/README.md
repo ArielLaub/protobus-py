@@ -25,12 +25,17 @@ New to Protobus? Start here:
 - [Troubleshooting](troubleshooting.md) - Common issues and solutions
 - [Known Issues](known-issues.md) - Current limitations
 
+## CLI Tools
+
+- [CLI Tools](cli.md) - Generate types and service stubs from .proto files
+
 ## API Reference
 
 Detailed documentation for each component:
 
 - [Context](api/context.md) - Connection management and initialization
 - [MessageService](api/message-service.md) - Building RPC services
+- [RunnableService](api/runnable-service.md) - Services with lifecycle management
 - [ServiceProxy](api/service-proxy.md) - Calling remote services
 - [ServiceCluster](api/service-cluster.md) - Managing multiple services
 - [Events](api/events.md) - Publishing and subscribing to events

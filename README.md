@@ -4,6 +4,20 @@ A lightweight, scalable microservices message bus for Python. Leverages RabbitMQ
 
 > **Note:** This is the official Python port of [Protobus](https://github.com/ArielLaub/protobus), originally written in TypeScript. The API and architecture are designed to be as close to the original as possible.
 
+## Why Protobus?
+
+Unlike transport-agnostic frameworks that abstract away the message broker, Protobus **embraces RabbitMQ's native capabilities** directly. We leverage topic exchanges, routing keys, competing consumers, dead-letter queues, and message persistence - rather than re-implementing routing logic at the application level.
+
+### RabbitMQ-Native Approach
+
+**Message Routing**: By delegating routing to RabbitMQ's Erlang runtime instead of your Python process, Protobus eliminates the double-processing that transport-agnostic frameworks impose. The broker handles competing consumers, topic-based routing, and dead-letter queues natively.
+
+**Binary Serialization**: Protocol Buffers provide 3-10x smaller payloads than JSON, with compile-time type safety and built-in backward compatibility. No more runtime schema guessing or JSON parsing overhead.
+
+### Polyglot Advantage
+
+Since Protobus uses standard Protobuf schemas and AMQP protocol, implementing clients in other languages is straightforward. Currently available in **TypeScript/Node.js** and **Python**, with Java, Go, or Rust implementations requiring minimal effort.
+
 ## Features
 
 - **RPC Communication**: Request-response pattern over message queues
@@ -12,6 +26,8 @@ A lightweight, scalable microservices message bus for Python. Leverages RabbitMQ
 - **Message Retry**: Automatic retry with dead-letter queue (DLQ) support
 - **Custom Types**: Extensible type system (BigInt, Timestamp built-in)
 - **Async/Await**: Built on asyncio and aio-pika for modern Python
+- **CLI Tools**: Generate types and service stubs from .proto files
+- **Lifecycle Management**: RunnableService with graceful shutdown handling
 
 ## Requirements
 
@@ -43,16 +59,12 @@ docker-compose up -d
 ### 2. Create a Service
 
 ```python
-from protobus import Context, MessageService
+from protobus import RunnableService, Context
 
-class CalculatorService(MessageService):
+class CalculatorService(RunnableService):
     @property
     def service_name(self) -> str:
         return "calculator.MathService"
-
-    @property
-    def proto_file_name(self) -> str:
-        return "calculator.proto"
 
     async def add(self, data: dict, actor: str, correlation_id: str) -> dict:
         return {"result": data["a"] + data["b"]}
@@ -68,23 +80,11 @@ import asyncio
 from protobus import Context
 
 async def main():
-    # Initialize context
     ctx = Context()
     await ctx.init("amqp://guest:guest@localhost:5672/")
 
-    # Create and start service
-    service = CalculatorService(ctx)
-    ctx.factory.parse("", service.service_name)
-    await service.init()
-
-    print("Calculator service running...")
-
-    # Keep running
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        await ctx.close()
+    # Start with lifecycle management (handles SIGINT/SIGTERM)
+    await CalculatorService.start(ctx, CalculatorService)
 
 asyncio.run(main())
 ```
@@ -115,18 +115,44 @@ async def main():
 asyncio.run(main())
 ```
 
+## CLI Tools
+
+Protobus includes CLI tools for code generation:
+
+```bash
+# Generate Python types from .proto files
+protobus generate
+
+# Generate a service stub
+protobus generate:service calculator.MathService
+
+# Show project setup instructions
+protobus init
+```
+
+Configure in `pyproject.toml`:
+
+```toml
+[tool.protobus]
+protoDir = "./proto"
+typesOutput = "./types/proto.py"
+servicesDir = "./services"
+```
+
 ## Documentation
 
 - [Getting Started](docs/getting-started.md) - Installation and first service
 - [Architecture](docs/architecture.md) - System design and components
 - [Configuration](docs/configuration.md) - Environment variables and options
 - [Message Flow](docs/message-flow.md) - How messages move through the system
+- [CLI Tools](docs/cli.md) - Code generation commands
 - [Troubleshooting](docs/troubleshooting.md) - Common issues and solutions
 
 ### API Reference
 
 - [Context](docs/api/context.md) - Connection management
 - [MessageService](docs/api/message-service.md) - Building services
+- [RunnableService](docs/api/runnable-service.md) - Services with lifecycle management
 - [ServiceProxy](docs/api/service-proxy.md) - Calling services
 - [ServiceCluster](docs/api/service-cluster.md) - Managing multiple services
 - [Events](docs/api/events.md) - Publish-subscribe patterns

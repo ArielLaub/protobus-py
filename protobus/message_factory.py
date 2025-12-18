@@ -47,6 +47,8 @@ class MessageFactory:
     Factory for building, parsing, and managing protobuf messages.
 
     Handles Protocol Buffer encoding/decoding with support for custom types.
+    Includes preprocessing cache optimization to skip object traversal for
+    messages without custom types.
     """
 
     def __init__(self):
@@ -56,6 +58,9 @@ class MessageFactory:
         self._service_descriptors: Dict[str, ServiceDescriptor] = {}
         self._initialized = False
         self._proto_sources: Dict[str, str] = {}
+        # Cache for checking if message types contain custom types
+        # This optimization skips unnecessary object traversal
+        self._has_custom_types_cache: Dict[str, bool] = {}
 
     @property
     def root(self) -> "MessageFactory":
@@ -119,19 +124,62 @@ class MessageFactory:
         """
         return self._service_descriptors.get(name)
 
+    def _check_has_custom_types(self, data: Any) -> bool:
+        """
+        Check if data contains any custom type fields.
+
+        This is used for cache invalidation and optimization decisions.
+
+        Args:
+            data: Data to check
+
+        Returns:
+            True if data contains custom types
+        """
+        if data is None:
+            return False
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if is_custom_type(key):
+                    return True
+                if self._check_has_custom_types(value):
+                    return True
+            return False
+
+        if isinstance(data, list):
+            return any(self._check_has_custom_types(item) for item in data)
+
+        return False
+
     def _preprocess_for_encode(self, data: Any, type_name: Optional[str] = None) -> Any:
         """
         Preprocess data before encoding, handling custom types.
 
+        Uses caching to skip object traversal for messages without custom types.
+
         Args:
             data: Data to preprocess
-            type_name: Optional type name hint
+            type_name: Optional type name hint for caching
 
         Returns:
             Preprocessed data
         """
         if data is None:
             return data
+
+        # Check cache if type_name is provided
+        if type_name:
+            if type_name in self._has_custom_types_cache:
+                if not self._has_custom_types_cache[type_name]:
+                    # No custom types in this message type, return as-is
+                    return data
+            else:
+                # First time seeing this type, check if it has custom types
+                has_custom = self._check_has_custom_types(data)
+                self._has_custom_types_cache[type_name] = has_custom
+                if not has_custom:
+                    return data
 
         if isinstance(data, dict):
             result = {}
@@ -154,15 +202,24 @@ class MessageFactory:
         """
         Postprocess data after decoding, handling custom types.
 
+        Uses caching to skip object traversal for messages without custom types.
+
         Args:
             data: Data to postprocess
-            type_name: Optional type name hint
+            type_name: Optional type name hint for caching
 
         Returns:
             Postprocessed data
         """
         if data is None:
             return data
+
+        # Check cache if type_name is provided
+        if type_name:
+            if type_name in self._has_custom_types_cache:
+                if not self._has_custom_types_cache[type_name]:
+                    # No custom types in this message type, return as-is
+                    return data
 
         if isinstance(data, dict):
             result = {}
