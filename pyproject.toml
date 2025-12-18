@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "protobus"
-version = "1.1.1"
+version = "1.2.1"
 description = "The Protobus micro-services framework - Python port"
 readme = "README.md"
 license = {text = "MIT"}
@@ -37,6 +37,9 @@ dev = [
     "mypy>=1.0.0",
     "ruff>=0.1.0",
 ]
+
+[project.scripts]
+protobus = "protobus.cli.main:main"
 
 [project.urls]
 Homepage = "https://github.com/ArielLaub/protobus-py"

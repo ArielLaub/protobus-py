@@ -3,6 +3,10 @@ Protobus - A lightweight, scalable microservices message bus.
 
 Leverages RabbitMQ for message routing and load balancing, combined with
 Protocol Buffers for efficient, type-safe serialization.
+
+Unlike transport-agnostic frameworks, Protobus embraces RabbitMQ's native
+capabilities directly - topic exchanges, routing keys, competing consumers,
+dead-letter queues, and message persistence.
 """
 
 # Context and connection
@@ -19,6 +23,7 @@ from .message_factory import (
 
 # Services
 from .message_service import MessageService, MessageServiceOptions
+from .runnable_service import RunnableService
 from .proxied_service import ProxiedService
 from .service_proxy import ServiceProxy
 from .service_cluster import ServiceCluster
@@ -70,7 +75,7 @@ from .logger import Logger, ILogger, set_logger
 # Config
 from .config import Config
 
-__version__ = "1.1.1"
+__version__ = "1.2.1"
 
 __all__ = [
     # Context and connection
@@ -89,6 +94,7 @@ __all__ = [
     # Services
     "MessageService",
     "MessageServiceOptions",
+    "RunnableService",
     "ProxiedService",
     "ServiceProxy",
     "ServiceCluster",
