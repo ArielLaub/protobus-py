@@ -110,15 +110,17 @@ class Context:
         """Get the connection."""
         return self._connection
 
-    async def init(self, url: str) -> None:
+    async def init(self, url: str, proto_dirs: Optional[list] = None) -> None:
         """
         Initialize the context and connect to RabbitMQ.
 
         Args:
             url: AMQP connection URL
+            proto_dirs: Optional list of directories containing .proto files
+                        for binary protobuf encoding/decoding of inner messages
         """
         # Initialize the message factory
-        await self._factory.init()
+        await self._factory.init(root_paths=proto_dirs)
 
         # Connect to RabbitMQ
         await self._connection.connect(url)
