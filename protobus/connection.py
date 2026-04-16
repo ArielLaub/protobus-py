@@ -408,6 +408,10 @@ class Connection:
                             await message.ack()
 
                     except Exception as e:
+                        import traceback
+                        Logger.error(f"Handler error: {type(e).__name__}: {e}")
+                        Logger.error(f"Traceback: {traceback.format_exc()}")
+
                         if is_handled_error(e):
                             # Don't retry handled errors
                             Logger.debug(f"Handled error, not retrying: {e}")
@@ -461,10 +465,18 @@ class Connection:
         retry_queue_name = f"{message.routing_key}.retry"
         try:
             retry_exchange = await channel.get_exchange(Config.bus_exchange_name())
+            # Sanitize headers: ensure numeric values are ints (aio-pika strict typing)
+            sanitized_headers = {}
+            for k, v in headers.items():
+                if isinstance(v, str) and v.isdigit():
+                    sanitized_headers[k] = int(v)
+                else:
+                    sanitized_headers[k] = v
+
             await retry_exchange.publish(
                 Message(
                     body=message.body,
-                    headers=headers,
+                    headers=sanitized_headers,
                     correlation_id=message.correlation_id,
                     reply_to=message.reply_to,
                     expiration=str(retry_opts.retry_delay_ms),
