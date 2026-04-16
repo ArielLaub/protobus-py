@@ -60,8 +60,14 @@ class ServiceProxy:
         # If service definition is found, create typed methods
         if service:
             # Create methods from service definition
-            for method_name, method_desc in getattr(service, "methods", {}).items():
-                self._create_method(method_name)
+            # methods can be a dict (older protobuf) or a list-like sequence (newer protobuf)
+            methods = getattr(service, "methods", [])
+            if hasattr(methods, "items"):
+                for method_name, method_desc in methods.items():
+                    self._create_method(method_name)
+            else:
+                for method_desc in methods:
+                    self._create_method(method_desc.name)
         else:
             # Service not found in proto definitions
             # This is okay - methods will be created on demand via __getattr__
