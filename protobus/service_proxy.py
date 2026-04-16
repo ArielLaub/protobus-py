@@ -146,7 +146,13 @@ class ServiceProxy:
                     setattr(err, "code", response.error["code"])
                 raise err
 
-            return response.result.get("data") if response.result else None
+            if response.result is None:
+                return None
+            # Binary protobuf decode returns the inner message directly;
+            # legacy JSON format wraps in {"data": ...}
+            if isinstance(response.result, dict) and "data" in response.result and len(response.result) <= 2:
+                return response.result["data"]
+            return response.result
 
         self._methods[method_name] = proxy_method
         setattr(self, method_name, proxy_method)
