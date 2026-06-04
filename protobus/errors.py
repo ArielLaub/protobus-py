@@ -134,3 +134,24 @@ class MissingExchangeError(Exception):
 class ConnectionError(Exception):
     """General connection error."""
     pass
+
+
+# Streaming errors
+class StreamingError(Exception):
+    """Base class for streaming RPC errors."""
+    pass
+
+
+class StreamTimeoutError(StreamingError):
+    """Raised when no streaming chunk arrives within the idle timeout."""
+    pass
+
+
+class StreamBackpressureError(StreamingError):
+    """Raised when the streaming reply queue overflows."""
+    pass
+
+
+class StreamClosedError(StreamingError):
+    """Raised when iterating a stream after it has been closed."""
+    pass

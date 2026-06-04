@@ -16,8 +16,10 @@ from .errors import (
 )
 from .logger import Logger
 
-# Type alias for message handlers
-MessageHandler = Callable[[bytes, str], Awaitable[Optional[bytes]]]
+# Type alias for message handlers.
+# Handlers may return bytes (unary reply), None (no reply), or an
+# AsyncIterator[bytes] (streaming reply — see docs/advanced/streaming.md).
+MessageHandler = Callable[[bytes, str, Dict[str, Any]], Awaitable[Any]]
 
 
 class BaseListener:

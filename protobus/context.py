@@ -1,7 +1,7 @@
 """Context module - central coordinator for Protobus messaging."""
 
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, AsyncIterator, Optional, Protocol
 
 from .connection import Connection, ConnectionOptions, IConnection
 from .event_dispatcher import EventDispatcher
@@ -48,6 +48,14 @@ class IContext(Protocol):
     async def publish_message(
         self, data: bytes, routing_key: str, rpc: bool = True
     ) -> Optional[bytes]:
+        ...
+
+    def publish_streaming_message(
+        self,
+        data: bytes,
+        routing_key: str,
+        stream_idle_timeout_ms: Optional[int] = None,
+    ) -> AsyncIterator[bytes]:
         ...
 
     async def publish_event(
@@ -160,6 +168,26 @@ class Context:
             raise RuntimeError("Context not initialized")
 
         return await self._message_dispatcher.publish(data, routing_key, rpc)
+
+    def publish_streaming_message(
+        self,
+        data: bytes,
+        routing_key: str,
+        stream_idle_timeout_ms: Optional[int] = None,
+    ) -> AsyncIterator[bytes]:
+        """
+        Publish a request expecting a streaming reply.
+
+        Returns an async iterator over raw response bytes. See
+        ``docs/advanced/streaming.md`` for protocol details and
+        ``ServiceProxy`` for the high-level user-facing API.
+        """
+        if not self._message_dispatcher:
+            raise RuntimeError("Context not initialized")
+
+        return self._message_dispatcher.publish_streaming(
+            data, routing_key, stream_idle_timeout_ms=stream_idle_timeout_ms
+        )
 
     async def publish_event(
         self,

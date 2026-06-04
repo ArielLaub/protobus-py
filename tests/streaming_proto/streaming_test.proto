@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package streaming_test;
+
+// Request shared by all streaming methods below.
+message TickRequest {
+    int32 count = 1;        // how many chunks the server should emit
+    int32 fail_at = 2;      // if > 0, server raises after emitting this many chunks
+    bool emit_nothing = 3;  // if true, server's generator yields zero chunks
+}
+
+// A single chunk in the stream.
+message Tick {
+    int32 seq = 1;          // server-assigned sequence number
+    string payload = 2;
+}
+
+// Terminal chunk carries cumulative metadata (mirrors the LLM stop_reason
+// pattern: last yield includes usage / stop info).
+message StreamSummary {
+    int32 total = 1;
+    string reason = 2;
+}
+
+// Counter.Service exercises every streaming code path the framework supports.
+service Counter {
+    // Unary baseline so we can confirm streaming is purely additive.
+    rpc add (AddRequest) returns (AddResponse);
+
+    // Server-streaming. The `stream` keyword on the response is what flips the
+    // framework into streaming mode for this method.
+    rpc tick (TickRequest) returns (stream Tick);
+}
+
+message AddRequest {
+    int32 a = 1;
+    int32 b = 2;
+}
+
+message AddResponse {
+    int32 sum = 1;
+}

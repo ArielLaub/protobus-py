@@ -1,8 +1,9 @@
 """Message service - base class for RPC-based microservices."""
 
+import inspect
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, Optional, Type
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Type
 
 from .connection import RetryOptions
 from .context import IContext
@@ -159,16 +160,27 @@ class MessageService(ABC):
             )
             raise
 
-    async def _on_message(self, data: bytes, correlation_id: str) -> Optional[bytes]:
+    async def _on_message(
+        self,
+        data: bytes,
+        correlation_id: str,
+        headers: Optional[dict] = None,
+    ) -> Any:
         """
         Handle incoming RPC requests.
+
+        Unary handlers (regular ``async def``) return ``bytes``. Streaming
+        handlers (``async def`` with ``yield``) return an async iterator of
+        ``bytes`` — the framework publishes each chunk as a separate reply
+        message with x-protobus-final headers. See docs/advanced/streaming.md.
 
         Args:
             data: Request data
             correlation_id: Request correlation ID
+            headers: Incoming AMQP headers (reserved for future tracing/auth use)
 
         Returns:
-            Response data
+            Response bytes (unary) or AsyncIterator[bytes] (streaming).
         """
         request = self._context.factory.decode_request(data)
         method_parts = request.method.split(".")
@@ -177,17 +189,23 @@ class MessageService(ABC):
 
         Logger.debug(f"Received request {request.method} ({correlation_id})")
 
+        # Look up the method on this service. We surface a not-found method
+        # as a regular error response — same for unary and streaming.
+        handler = getattr(self, method, None)
+
+        if handler is None or not callable(handler):
+            err = InvalidMethodError(f"Invalid service method {method}")
+            return self._context.factory.build_response(request.method, err)
+
+        # Streaming path: handler is an async-generator function. Each yield
+        # gets published as a separate reply chunk by connection._publish_stream_reply.
+        if inspect.isasyncgenfunction(handler):
+            return self._stream_responses(handler, request, correlation_id)
+
+        # Unary path (existing behavior)
         try:
-            # Look up the method on this service
-            handler = getattr(self, method, None)
-
-            if handler is None or not callable(handler):
-                raise InvalidMethodError(f"Invalid service method {method}")
-
-            # Call the method
             result = handler(request.data, request.actor, correlation_id)
 
-            # Handle both sync and async methods
             if hasattr(result, "__await__"):
                 result = await result
             elif hasattr(result, "then"):
@@ -209,3 +227,28 @@ class MessageService(ABC):
                 Logger.error("null error received")
 
             return self._context.factory.build_response(request.method, error)
+
+    async def _stream_responses(
+        self,
+        handler: Callable[..., AsyncIterator[Any]],
+        request: Any,
+        correlation_id: str,
+    ) -> AsyncIterator[bytes]:
+        """
+        Wrap a user async-generator handler so each yielded chunk is encoded
+        into a ResponseContainer before being published.
+
+        An exception inside the generator becomes a terminal error response —
+        the connection layer publishes it with x-protobus-final=true so the
+        client's iterator raises.
+        """
+        method = request.method
+        try:
+            async for chunk in handler(request.data, request.actor, correlation_id):
+                yield self._context.factory.build_response(method, chunk)
+        except Exception as error:
+            Logger.error(
+                getattr(error, "stack", None)
+                or getattr(error, "message", str(error))
+            )
+            yield self._context.factory.build_response(method, error)

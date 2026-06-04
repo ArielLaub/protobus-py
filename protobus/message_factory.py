@@ -261,6 +261,9 @@ class MessageFactory:
         self._proto_dirs: List[str] = []
         # Cache for method -> (request_type_name, response_type_name)
         self._method_types: Dict[str, tuple] = {}
+        # Cache of whether a method is server-streaming.
+        # Populated lazily by is_streaming_method().
+        self._streaming_methods: Dict[str, bool] = {}
         # Cache for checking if message types contain custom types
         self._has_custom_types_cache: Dict[str, bool] = {}
 
@@ -341,6 +344,46 @@ class MessageFactory:
             pass
 
         return None
+
+    def is_streaming_method(self, method: str) -> bool:
+        """
+        Return True if the given fully-qualified method is declared as
+        server-streaming in its .proto file.
+
+        Uses the standard gRPC `stream` keyword on the response type, which
+        protoc surfaces as `MethodDescriptor.server_streaming = true`.
+
+        Args:
+            method: Fully-qualified method name (e.g. "Llm.Service.completeStream")
+
+        Returns:
+            True if the method's response type is declared `stream`, else False.
+        """
+        if method in self._streaming_methods:
+            return self._streaming_methods[method]
+
+        if not self._service_pool:
+            return False
+
+        parts = method.rsplit(".", 1)
+        if len(parts) != 2:
+            return False
+
+        service_full = parts[0]
+        method_name = parts[1]
+
+        try:
+            svc_desc = self._service_pool.FindServiceByName(service_full)
+            for m in svc_desc.methods:
+                if m.name == method_name:
+                    is_stream = bool(getattr(m, "server_streaming", False))
+                    self._streaming_methods[method] = is_stream
+                    return is_stream
+        except KeyError:
+            pass
+
+        self._streaming_methods[method] = False
+        return False
 
     def _decode_inner_data(self, data_bytes: bytes, type_name: Optional[str] = None) -> Any:
         """Decode inner data bytes. Uses protobuf if type is known, else JSON fallback."""

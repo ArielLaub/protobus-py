@@ -27,7 +27,18 @@ from .errors import (
 from .logger import Logger
 
 # Type aliases
-MessageHandler = Callable[[bytes, str], Awaitable[Optional[bytes]]]
+#
+# A handler receives the message body, correlation_id, and the incoming AMQP
+# headers. It returns one of:
+#   - bytes  → a single (unary) reply published to message.reply_to
+#   - None   → no reply (one-way event, or handler chose to suppress)
+#   - AsyncIterator[bytes] → a streaming reply. Each yielded chunk is
+#     published to message.reply_to with x-protobus-final=false; the last
+#     chunk is published with x-protobus-final=true. See docs/advanced/streaming.md.
+MessageHandler = Callable[
+    [bytes, str, Dict[str, Any]],
+    Awaitable[Any],
+]
 
 
 @dataclass
@@ -390,12 +401,24 @@ class Connection:
             try:
                 async with message.process(ignore_processed=True):
                     correlation_id = message.correlation_id or ""
+                    incoming_headers = dict(message.headers or {})
 
                     try:
-                        result = await handler(message.body, correlation_id)
+                        result = await handler(
+                            message.body, correlation_id, incoming_headers
+                        )
 
-                        # Handle RPC reply
-                        if message.reply_to and result is not None:
+                        # Streaming reply: handler returned an async iterator.
+                        # Each yielded chunk is published to reply_to with the
+                        # standard streaming headers; the last gets x-protobus-final=true.
+                        if hasattr(result, "__aiter__") and not isinstance(
+                            result, (bytes, bytearray)
+                        ):
+                            await self._publish_stream_reply(
+                                channel, message, result
+                            )
+                        # Unary RPC reply
+                        elif message.reply_to and result is not None:
                             await channel.default_exchange.publish(
                                 Message(
                                     body=result,
@@ -440,6 +463,64 @@ class Connection:
 
         consumer_tag = await queue.consume(process_message, no_ack=not late_ack)
         return consumer_tag
+
+    async def _publish_stream_reply(
+        self,
+        channel: AbstractChannel,
+        message: AbstractIncomingMessage,
+        chunks: Any,
+    ) -> None:
+        """
+        Publish a streaming reply on a single AMQP reply queue.
+
+        Consumes the async iterator `chunks` (each yielding already-encoded
+        response bytes), publishing each chunk to ``message.reply_to`` with the
+        same ``correlation_id`` as the incoming request. All chunks but the
+        last carry ``x-protobus-final=false``; the last carries ``x-protobus-final=true``.
+
+        If the iterator yields no chunks at all, publishes a single empty
+        terminal message so the client knows the stream ended.
+
+        See ``docs/advanced/streaming.md`` for the protocol details.
+        """
+        if not message.reply_to:
+            # Nothing to reply to; drain the iterator to clean up.
+            try:
+                async for _ in chunks:
+                    pass
+            except Exception:
+                pass
+            return
+
+        async def _publish_one(body: bytes, seq: int, final: bool) -> None:
+            await channel.default_exchange.publish(
+                Message(
+                    body=body,
+                    correlation_id=message.correlation_id,
+                    headers={
+                        Config.HEADER_FINAL: bool(final),
+                        Config.HEADER_SEQ: int(seq),
+                    },
+                ),
+                routing_key=message.reply_to,
+            )
+
+        # Look-ahead by one chunk so we can mark the last as final without
+        # an extra empty terminal message.
+        seq = 0
+        buffered: Optional[bytes] = None
+
+        async for chunk in chunks:
+            if buffered is not None:
+                await _publish_one(buffered, seq=seq, final=False)
+                seq += 1
+            buffered = chunk
+
+        if buffered is not None:
+            await _publish_one(buffered, seq=seq, final=True)
+        else:
+            # Empty stream — single terminal so the client iterator can end.
+            await _publish_one(b"", seq=0, final=True)
 
     async def _retry_message(
         self,

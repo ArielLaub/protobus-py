@@ -55,8 +55,14 @@ class EventListener(BaseListener):
             handler: Optional default handler (typically not used for events)
             queue_name: Queue name (empty for anonymous queue)
         """
-        # Create our own handler that routes to registered event handlers
-        async def event_handler(data: bytes, correlation_id: str) -> Optional[bytes]:
+        # Create our own handler that routes to registered event handlers.
+        # `headers` is part of the MessageHandler signature but events don't
+        # currently use it — kept for shape compatibility with RPC handlers.
+        async def event_handler(
+            data: bytes,
+            correlation_id: str,
+            headers: Optional[dict] = None,
+        ) -> Optional[bytes]:
             try:
                 event = self._message_factory.decode_event(data)
                 event_type = event.type

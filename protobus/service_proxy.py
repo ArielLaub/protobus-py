@@ -1,6 +1,6 @@
 """Service proxy for dynamic remote service method calls."""
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 from .context import IContext
 from .errors import (
@@ -82,6 +82,11 @@ class ServiceProxy:
         """
         Create a proxy method for a service method.
 
+        Branches at build time on whether the method is declared as
+        server-streaming in its .proto (the gRPC `stream` keyword on the
+        response type). Streaming methods return an AsyncIterator; unary
+        methods return a coroutine that awaits a single response.
+
         Args:
             method_name: Name of the method to create
 
@@ -89,6 +94,9 @@ class ServiceProxy:
             The proxy method
         """
         method_full_name = f"{self._service_name}.{method_name}"
+
+        if self._context.factory.is_streaming_method(method_full_name):
+            return self._create_streaming_method(method_name)
 
         async def proxy_method(
             request_message: Any,
@@ -157,6 +165,85 @@ class ServiceProxy:
         self._methods[method_name] = proxy_method
         setattr(self, method_name, proxy_method)
         return proxy_method
+
+    def _create_streaming_method(self, method_name: str) -> Callable[..., Any]:
+        """
+        Create a proxy method that returns an AsyncIterator of decoded chunks.
+
+        The returned function is an async-generator function — callers iterate
+        it with ``async for``. Internally it publishes one request and drains
+        the streaming reply queue, decoding each chunk's ResponseContainer.
+        A terminal chunk carrying an error raises out of the iteration.
+        """
+        method_full_name = f"{self._service_name}.{method_name}"
+
+        async def streaming_proxy_method(
+            request_message: Any,
+            actor: Optional[str] = None,
+            *,
+            stream_idle_timeout_ms: Optional[int] = None,
+        ) -> AsyncIterator[Any]:
+            try:
+                buffer = self._context.factory.build_request(
+                    method_full_name, request_message, actor
+                )
+            except Exception as error:
+                Logger.error(
+                    f"Failed building streaming request for {method_full_name} "
+                    f"from {request_message}\n{error}"
+                )
+                raise InvalidRequestError("Failed parsing message")
+
+            chunk_iter = self._context.publish_streaming_message(
+                buffer,
+                f"REQUEST.{method_full_name}",
+                stream_idle_timeout_ms=stream_idle_timeout_ms,
+            )
+
+            try:
+                async for response_data in chunk_iter:
+                    try:
+                        response = self._context.factory.decode_response(response_data)
+                    except Exception as error:
+                        Logger.error(str(error))
+                        raise InvalidResponseError(
+                            f"Failed parsing streaming chunk for {method_full_name}"
+                        )
+
+                    # Errors arrive as terminal chunks with response.error set.
+                    if response.error:
+                        err = Exception(response.error.get("message", "Unknown error"))
+                        if response.error.get("code"):
+                            setattr(err, "code", response.error["code"])
+                        raise err
+
+                    # Same unwrapping rule as the unary path: legacy JSON shape
+                    # wraps in {"data": ...}; protobuf decode returns the inner
+                    # message directly.
+                    result = response.result
+                    if result is None:
+                        continue
+                    if (
+                        isinstance(result, dict)
+                        and "data" in result
+                        and len(result) <= 2
+                    ):
+                        yield result["data"]
+                    else:
+                        yield result
+            finally:
+                # If the caller breaks out, this closes the underlying
+                # dispatcher iterator and releases the pending-streams slot.
+                aclose = getattr(chunk_iter, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:
+                        pass
+
+        self._methods[method_name] = streaming_proxy_method
+        setattr(self, method_name, streaming_proxy_method)
+        return streaming_proxy_method
 
     def __getattr__(self, name: str) -> Any:
         """

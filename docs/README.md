@@ -42,6 +42,7 @@ Detailed documentation for each component:
 
 ## Advanced Topics
 
+- [Streaming RPC](advanced/streaming.md) - Server-streaming responses (`rpc foo (Req) returns (stream Chunk)`)
 - [Error Handling](advanced/error-handling.md) - Retries, DLQ, and HandledError
 - [Custom Logger](advanced/custom-logger.md) - Integrating with your logging system
 - [Custom Types](advanced/custom-types.md) - Extending the type system

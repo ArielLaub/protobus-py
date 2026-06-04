@@ -21,6 +21,7 @@ Since Protobus uses standard Protobuf schemas and AMQP protocol, implementing cl
 ## Features
 
 - **RPC Communication**: Request-response pattern over message queues
+- **Server Streaming**: `rpc foo (Req) returns (stream Chunk)` — multi-chunk responses with `async for` ergonomics. See [streaming docs](docs/advanced/streaming.md).
 - **Event System**: Publish-subscribe with topic-based routing and wildcards
 - **Auto-Reconnection**: Exponential backoff with jitter for resilient connections
 - **Message Retry**: Automatic retry with dead-letter queue (DLQ) support
@@ -159,6 +160,7 @@ servicesDir = "./services"
 
 ### Advanced Topics
 
+- [Streaming RPC](docs/advanced/streaming.md) - Server-streaming responses
 - [Error Handling](docs/advanced/error-handling.md) - Retries and DLQ
 - [Custom Logger](docs/advanced/custom-logger.md) - Logging integration
 - [Custom Types](docs/advanced/custom-types.md) - Extending the type system
