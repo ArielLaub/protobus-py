@@ -75,7 +75,7 @@ from .logger import Logger, ILogger, set_logger
 # Config
 from .config import Config
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 __all__ = [
     # Context and connection
