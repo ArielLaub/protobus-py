@@ -9,7 +9,11 @@ from aio_pika.abc import AbstractChannel, AbstractExchange
 
 from .callback_listener import CallbackListener
 from .config import Config
-from .connection import IConnection
+from .connection import (
+    IConnection,
+    release_amqp_resources,
+    schedule_amqp_release,
+)
 from .errors import (
     DisconnectedError,
     NotConnectedError,
@@ -56,16 +60,24 @@ class MessageDispatcher:
         self._connection = connection
         self._channel: Optional[AbstractChannel] = None
         self._exchange: Optional[AbstractExchange] = None
-        self._callback_listener: Optional[CallbackListener] = None
+        # Built once, here. Building it per reconnect leaked a channel, an
+        # exclusive queue and a consumer each time — and because the discarded
+        # listener stayed subscribed to the connection's reconnection events it
+        # kept opening more channels, turning a linear leak into O(N^2).
+        self._callback_listener: CallbackListener = CallbackListener(connection)
         self._pending_callbacks: Dict[str, asyncio.Future] = {}
         # correlation_id -> queue of streaming chunks. Replies for streaming
         # calls land here; the consuming async iterator drains them.
         self._pending_streams: Dict[str, asyncio.Queue] = {}
         self._is_initialized = False
+        self._is_closed = False
 
-        # Set up connection event handlers
-        self._connection.on("reconnected", self._on_reconnected)
-        self._connection.on("disconnected", self._on_disconnected)
+        # Set up connection event handlers. Bound refs are stored so close()
+        # can unregister exactly these callbacks (TS parity).
+        self._bound_on_reconnected = self._on_reconnected
+        self._bound_on_disconnected = self._on_disconnected
+        self._connection.on("reconnected", self._bound_on_reconnected)
+        self._connection.on("disconnected", self._bound_on_disconnected)
 
     @property
     def is_initialized(self) -> bool:
@@ -74,11 +86,23 @@ class MessageDispatcher:
 
     async def init(self) -> None:
         """Initialize the message dispatcher."""
+        if self._is_initialized:
+            return
         await self._setup_channel()
         self._is_initialized = True
 
     async def _setup_channel(self) -> None:
-        """Set up the channel and callback listener."""
+        """
+        Set up the dispatcher's own channel and, on first call, its callback
+        listener.
+
+        Also called on reconnect, so the previous channel is closed first. The
+        CallbackListener is *not* rebuilt: it restores itself through its own
+        inherited reconnection handler, including re-binding its (newly
+        generated) callback queue to the callbacks exchange.
+        """
+        await self._teardown_channel()
+
         self._channel = await self._connection.open_channel()
 
         # Declare the main exchange
@@ -88,20 +112,32 @@ class MessageDispatcher:
             ExchangeType.TOPIC,
         )
 
-        # Set up callback listener for RPC responses
-        self._callback_listener = CallbackListener(self._connection)
-        await self._callback_listener.init(self._on_result, "")
+        # init()/start() are idempotent, so this is a no-op on reconnect.
+        if not self._callback_listener.is_initialized:
+            await self._callback_listener.init(self._on_result, "")
+            await self._callback_listener.start()
 
-        # Bind the callback queue to the callback exchange
-        if self._callback_listener._queue and self._callback_listener._exchange:
-            await self._connection.bind_queue(
-                self._callback_listener._queue,
-                self._callback_listener._exchange,
-                self._callback_listener.callback_queue,
-            )
-
-        await self._callback_listener.start()
         Logger.debug("MessageDispatcher initialized")
+
+    async def _teardown_channel(self) -> None:
+        """Best-effort release of the dispatcher's own channel."""
+        channel = self._channel
+        self._channel = None
+        self._exchange = None
+        await release_amqp_resources(channel)
+
+    async def close(self) -> None:
+        """Detach from the connection and release the dispatcher's resources."""
+        if self._is_closed:
+            return
+        self._is_closed = True
+
+        self._connection.off("reconnected", self._bound_on_reconnected)
+        self._connection.off("disconnected", self._bound_on_disconnected)
+
+        await self._callback_listener.close()
+        await self._teardown_channel()
+        Logger.debug("MessageDispatcher closed")
 
     async def _on_result(
         self,
@@ -277,6 +313,9 @@ class MessageDispatcher:
 
     async def _on_reconnected(self) -> None:
         """Handle reconnection event."""
+        if not self._is_initialized or self._is_closed:
+            return
+
         Logger.debug("MessageDispatcher reconnecting...")
         try:
             await self._setup_channel()
@@ -305,5 +344,9 @@ class MessageDispatcher:
                 pass
         self._pending_streams.clear()
 
+        # Release rather than merely forget: an event delivered while the
+        # connection is still up would otherwise strand a live channel.
+        channel = self._channel
         self._channel = None
         self._exchange = None
+        schedule_amqp_release(channel)

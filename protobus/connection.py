@@ -132,6 +132,70 @@ class IConnection(Protocol):
     def on(self, event: str, callback: Callable[..., Any]) -> None:
         ...
 
+    def off(self, event: str, callback: Callable[..., Any]) -> None:
+        ...
+
+
+async def release_amqp_resources(
+    channel: Optional[AbstractChannel] = None,
+    queue: Optional[AbstractQueue] = None,
+    consumer_tag: Optional[str] = None,
+) -> None:
+    """
+    Best-effort release of AMQP objects. Never raises.
+
+    Used by every component that re-creates its channel on reconnection.
+    Failures are expected and uninteresting: the usual reason to release a
+    channel is that the connection carrying it has already gone away.
+    """
+    if consumer_tag and queue is not None:
+        try:
+            await queue.cancel(consumer_tag)
+        except Exception as e:
+            Logger.debug(f"Could not cancel consumer {consumer_tag}: {e}")
+
+    if channel is not None:
+        try:
+            await channel.close()
+        except Exception as e:
+            Logger.debug(f"Could not close channel: {e}")
+
+
+# Fire-and-forget cleanup tasks are kept referenced here: asyncio only holds a
+# weak reference to a running task, so a task nobody references can be garbage
+# collected mid-await and silently abandon the cleanup.
+_pending_releases: "set[asyncio.Task[None]]" = set()
+
+
+def _spawn_release(coro: Any) -> None:
+    """Run a cleanup coroutine on the running loop, if there is one."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        return
+    task = loop.create_task(coro)
+    _pending_releases.add(task)
+    task.add_done_callback(_pending_releases.discard)
+
+
+def schedule_amqp_release(
+    channel: Optional[AbstractChannel] = None,
+    queue: Optional[AbstractQueue] = None,
+    consumer_tag: Optional[str] = None,
+) -> None:
+    """
+    Fire-and-forget ``release_amqp_resources``.
+
+    The 'disconnected' event is delivered synchronously, so state has to be
+    cleared without awaiting; the cleanup itself is scheduled on the running
+    loop. Without a running loop there is nothing to schedule and nothing to
+    leak.
+    """
+    if channel is None and consumer_tag is None:
+        return
+    _spawn_release(release_amqp_resources(channel, queue, consumer_tag))
+
 
 class Connection:
     """
@@ -170,6 +234,28 @@ class Connection:
         if event not in self._event_handlers:
             self._event_handlers[event] = []
         self._event_handlers[event].append(callback)
+
+    def off(self, event: str, callback: Callable[..., Any]) -> None:
+        """
+        Unregister a previously registered event handler.
+
+        Without this, every listener and dispatcher ever attached to the
+        connection stayed subscribed to 'reconnected'/'disconnected' for the
+        lifetime of the process and kept re-opening AMQP resources long after
+        it had been discarded. Unknown handlers are ignored.
+        """
+        handlers = self._event_handlers.get(event)
+        if not handlers:
+            return
+        try:
+            handlers.remove(callback)
+        except ValueError:
+            return
+        if not handlers:
+            del self._event_handlers[event]
+
+    # TS parity: `protobus` (Node) exposes this as removeListener().
+    remove_listener = off
 
     def _emit(self, event: str, *args: Any) -> None:
         """Emit an event to all registered handlers."""
@@ -214,26 +300,70 @@ class Connection:
             raise
 
     def _on_connection_closed(
-        self, connection: AbstractConnection, exception: Optional[Exception]
+        self, connection: AbstractConnection, exception: Optional[BaseException]
     ) -> None:
         """Handle connection closed event."""
         if self._is_closing:
+            return
+
+        # Only the connection we are currently using drives our state. A
+        # superseded connection must never be able to reset it or start
+        # another reconnect loop.
+        if connection is not self._connection:
+            Logger.debug("Ignoring close callback from a superseded connection")
             return
 
         self._is_connected = False
         Logger.warn("Connection to RabbitMQ lost")
         self._emit("disconnected")
 
-        if not self._is_reconnecting and not self._is_closing:
-            self._reconnect_task = asyncio.create_task(self._reconnect())
+        if self._is_closing or self._is_reconnecting:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            # A reconnect loop is already running; a second one would open a
+            # second connection and leak the first.
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect())
+
+    def _release_connection(self, connection: Optional[AbstractConnection]) -> None:
+        """
+        Detach from a connection we are done with and close it.
+
+        Detaching happens synchronously — that is what stops a superseded
+        connection from resurrecting itself (aio-pika's robust connections
+        re-establish on their own, bringing their channels and consumers back
+        with them) and from driving another reconnect. The close itself is
+        fire-and-forget so a hung close cannot stall reconnection.
+        """
+        if connection is None:
+            return
+
+        try:
+            connection.close_callbacks.remove(self._on_connection_closed)
+        except Exception as e:
+            Logger.debug(f"Could not detach close callback: {e}")
+
+        async def _close() -> None:
+            try:
+                await connection.close()
+            except Exception as e:
+                Logger.debug(f"Could not close superseded connection: {e}")
+
+        _spawn_release(_close())
 
     async def _reconnect(self) -> None:
         """Attempt to reconnect with exponential backoff."""
         if not self._url or self._is_closing:
             return
+        if self._is_reconnecting:
+            return
 
         self._is_reconnecting = True
         delay = self._options.initial_reconnect_delay_ms
+
+        # Let go of the dead connection before opening its replacement.
+        self._release_connection(self._connection)
+        self._connection = None
 
         for attempt in range(1, self._options.max_reconnect_attempts + 1):
             self._emit("reconnecting", attempt, self._options.max_reconnect_attempts)
