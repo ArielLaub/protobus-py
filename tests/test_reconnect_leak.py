@@ -216,6 +216,27 @@ class TestListenerReconnectLeak:
             f"{RECONNECT_CYCLES} reconnects"
         )
 
+    async def test_bare_reconnected_event_does_not_strand_a_live_channel(
+        self, connection
+    ):
+        """
+        `reconnected` fires unconditionally, without a preceding `disconnected`
+        too. Here the previous channel is still *live*, so re-setup has to close
+        it rather than just overwrite the reference.
+        """
+        listener = CallbackListener(connection)
+        await listener.init(_noop_handler, "")
+        await listener.start()
+
+        for _ in range(RECONNECT_CYCLES):
+            await connection.emit("reconnected")
+
+        assert len(connection.open_channels) == 1, (
+            f"stranded channels: {len(connection.open_channels)} open after "
+            f"{RECONNECT_CYCLES} bare reconnected events"
+        )
+        assert len(connection.consumers) == 1
+
     async def test_reconnect_before_init_opens_nothing(self, connection):
         """An un-initialized listener must not react to reconnection at all."""
         CallbackListener(connection)
@@ -303,6 +324,21 @@ class TestMessageDispatcherReconnectLeak:
 
         assert connection.handler_count("reconnected") == baseline
         assert connection.handler_count("disconnected") == baseline
+
+    async def test_bare_reconnected_event_does_not_strand_a_live_channel(
+        self, connection
+    ):
+        dispatcher = MessageDispatcher(connection)
+        await dispatcher.init()
+
+        for _ in range(RECONNECT_CYCLES):
+            await connection.emit("reconnected")
+
+        assert len(connection.open_channels) == 2, (
+            f"stranded channels: {len(connection.open_channels)} open after "
+            f"{RECONNECT_CYCLES} bare reconnected events"
+        )
+        assert len(connection.consumers) == 1
 
     async def test_reconnect_before_init_opens_nothing(self, connection):
         MessageDispatcher(connection)
