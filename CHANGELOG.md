@@ -32,10 +32,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   survives a reconnect instead of only working because the dispatcher happened
   to rebuild it.
 
+- **Reconnection could deadlock itself under a flapping broker.** `_emit`
+  dispatches handlers with `create_task`, so a second `reconnected` arriving
+  while the first re-setup was still awaiting a round-trip ran concurrently on
+  the same object; interleaved, the two re-setups each left the other's channel
+  and consumer behind. Channel setup is now serialised per component.
+- **A dispatcher whose callback listener failed to restore reported success.**
+  `is_initialized` stays `True` once set, so the dispatcher skipped re-init
+  while the callback queue was gone, and every later RPC published `reply_to`
+  at a deleted queue and timed out forever. The dispatcher now gates on a new
+  `BaseListener.is_ready` and re-drives the listener's `restore()`;
+  `publish()` / `publish_streaming()` check readiness too.
+- **A hung channel close could block recovery permanently.** Releases run on
+  the restore path and are now bounded by `RELEASE_TIMEOUT_S` (5s).
+- `close()` now fails pending RPCs and streams instead of leaving callers to
+  wait out the full timeout — it detaches the handler that used to do that.
+- `_emit` iterates a copy of the handler list, so a handler that unsubscribes
+  itself no longer causes the next one to be skipped.
+- Handler tasks created by `_emit` are strongly referenced, for the same reason
+  the cleanup tasks are: asyncio holds only a weak reference to a running task.
+- A connection that was opened but then failed to wire up is released rather
+  than abandoned.
+- `init()` after `close()` raises instead of silently doing nothing.
+
 ### Added
 
 - `Connection.off(event, callback)` (alias `remove_listener`, matching TS
   `protobus`) — there was previously no way to unregister an event handler.
+  Handlers are detached through `detach_listener()`, which tolerates an
+  `IConnection` implemented against 1.4.0 that has no `off()`, so upgrading
+  stays drop-in.
+- `BaseListener.is_ready` (does it hold usable AMQP objects *right now*, as
+  opposed to `is_initialized`) and `BaseListener.restore()`.
 - `MessageDispatcher.close()` and `EventDispatcher.close()`, mirroring TS
   v1.1.2. `Context.close()` now calls them before closing the connection.
 - `release_amqp_resources()` / `schedule_amqp_release()` in `protobus.connection`
@@ -44,13 +72,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`max_reconnect_attempts` is now an escalation threshold, not a give-up
+  point.** The reconnect loop keeps retrying at `max_reconnect_delay_ms` and
+  emits the `error` event exactly once when the budget is exhausted. Before
+  this release the loop stopped there — which was survivable only because the
+  abandoned connection healed itself, i.e. because of the leak. With that leak
+  fixed, giving up would leave the process permanently mute after any outage
+  longer than the budget (under three minutes on the defaults). Verified
+  against a real broker: a 12s outage with a 2-attempt budget never recovered
+  before, and recovers now.
 - `BaseListener.init()`, `MessageDispatcher.init()` and `EventDispatcher.init()`
   are idempotent, and `_on_reconnected()` is a no-op for a component that was
   never initialized or has been closed (TS parity).
 
 ### Notes
 
-- Tests: 70/70 pass (55 existing + 15 new reconnection-leak regression tests).
+- Tests: 82/82 pass (55 existing + 27 new reconnection-leak regression tests).
   The new tests use a counting fake connection and need no broker.
 - Version stays in the 1.4.x line deliberately. This is a bug fix; the port has
   not had the security-and-stability audit that TS `protobus` 2.0 represents, so
