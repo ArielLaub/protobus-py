@@ -50,7 +50,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Notes
 
-- Tests: 68/68 pass (55 existing + 13 new reconnection-leak regression tests).
+- Tests: 70/70 pass (55 existing + 15 new reconnection-leak regression tests).
   The new tests use a counting fake connection and need no broker.
 - Version stays in the 1.4.x line deliberately. This is a bug fix; the port has
   not had the security-and-stability audit that TS `protobus` 2.0 represents, so
