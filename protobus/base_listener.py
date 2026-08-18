@@ -11,11 +11,13 @@ from .connection import (
     Connection,
     IConnection,
     RetryOptions,
+    detach_listener,
     release_amqp_resources,
     schedule_amqp_release,
 )
 from .errors import (
     AlreadyStartedError,
+    ConnectionError,
     MissingExchangeError,
     NotConnectedError,
     NotInitializedError,
@@ -77,6 +79,13 @@ class BaseListener:
         self._was_started = False
         self._is_closed = False
 
+        # Serialises channel setup. A flapping broker can deliver a second
+        # 'reconnected' while the first re-setup is still awaiting a round-trip,
+        # and _emit dispatches handlers with create_task, so the two would
+        # otherwise interleave and each leave the other's channel and consumer
+        # behind. _setup_channel/_teardown_channel assume the caller holds this.
+        self._setup_lock = asyncio.Lock()
+
         # Set up connection event handlers. The bound refs are stored so close()
         # can unregister exactly these callbacks (TS parity: _boundOnReconnected).
         self._bound_on_reconnected = self._on_reconnected
@@ -104,6 +113,17 @@ class BaseListener:
         """Check if the listener was ever started."""
         return self._was_started
 
+    @property
+    def is_ready(self) -> bool:
+        """
+        Whether the listener currently holds usable AMQP objects.
+
+        Distinct from is_initialized, which stays True once set even if a
+        later restore failed. Anything that depends on this listener's queue
+        existing right now must check this, not is_initialized.
+        """
+        return self._channel is not None and self._queue is not None
+
     async def init(
         self,
         handler: MessageHandler,
@@ -116,19 +136,25 @@ class BaseListener:
             handler: Message handler function
             queue_name: Queue name (empty for anonymous queue)
         """
-        if self._is_initialized:
-            return
+        if self._is_closed:
+            raise ConnectionError(
+                "Listener has been closed and cannot be re-initialized"
+            )
 
         if not self._exchange_name:
             raise MissingExchangeError("Exchange name not set")
 
-        self._handler = handler
-        self._queue_name = queue_name
-        self._configured_queue_name = queue_name
-        self._is_anonymous = not queue_name
+        async with self._setup_lock:
+            if self._is_initialized:
+                return
 
-        await self._setup_channel()
-        self._is_initialized = True
+            self._handler = handler
+            self._queue_name = queue_name
+            self._configured_queue_name = queue_name
+            self._is_anonymous = not queue_name
+
+            await self._setup_channel()
+            self._is_initialized = True
 
     async def _setup_channel(self) -> None:
         """
@@ -238,14 +264,27 @@ class BaseListener:
         self._is_closed = True
 
         # Detach first: a reconnect racing with close() must not resurrect us.
-        self._connection.off("reconnected", self._bound_on_reconnected)
-        self._connection.off("disconnected", self._bound_on_disconnected)
+        detach_listener(self._connection, "reconnected", self._bound_on_reconnected)
+        detach_listener(
+            self._connection, "disconnected", self._bound_on_disconnected
+        )
 
-        await self._teardown_channel()
+        # An in-flight re-setup holds the lock; wait for it so we tear down the
+        # channel it opened rather than leaving it behind.
+        async with self._setup_lock:
+            await self._teardown_channel()
         Logger.debug(f"Closed listener for queue: {self._queue_name}")
 
     async def _on_reconnected(self) -> None:
         """Handle reconnection event."""
+        await self.restore()
+
+    async def restore(self) -> None:
+        """
+        Rebuild channel, queue, bindings and consumer against the current
+        connection. Safe to call concurrently and safe to call again after a
+        previous attempt failed.
+        """
         if not self._is_initialized or self._is_closed:
             # Never initialized (or already closed): nothing to restore, and
             # opening a channel here is a pure leak.
@@ -253,30 +292,40 @@ class BaseListener:
 
         Logger.debug(f"Reconnected, reinitializing listener: {self._queue_name}")
 
-        try:
-            await self._setup_channel()
+        async with self._setup_lock:
+            # Re-check: close() may have run while we waited for the lock.
+            if self._is_closed:
+                return
 
-            # Rebind all routing keys
-            if self._queue and self._exchange:
-                for routing_key in self._bindings:
-                    await self._connection.bind_queue(
-                        self._queue, self._exchange, routing_key
+            try:
+                await self._setup_channel()
+
+                # Rebind all routing keys
+                if self._queue and self._exchange:
+                    for routing_key in self._bindings:
+                        await self._connection.bind_queue(
+                            self._queue, self._exchange, routing_key
+                        )
+                        Logger.debug(f"Rebound: {routing_key}")
+
+                # Resume consumption if we were started
+                if (
+                    self._was_started
+                    and self._handler
+                    and self._channel
+                    and self._queue
+                ):
+                    self._consumer_tag = await self._connection.consume(
+                        self._channel,
+                        self._queue,
+                        self._handler,
+                        late_ack=self._late_ack,
+                        max_concurrent=self._max_concurrent,
                     )
-                    Logger.debug(f"Rebound: {routing_key}")
+                    Logger.debug(f"Resumed consuming: {self._queue_name}")
 
-            # Resume consumption if we were started
-            if self._was_started and self._handler and self._channel and self._queue:
-                self._consumer_tag = await self._connection.consume(
-                    self._channel,
-                    self._queue,
-                    self._handler,
-                    late_ack=self._late_ack,
-                    max_concurrent=self._max_concurrent,
-                )
-                Logger.debug(f"Resumed consuming: {self._queue_name}")
-
-        except Exception as e:
-            Logger.error(f"Error during reconnection: {e}")
+            except Exception as e:
+                Logger.error(f"Error during reconnection: {e}")
 
     def _on_disconnected(self) -> None:
         """

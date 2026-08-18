@@ -59,6 +59,10 @@ class FakeExchange:
     def __init__(self, name: str, channel: FakeChannel):
         self.name = name
         self.channel = channel
+        self.published: List[Any] = []
+
+    async def publish(self, message: Any, routing_key: str = "") -> None:
+        self.published.append((message, routing_key))
 
 
 class FakeQueue:
@@ -102,6 +106,7 @@ class FakeConnection:
     # --- Connection surface -------------------------------------------------
 
     async def open_channel(self) -> FakeChannel:
+        await asyncio.sleep(0)  # a real open_channel is a broker round-trip
         channel = FakeChannel(self._next_channel)
         self._next_channel += 1
         self.channels.append(channel)
@@ -110,6 +115,7 @@ class FakeConnection:
     async def ensure_exchange(
         self, channel: FakeChannel, name: str, exchange_type: Any = None
     ) -> FakeExchange:
+        await asyncio.sleep(0)
         return FakeExchange(name, channel)
 
     async def ensure_queue(
@@ -118,6 +124,7 @@ class FakeConnection:
         name: str,
         arguments: Optional[Dict[str, Any]] = None,
     ) -> FakeQueue:
+        await asyncio.sleep(0)
         if not name:
             # Mirrors the broker: an anonymous queue gets a fresh generated name.
             name = f"amq.gen-{self._next_queue}"
@@ -132,6 +139,7 @@ class FakeConnection:
     async def bind_queue(
         self, queue: FakeQueue, exchange: FakeExchange, routing_key: str
     ) -> None:
+        await asyncio.sleep(0)
         self.bindings.append(f"{queue.name}:{exchange.name}:{routing_key}")
 
     async def consume(
@@ -143,6 +151,7 @@ class FakeConnection:
         max_concurrent: Optional[int] = None,
         retry_options: Any = None,
     ) -> str:
+        await asyncio.sleep(0)
         tag = f"ctag-{self._next_consumer}"
         self._next_consumer += 1
         self.consumers[tag] = queue.name
@@ -500,3 +509,306 @@ class TestConnectionReconnectLeak:
         assert len(created) == 2, (
             f"{len(created) - 1} reconnects were started for one disconnect"
         )
+
+
+class TestConcurrentReconnect:
+    """
+    `Connection._emit` dispatches coroutine handlers with `create_task`, so a
+    second `reconnected` arriving while the first re-setup is still awaiting a
+    broker round-trip runs *concurrently* on the same object. A flapping broker
+    — the condition that produced the original incident — is exactly when that
+    happens. Two interleaved re-setups must still converge on one channel and
+    one consumer, not leave the loser's behind.
+    """
+
+    async def test_listener_converges_on_one_channel_and_consumer(self, connection):
+        listener = CallbackListener(connection)
+        await listener.init(_noop_handler, "")
+        await listener.start()
+
+        await asyncio.gather(listener._on_reconnected(), listener._on_reconnected())
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert len(connection.open_channels) == 1, (
+            f"concurrent reconnects left {len(connection.open_channels)} channels open"
+        )
+        assert len(connection.consumers) == 1, (
+            f"concurrent reconnects left {len(connection.consumers)} consumers live"
+        )
+
+    async def test_dispatcher_converges_on_its_two_channels(self, connection):
+        dispatcher = MessageDispatcher(connection)
+        await dispatcher.init()
+
+        await asyncio.gather(dispatcher._on_reconnected(), dispatcher._on_reconnected())
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert len(connection.open_channels) == 2, (
+            f"concurrent reconnects left {len(connection.open_channels)} channels open"
+        )
+        assert len(connection.consumers) == 1
+
+
+class TestReviewFindings:
+    """
+    Regressions found reviewing the leak fix itself. Each one is a way the fix
+    could have traded a leak for an outage.
+    """
+
+    # --- the reconnect loop must never give up permanently -------------------
+
+    async def test_reconnect_keeps_retrying_past_the_attempt_budget(
+        self, monkeypatch
+    ):
+        """
+        Releasing the superseded connection removed aio-pika's accidental
+        self-healing, so exhausting the attempt budget used to mean the process
+        served nothing until it was restarted. A broker outage longer than the
+        budget must still be survivable.
+        """
+        import protobus.connection as connection_module
+        from protobus.connection import Connection, ConnectionOptions
+
+        made: List[FakeRobustConnection] = []
+        failures = {"left": 4}
+
+        async def fake_connect_robust(url: str, **kwargs: Any) -> FakeRobustConnection:
+            if failures["left"] > 0:
+                failures["left"] -= 1
+                raise OSError("broker is down")
+            conn = FakeRobustConnection(url)
+            made.append(conn)
+            return conn
+
+        monkeypatch.setattr(
+            connection_module.aio_pika, "connect_robust", fake_connect_robust
+        )
+
+        errors: List[Any] = []
+        conn = Connection(
+            ConnectionOptions(
+                max_reconnect_attempts=2,
+                initial_reconnect_delay_ms=1,
+                max_reconnect_delay_ms=1,
+                jitter_percent=0.0,
+            )
+        )
+        conn.on("error", lambda e: errors.append(e))
+        conn._url = "amqp://guest:guest@localhost:5672/"
+
+        await conn._reconnect()
+
+        assert conn.is_connected, "gave up permanently after the attempt budget"
+        assert len(errors) == 1, (
+            f"the exhausted budget must be surfaced exactly once, got {len(errors)}"
+        )
+
+    # --- fire-and-forget handler tasks must be referenced --------------------
+
+    async def test_emit_keeps_a_strong_reference_to_handler_tasks(self):
+        """
+        `_emit` turns coroutine handlers into tasks. asyncio only holds a weak
+        reference to a running task, so an untracked one can be collected
+        mid-await — which would abandon a reconnect half-done.
+        """
+        from protobus.connection import Connection
+
+        conn = Connection()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_handler() -> None:
+            started.set()
+            await release.wait()
+
+        conn.on("reconnected", slow_handler)
+        conn._emit("reconnected")
+        await started.wait()
+
+        tracked = [
+            t
+            for t in getattr(conn, "_pending_emissions", ())
+            if not t.done()
+        ]
+        assert tracked, "in-flight handler task is not referenced anywhere"
+
+        release.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    # --- a handler that unsubscribes itself must not skip the next one -------
+
+    async def test_emit_survives_a_handler_that_unsubscribes_itself(self):
+        from protobus.connection import Connection
+
+        conn = Connection()
+        seen: List[str] = []
+
+        def first() -> None:
+            seen.append("first")
+            conn.off("reconnected", first)
+
+        def second() -> None:
+            seen.append("second")
+
+        conn.on("reconnected", first)
+        conn.on("reconnected", second)
+        conn._emit("reconnected")
+
+        assert seen == ["first", "second"], f"handler was skipped: {seen}"
+
+    # --- an attach failure must not strand the connection it just opened -----
+
+    async def test_failed_callback_attach_releases_the_connection(
+        self, monkeypatch
+    ):
+        import protobus.connection as connection_module
+        from protobus.connection import Connection, ConnectionOptions
+
+        made: List[FakeRobustConnection] = []
+
+        class HostileCallbacks(FakeCallbackCollection):
+            """Mirrors aio-pika freezing close_callbacks on a dead connection."""
+
+            def add(self, callback: Callable[..., Any]) -> None:
+                raise RuntimeError("collection is frozen")
+
+        async def fake_connect_robust(url: str, **kwargs: Any) -> FakeRobustConnection:
+            conn = FakeRobustConnection(url)
+            if not made:
+                conn.close_callbacks = HostileCallbacks()
+            made.append(conn)
+            return conn
+
+        monkeypatch.setattr(
+            connection_module.aio_pika, "connect_robust", fake_connect_robust
+        )
+
+        conn = Connection(
+            ConnectionOptions(
+                max_reconnect_attempts=3,
+                initial_reconnect_delay_ms=1,
+                max_reconnect_delay_ms=1,
+                jitter_percent=0.0,
+            )
+        )
+        conn._url = "amqp://guest:guest@localhost:5672/"
+
+        await conn._reconnect()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert made[0].closed, (
+            "a connection opened by a failed attempt was left live and untracked"
+        )
+        assert conn.is_connected
+
+    # --- a hung release must not block recovery ------------------------------
+
+    async def test_a_hung_channel_close_does_not_block_re_setup(self, connection):
+        """
+        The old channel is released on the restore path. Awaiting a close that
+        never resolves would mean the listener never consumes again.
+        """
+        import protobus.connection as connection_module
+
+        monkeypatch_timeout = 0.05
+        original = connection_module.RELEASE_TIMEOUT_S
+        connection_module.RELEASE_TIMEOUT_S = monkeypatch_timeout
+        try:
+            listener = CallbackListener(connection)
+            await listener.init(_noop_handler, "")
+            await listener.start()
+
+            async def never_returns() -> None:
+                await asyncio.Event().wait()
+
+            connection.open_channels[0].close = never_returns  # type: ignore[method-assign]
+
+            await asyncio.wait_for(listener._on_reconnected(), timeout=2)
+            assert listener._channel is not None, "re-setup never completed"
+        finally:
+            connection_module.RELEASE_TIMEOUT_S = original
+
+    # --- the dispatcher must not report ready with a broken callback queue ---
+
+    async def test_dispatcher_heals_a_callback_listener_that_failed_to_restore(
+        self, connection
+    ):
+        """
+        The dispatcher no longer rebuilds its CallbackListener, so if the
+        listener's own restore failed, `is_initialized` stays True while the
+        callback queue is gone — and every later RPC would publish reply_to at
+        a dead queue and time out forever.
+        """
+        dispatcher = MessageDispatcher(connection)
+        await dispatcher.init()
+
+        # Simulate the listener's own _on_reconnected having failed.
+        dispatcher._callback_listener._channel = None
+        dispatcher._callback_listener._queue = None
+
+        await dispatcher._on_reconnected()
+
+        assert dispatcher._callback_listener.is_ready, (
+            "dispatcher reported a successful reconnect with a dead callback queue"
+        )
+
+    async def test_publish_refuses_a_dead_callback_queue(self, connection):
+        from protobus.errors import NotConnectedError
+
+        dispatcher = MessageDispatcher(connection)
+        await dispatcher.init()
+        dispatcher._callback_listener._channel = None
+        dispatcher._callback_listener._queue = None
+
+        with pytest.raises(NotConnectedError):
+            await dispatcher.publish(b"payload", "REQUEST.x", rpc=True, timeout_ms=50)
+
+    # --- close() must not strand callers -------------------------------------
+
+    async def test_close_fails_pending_rpcs(self, connection):
+        from protobus.errors import DisconnectedError
+
+        dispatcher = MessageDispatcher(connection)
+        await dispatcher.init()
+
+        pending: asyncio.Future = asyncio.get_running_loop().create_future()
+        dispatcher._pending_callbacks["corr-1"] = pending
+
+        await dispatcher.close()
+
+        assert pending.done()
+        with pytest.raises(DisconnectedError):
+            pending.result()
+
+    # --- upgrading from 1.4.0 must not break a third-party IConnection -------
+
+    async def test_close_tolerates_a_connection_without_off(self):
+        """`off()` is new in 1.4.1; an external IConnection built against 1.4.0
+        has no such method and must not blow up on close."""
+
+        class LegacyConnection(FakeConnection):
+            off = None  # type: ignore[assignment]
+
+        legacy = LegacyConnection()
+        listener = CallbackListener(legacy)
+        await listener.init(_noop_handler, "")
+        await listener.start()
+
+        await listener.close()  # must not raise AttributeError/TypeError
+        assert legacy.open_channels == []
+
+    # --- re-initialising a closed component must be loud, not silent ---------
+
+    async def test_init_after_close_raises(self, connection):
+        from protobus.errors import ConnectionError as ProtobusConnectionError
+
+        listener = CallbackListener(connection)
+        await listener.init(_noop_handler, "")
+        await listener.close()
+
+        with pytest.raises(ProtobusConnectionError):
+            await listener.init(_noop_handler, "")

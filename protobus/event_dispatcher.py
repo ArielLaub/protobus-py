@@ -1,5 +1,6 @@
 """Event dispatcher for publishing events."""
 
+import asyncio
 import uuid
 from typing import Any, Optional
 
@@ -9,6 +10,7 @@ from aio_pika.abc import AbstractChannel, AbstractExchange
 from .config import Config
 from .connection import (
     IConnection,
+    detach_listener,
     release_amqp_resources,
     schedule_amqp_release,
 )
@@ -39,6 +41,13 @@ class EventDispatcher:
         self._is_initialized = False
         self._is_closed = False
 
+        # Serialises channel setup. A flapping broker can deliver a second
+        # 'reconnected' while the first re-setup is still awaiting a round-trip,
+        # and _emit dispatches handlers with create_task, so the two would
+        # otherwise interleave and each leave the other's channel and consumer
+        # behind. _setup_channel/_teardown_channel assume the caller holds this.
+        self._setup_lock = asyncio.Lock()
+
         # Set up connection event handlers. Bound refs are stored so close()
         # can unregister exactly these callbacks (TS parity).
         self._bound_on_reconnected = self._on_reconnected
@@ -53,10 +62,11 @@ class EventDispatcher:
 
     async def init(self) -> None:
         """Initialize the event dispatcher."""
-        if self._is_initialized:
-            return
-        await self._setup_channel()
-        self._is_initialized = True
+        async with self._setup_lock:
+            if self._is_initialized:
+                return
+            await self._setup_channel()
+            self._is_initialized = True
 
     async def _setup_channel(self) -> None:
         """
@@ -91,10 +101,13 @@ class EventDispatcher:
             return
         self._is_closed = True
 
-        self._connection.off("reconnected", self._bound_on_reconnected)
-        self._connection.off("disconnected", self._bound_on_disconnected)
+        detach_listener(self._connection, "reconnected", self._bound_on_reconnected)
+        detach_listener(
+            self._connection, "disconnected", self._bound_on_disconnected
+        )
 
-        await self._teardown_channel()
+        async with self._setup_lock:
+            await self._teardown_channel()
         Logger.debug("EventDispatcher closed")
 
     async def publish(
@@ -149,11 +162,14 @@ class EventDispatcher:
         """Handle reconnection event."""
         if self._is_initialized and not self._is_closed:
             Logger.debug("EventDispatcher reconnecting...")
-            try:
-                await self._setup_channel()
-                Logger.debug("EventDispatcher reconnected")
-            except Exception as e:
-                Logger.error(f"Error reconnecting EventDispatcher: {e}")
+            async with self._setup_lock:
+                if self._is_closed:
+                    return
+                try:
+                    await self._setup_channel()
+                    Logger.debug("EventDispatcher reconnected")
+                except Exception as e:
+                    Logger.error(f"Error reconnecting EventDispatcher: {e}")
 
     def _on_disconnected(self) -> None:
         """Handle disconnection event."""

@@ -136,13 +136,18 @@ class IConnection(Protocol):
         ...
 
 
+# A release runs on the recovery path, so it must be bounded: a cancel or close
+# that never resolves would mean the component never consumes again.
+RELEASE_TIMEOUT_S = 5.0
+
+
 async def release_amqp_resources(
     channel: Optional[AbstractChannel] = None,
     queue: Optional[AbstractQueue] = None,
     consumer_tag: Optional[str] = None,
 ) -> None:
     """
-    Best-effort release of AMQP objects. Never raises.
+    Best-effort, time-bounded release of AMQP objects. Never raises.
 
     Used by every component that re-creates its channel on reconnection.
     Failures are expected and uninteresting: the usual reason to release a
@@ -150,13 +155,13 @@ async def release_amqp_resources(
     """
     if consumer_tag and queue is not None:
         try:
-            await queue.cancel(consumer_tag)
+            await asyncio.wait_for(queue.cancel(consumer_tag), RELEASE_TIMEOUT_S)
         except Exception as e:
             Logger.debug(f"Could not cancel consumer {consumer_tag}: {e}")
 
     if channel is not None:
         try:
-            await channel.close()
+            await asyncio.wait_for(channel.close(), RELEASE_TIMEOUT_S)
         except Exception as e:
             Logger.debug(f"Could not close channel: {e}")
 
@@ -177,6 +182,38 @@ def _spawn_release(coro: Any) -> None:
     task = loop.create_task(coro)
     _pending_releases.add(task)
     task.add_done_callback(_pending_releases.discard)
+
+
+async def _close_quietly(connection: Any) -> None:
+    """Close a connection we are done with, tolerating any failure."""
+    try:
+        await connection.close()
+    except Exception as e:
+        Logger.debug(f"Could not close connection: {e}")
+
+
+def detach_listener(
+    connection: Any, event: str, callback: Callable[..., Any]
+) -> None:
+    """
+    Unregister a handler, tolerating a connection that predates off().
+
+    off() is new in 1.4.1 and IConnection is a structural Protocol, so an
+    external implementation written against 1.4.0 will not have it. Failing to
+    detach leaks a handler; raising would break close() outright, which is
+    worse.
+    """
+    off = getattr(connection, "off", None)
+    if not callable(off):
+        Logger.debug(
+            f"Connection {type(connection).__name__} has no off(); "
+            f"cannot detach '{event}' handler"
+        )
+        return
+    try:
+        off(event, callback)
+    except Exception as e:
+        Logger.debug(f"Could not detach '{event}' handler: {e}")
 
 
 def schedule_amqp_release(
@@ -216,6 +253,10 @@ class Connection:
         self._is_reconnecting = False
         self._is_closing = False
         self._event_handlers: Dict[str, List[Callable[..., Any]]] = {}
+        # Handler tasks are referenced for the same reason cleanup tasks are:
+        # asyncio holds only a weak reference to a running task, and the whole
+        # reconnection fix depends on these running to completion.
+        self._pending_emissions: "set[asyncio.Task[Any]]" = set()
         self._consumer_tags: Dict[str, asyncio.Task] = {}
         self._reconnect_task: Optional[asyncio.Task] = None
 
@@ -259,12 +300,16 @@ class Connection:
 
     def _emit(self, event: str, *args: Any) -> None:
         """Emit an event to all registered handlers."""
-        handlers = self._event_handlers.get(event, [])
+        # Copy: a handler is allowed to unsubscribe itself (or another) during
+        # emission now that off() exists, which would shift the live list.
+        handlers = list(self._event_handlers.get(event, []))
         for handler in handlers:
             try:
                 result = handler(*args)
                 if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+                    task = asyncio.create_task(result)
+                    self._pending_emissions.add(task)
+                    task.add_done_callback(self._pending_emissions.discard)
             except Exception as e:
                 Logger.error(f"Error in event handler for {event}: {e}")
 
@@ -343,13 +388,7 @@ class Connection:
         except Exception as e:
             Logger.debug(f"Could not detach close callback: {e}")
 
-        async def _close() -> None:
-            try:
-                await connection.close()
-            except Exception as e:
-                Logger.debug(f"Could not close superseded connection: {e}")
-
-        _spawn_release(_close())
+        _spawn_release(_close_quietly(connection))
 
     async def _reconnect(self) -> None:
         """Attempt to reconnect with exponential backoff."""
@@ -365,41 +404,62 @@ class Connection:
         self._release_connection(self._connection)
         self._connection = None
 
-        for attempt in range(1, self._options.max_reconnect_attempts + 1):
-            self._emit("reconnecting", attempt, self._options.max_reconnect_attempts)
-            Logger.info(
-                f"Reconnection attempt {attempt}/{self._options.max_reconnect_attempts}"
-            )
+        # max_reconnect_attempts is an ESCALATION threshold, not a give-up
+        # point. Closing the superseded connection removed aio-pika's
+        # accidental self-healing, so giving up here would leave the process
+        # permanently mute after any outage longer than the budget — which for
+        # the default options is under three minutes.
+        attempt = 0
+        escalated = False
+        try:
+            while not self._is_closing:
+                attempt += 1
+                self._emit(
+                    "reconnecting", attempt, self._options.max_reconnect_attempts
+                )
+                Logger.info(
+                    f"Reconnection attempt {attempt}"
+                    f"/{self._options.max_reconnect_attempts}"
+                )
 
-            try:
-                self._connection = await aio_pika.connect_robust(self._url)
-                self._is_connected = True
-                self._is_reconnecting = False
-                self._connection.close_callbacks.add(self._on_connection_closed)
-                Logger.info("Reconnected to RabbitMQ")
-                self._emit("reconnected")
-                return
-            except Exception as e:
-                Logger.warn(f"Reconnection attempt {attempt} failed: {e}")
+                connection = None
+                try:
+                    connection = await aio_pika.connect_robust(self._url)
+                    # Attach before publishing the new state: a connection we
+                    # cannot observe closing is worse than no connection.
+                    connection.close_callbacks.add(self._on_connection_closed)
+                    self._connection = connection
+                    self._is_connected = True
+                    Logger.info("Reconnected to RabbitMQ")
+                    self._emit("reconnected")
+                    return
+                except Exception as e:
+                    Logger.warn(f"Reconnection attempt {attempt} failed: {e}")
+                    if connection is not None and connection is not self._connection:
+                        # Opened, then failed to wire up. Do not abandon it.
+                        _spawn_release(_close_quietly(connection))
 
-                if attempt < self._options.max_reconnect_attempts:
-                    # Add jitter to prevent thundering herd
-                    jitter = random.uniform(
-                        -self._options.jitter_percent, self._options.jitter_percent
+                if attempt >= self._options.max_reconnect_attempts and not escalated:
+                    escalated = True
+                    error = ReconnectionError(
+                        f"Failed to reconnect after {attempt} attempts; "
+                        f"still retrying"
                     )
-                    actual_delay = delay * (1 + jitter)
-                    await asyncio.sleep(actual_delay / 1000)
-                    delay = min(
-                        delay * self._options.reconnect_backoff_multiplier,
-                        self._options.max_reconnect_delay_ms,
-                    )
+                    Logger.error(str(error))
+                    self._emit("error", error)
 
-        self._is_reconnecting = False
-        error = ReconnectionError(
-            f"Failed to reconnect after {self._options.max_reconnect_attempts} attempts"
-        )
-        Logger.error(str(error))
-        self._emit("error", error)
+                # Add jitter to prevent thundering herd
+                jitter = random.uniform(
+                    -self._options.jitter_percent, self._options.jitter_percent
+                )
+                actual_delay = delay * (1 + jitter)
+                await asyncio.sleep(actual_delay / 1000)
+                delay = min(
+                    delay * self._options.reconnect_backoff_multiplier,
+                    self._options.max_reconnect_delay_ms,
+                )
+        finally:
+            self._is_reconnecting = False
 
     async def close(self) -> None:
         """Close the connection."""
