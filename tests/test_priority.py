@@ -1090,6 +1090,16 @@ class TestEndToEnd:
         rate rather than the prefetch window. Hence the peak-in-flight
         assertion: if this test ever stops saturating, it must fail loudly
         rather than quietly measure something else.
+
+        Both ports missed this for the same reason, which is a shape worth
+        remembering: at prefetch 1 the precondition is FREE — holding one
+        message saturates a one-slot consumer by definition — so a test
+        written at the lowest value looks clean and only breaks its own
+        assumption when someone raises the parameter. The TypeScript port
+        measured the un-saturated case independently and got peak in-flight 2
+        as well, on a different runtime and AMQP client, so this is the shared
+        protobus design of not awaiting the consume callback rather than
+        anything aio-pika-specific.
         """
         bulk = 30
         ctx = Context()

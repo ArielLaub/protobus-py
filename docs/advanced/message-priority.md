@@ -164,7 +164,14 @@ Same setup, same 50-message backlog, but only the first delivery held:
 
 The `index 50` rows are not a counter-example to the law — they are measuring something
 else. The backlog was already gone. (Prefetch 1 still matches, because holding one message
-saturates a one-slot consumer by definition.)
+saturates a one-slot consumer by definition. That is worth noticing on its own: a parameter
+whose *lowest* value hides a precondition is one whose test looks clean until someone raises
+it. Both ports started at prefetch 1 and neither spotted the assumption.)
+
+The "peak in flight 2" figure is not an aio-pika detail. The TypeScript port measured the
+same scenario independently, on a different runtime with a different AMQP client, and got
+**peak in flight 2 as well** — so the behaviour comes from the shared protobus design of not
+awaiting the consume callback, not from either client library.
 
 This matters for anyone benchmarking it: **a fast handler measures the drain rate, not the
 prefetch window**, and will make the table above look wrong. It is not a bug and not a
