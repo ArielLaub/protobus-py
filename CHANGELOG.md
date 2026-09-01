@@ -74,13 +74,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `MessageServiceOptions` only `max_concurrent` is needed — `MessageService`
   sets `late_ack` itself.
 
-- **Port parity.** The TypeScript port gains the same feature in the same
-  release, with the same concepts and wire behaviour (`maxPriority` /
-  `priority`, the same three constants, the same validation range). One
-  harmless representational difference: amqplib omits the AMQP `priority`
-  property when unset, whereas aio-pika normalizes it to `0` — as it always
-  has, before this change. RabbitMQ treats absent and `0` identically, which is
-  pinned by a real-broker test.
+- **Port parity, verified across the wire.** The TypeScript port gains the same
+  feature in the same release, with the same concepts and wire behaviour
+  (`maxPriority` / `priority`, the same three constants, the same validation
+  range). The TS port's integration harness drove a Python server from a TS
+  client against a live broker and confirmed both halves that matter: a TS
+  `priority` is honoured by a Python `max_priority` queue (control message
+  handled at index 1 of 21, with the consumer already draining), and the two
+  ports emit an **identical queue argument set** — a TS service re-declares a
+  Python-created priority queue with no 406, while the negative control (a TS
+  service without `maxPriority`) is correctly rejected. The reverse direction,
+  Python publisher → TS consumer, has NOT been run and is not claimed.
+
+  Three deliberate divergences, all behaviourally invisible because RabbitMQ
+  cannot distinguish an absent priority from an explicit `0`: amqplib omits the
+  property when unset whereas aio-pika normalizes it to `0` (as it always has,
+  before this change); an explicit `priority=0` is forwarded by TS but folded
+  into the default path by Python, where the bytes are identical either way and
+  folding preserves compatibility with a third-party `IContext` predating the
+  parameter; and TS defaults its prefetch so it need only reject
+  `lateAck: false`, whereas Python has no default prefetch and rejects both.
+  See `docs/advanced/message-priority.md`.
 
 - Validation exists because neither underlying failure is usable as-is:
   aio-pika applies `int()` to a priority, so `1.5` would be silently stored as

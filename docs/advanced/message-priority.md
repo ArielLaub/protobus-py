@@ -198,20 +198,65 @@ Everything here is additive and opt-in, in both directions:
 | **New** service that does not pass `max_priority` | Declares its queue with the identical argument set as before. No migration, no 406. |
 | **New** client publishing a priority to an **old** (non-priority) queue | Accepted by the broker and ignored for ordering. No error, channel stays open. This is what lets clients be deployed before services. |
 | Old client calling a **new** priority-enabled service | Works. Its messages carry no explicit priority, which RabbitMQ treats as 0 — the same as `PRIORITY_NORMAL`. |
-| TypeScript publisher ↔ Python consumer (and vice versa) | Same wire behaviour. See below. |
+| TypeScript publisher → Python consumer | Verified end-to-end against a live broker. See [Cross-port verification](#cross-port-verification). |
 
-### A note on the Python/TypeScript wire difference
+### Cross-port verification
 
-The TypeScript port omits the AMQP `priority` property entirely when no priority is given.
-aio-pika does not offer that: it normalizes an unset priority to `0`
+Run by the TypeScript port's integration harness, which spawns a Python server from a
+sibling `protobus-py` checkout and drives it from a TS client. Two results:
+
+1. **TS publisher → Python consumer, priority queue.** A Python `MessageService` with
+   `max_concurrent=1, max_priority=2`; a TS `ServiceProxy` publishes 20 bulk at
+   `PRIORITY_NORMAL` then one at `PRIORITY_CONTROL`, with the Python handler already
+   draining and gated so the backlog is real. Handled order:
+   `["bulk-0", "CONTROL", "bulk-1", ...]` — control at index 1 of 21. A TS `priority` is
+   honoured by a Python `max_priority` queue.
+
+2. **Identical queue arguments.** Python declares the queue with `max_priority=2`; a TS
+   service with `maxPriority=2` then re-declares the same queue and initialises with no
+   406. Negative control in the same run: a TS service *without* `maxPriority` against that
+   queue gets `PRECONDITION_FAILED - inequivalent arg 'x-max-priority' ... received none but
+   current is the value '2' of type 'byte'`. So the two ports emit the same argument set,
+   and the check has teeth.
+
+**Not verified: Python publisher → TS consumer.** Expected to hold given (1) and (2), but
+it has not been run, and it is not claimed here.
+
+### Where the two ports deliberately differ
+
+Three places. All are behaviourally invisible, because **RabbitMQ cannot distinguish an
+absent priority from an explicit `0`** — pinned by a real-broker test that publishes one of
+each to a priority queue and asserts they keep their relative order while a priority-2
+message jumps both. They are listed so nobody re-derives them from a packet capture and
+concludes the ports disagree.
+
+**1. An unset priority on the wire.** The TypeScript port omits the AMQP `priority`
+property entirely. aio-pika does not offer that: it normalizes unset to `0`
 (`optional(priority, int, 0)`), so **protobus-py has always put `priority: 0` on every
-message**, long before this feature existed.
+message**, long before this feature existed. Not introduced here, and not fixable.
 
-This is a difference in the bytes, not in the behaviour. RabbitMQ treats an absent priority
-and an explicit `0` as the same lowest priority — pinned by a real-broker test that publishes
-one of each to a priority queue and asserts they keep their relative order while a
-priority-2 message jumps both. Nothing needs to be done about it; it is documented here so
-nobody re-derives it from a packet capture and thinks the ports disagree.
+**2. An explicit `priority=0` from the caller.** TypeScript forwards it; Python folds it
+into the same path as "not asked for". This one is a deliberate choice on each side rather
+than a constraint, and each side is right for its own language:
+
+- In Python the two paths emit *literally identical bytes* — aio-pika normalizes both to
+  `0` — so folding costs nothing observable and buys something real: `IContext` is a
+  `Protocol`, and a third-party context written before this parameter existed would raise
+  `TypeError` on an unexpected `priority` keyword. Forwarding a value that cannot change
+  the outcome, at the price of breaking those callers, is a bad trade.
+- In TypeScript, omitting and sending `0` *are* different bytes, and there is no equivalent
+  compatibility pressure — so faithfulness to what the caller actually passed wins.
+
+Since no option makes the bytes match for both cases, matching them for one case is not
+worth a behavioural difference in either port.
+
+**3. What each port has to reject.** TypeScript defaults its prefetch (`maxConcurrent || 1`,
+with `effectivePrefetch()` falling back to a positive config default), so `maxPriority` on
+its own is already safe there and only `lateAck: false` has to be refused. Python has no
+default prefetch — an unset `max_concurrent` means no QoS at all — so it refuses both. Giving
+Python a default prefetch would change delivery behaviour for *every* existing listener, not
+just priority-enabled ones; that is a far larger and riskier change than this feature should
+carry, and refusing is equally safe.
 
 ## Validation
 
