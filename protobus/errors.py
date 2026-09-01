@@ -106,9 +106,18 @@ class InvalidServiceNameError(Exception):
     pass
 
 
-class InvalidMethodError(Exception):
-    """Raised when a service method is invalid."""
-    pass
+class InvalidMethodError(HandledError):
+    """
+    Raised when a request names a method the receiving service does not declare.
+
+    A HandledError: naming a method that does not exist is deterministic, so
+    retrying the delivery cannot change the outcome. The caller is answered and
+    the delivery is dropped rather than put through the retry ladder and the
+    DLQ. Parity with TS protobus 6c9b12d.
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message, code or "INVALID_METHOD")
 
 
 class InvalidResultError(Exception):
@@ -136,9 +145,63 @@ class ConnectionError(Exception):
     pass
 
 
+class ProtocolError(HandledError):
+    """
+    Raised when an envelope or payload cannot be decoded.
+
+    A HandledError: the same bytes fail the same way every time, so the retry
+    ladder buys five broker operations and a DLQ entry for nothing while the
+    caller waits out its RPC timeout for a reply the retries were never going
+    to produce. Parity with TS protobus 6c9b12d.
+
+    The message never quotes the payload — a payload that failed to decode is
+    still a payload.
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message, code or "PROTOCOL_ERROR")
+
+
+class RpcTimeoutError(TimeoutError):
+    """
+    Raised when a unary RPC is not answered within the caller's deadline.
+
+    Distinct from the server-side message processing timeout: this is the
+    caller's budget for the whole round trip. Parity with TS protobus 908d5c8.
+    """
+    pass
+
+
+class PublishError(Exception):
+    """Base class for failures to get a message onto the bus."""
+    pass
+
+
+class UnroutableError(PublishError):
+    """
+    Raised when the broker returned a mandatory publish as unroutable.
+
+    A definite failure — the message reached the broker and was not enqueued
+    anywhere — so it is safe to retry. This is the failure that makes a service
+    with no consumers look like a timeout rather than an error.
+    """
+    pass
+
+
 # Streaming errors
 class StreamingError(Exception):
     """Base class for streaming RPC errors."""
+    pass
+
+
+class StreamSequenceError(StreamingError):
+    """
+    Raised when a streaming reply arrives with a gap in its sequence numbers.
+
+    A missing chunk would otherwise be delivered as a shorter but apparently
+    complete stream. Parity with TS protobus 1e829ad ("sequence gaps raise
+    instead of yielding a short stream").
+    """
     pass
 
 

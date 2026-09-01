@@ -6,6 +6,7 @@ from abc import abstractmethod
 from typing import Any, Callable, Optional, Type, TypeVar
 
 from .context import Context, IContext
+from .errors import MissingProtoError
 from .logger import Logger
 from .message_service import MessageService, MessageServiceOptions
 
@@ -121,6 +122,28 @@ class RunnableService(MessageService):
         await self.cleanup()
         Logger.info(f"Service {self.service_name} stopped")
 
+    @staticmethod
+    def _register_schema(context: IContext, service: "RunnableService") -> None:
+        """
+        Register the service's .proto with the factory.
+
+        A missing .proto is legitimate — services that speak JSON have none —
+        and registers an empty schema. Everything else is a real failure and is
+        raised: the previous bare ``except Exception`` swallowed a broken proto,
+        an unreadable file and a factory error alike, leaving a service that
+        came up looking healthy with no schema behind it.
+        """
+        try:
+            source = service.Proto
+        except MissingProtoError:
+            Logger.debug(
+                f"No .proto for {service.service_name}; registering an empty "
+                f"schema (JSON mode)"
+            )
+            source = ""
+
+        context.factory.parse(source, service.service_name)
+
     @classmethod
     async def start(
         cls: Type[T],
@@ -153,12 +176,7 @@ class RunnableService(MessageService):
         svc_class = service_class or cls
         service = svc_class(context, options)
 
-        # Parse the proto file
-        try:
-            context.factory.parse(service.Proto, service.service_name)
-        except Exception:
-            # Proto may not exist or be empty, which is fine for some services
-            context.factory.parse("", service.service_name)
+        cls._register_schema(context, service)
 
         # Initialize the service
         await service.init()
