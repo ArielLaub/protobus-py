@@ -8,9 +8,11 @@ Two things are under test and they pull in opposite directions:
 2. That priority is INVISIBLE unless asked for — a listener that does not opt
    in must declare its queue with byte-identical arguments to a listener from
    before this feature existed. Adding ``x-max-priority`` to a queue that
-   already exists is a 406 PRECONDITION_FAILED which closes the channel, and
-   protobus shares one connection across every listener in the process, so a
-   silent default would take a whole service down on upgrade.
+   already exists is a 406 PRECONDITION_FAILED, which closes that listener's
+   channel and stops it starting — so a silent default would stop every
+   already-deployed service from booting on upgrade. (It does NOT take down
+   other listeners on the same connection; that is measured in
+   test_a_406_does_not_take_down_other_listeners_on_the_connection.)
 
 Guarantee 2 is the reason most of the assertions here are about arguments
 being ABSENT rather than present.
@@ -120,7 +122,7 @@ class TestQueueDeclaration:
 
     async def test_listener_with_max_priority_sets_x_max_priority(self):
         conn = RecordingConnection()
-        listener = BaseListener(conn, max_priority=2)
+        listener = BaseListener(conn, late_ack=True, max_concurrent=1, max_priority=2)
         listener._exchange_name = "proto.bus"
         await listener.init(handler=lambda *a: None, queue_name="svc.Priority")
 
@@ -128,7 +130,9 @@ class TestQueueDeclaration:
 
     async def test_max_priority_combines_with_message_ttl(self):
         conn = RecordingConnection()
-        listener = BaseListener(conn, message_ttl_ms=60000, max_priority=2)
+        listener = BaseListener(
+            conn, late_ack=True, max_concurrent=1, message_ttl_ms=60000, max_priority=2
+        )
         listener._exchange_name = "proto.bus"
         await listener.init(handler=lambda *a: None, queue_name="svc.Both")
 
@@ -148,7 +152,7 @@ class TestQueueDeclaration:
 
     async def test_message_listener_threads_max_priority_through(self):
         conn = RecordingConnection()
-        listener = MessageListener(conn, max_priority=2)
+        listener = MessageListener(conn, late_ack=True, max_concurrent=1, max_priority=2)
         await listener.init(handler=lambda *a: None, queue_name="svc.Msg")
 
         assert declare_for("svc.Msg", conn)["arguments"] == {"x-max-priority": 2}
@@ -167,6 +171,8 @@ class TestQueueDeclaration:
         conn = RecordingConnection()
         listener = MessageListener(
             conn,
+            late_ack=True,
+            max_concurrent=1,
             retry_options=RetryOptions(max_retries=3, retry_delay_ms=5000),
             max_priority=2,
         )
@@ -179,6 +185,87 @@ class TestQueueDeclaration:
 
 
 # ==========================================================================
+# 1b. Priority is refused when it would silently do nothing
+#
+# Measured against a real broker, with 300 bulk messages arriving while the
+# consumer is already draining and one control message published after them:
+#
+#   max_concurrent=1, late_ack=True   -> control handled at position 92/301
+#   max_concurrent=1, late_ack=False  -> control handled at position 300/301
+#   max_concurrent=None               -> control handled at position 300/301
+#
+# i.e. without a REAL prefetch bound, priority does nothing at all — the broker
+# pushes the whole queue into the consumer's buffer and the control message is
+# handled dead last. RabbitMQ ignores QoS prefetch for auto-ack consumers, so
+# `max_concurrent` without `late_ack` is just as useless as no prefetch.
+#
+# That failure is invisible: the queue is correctly declared with
+# x-max-priority, an operator has done the drain/delete/recreate migration, and
+# nothing reports that the feature is inert. So it is refused at construction
+# instead.
+# ==========================================================================
+class TestPriorityRequiresABoundedPrefetch:
+    def test_max_priority_without_max_concurrent_is_refused(self):
+        with pytest.raises(InvalidPriorityError) as e:
+            BaseListener(RecordingConnection(), max_priority=2)
+        assert "max_concurrent" in str(e.value)
+
+    def test_max_priority_with_autoack_is_refused(self):
+        """max_concurrent alone is not enough — auto-ack ignores prefetch."""
+        with pytest.raises(InvalidPriorityError) as e:
+            BaseListener(RecordingConnection(), max_concurrent=10, max_priority=2)
+        assert "late_ack" in str(e.value)
+
+    def test_max_priority_with_a_real_prefetch_is_accepted(self):
+        listener = BaseListener(
+            RecordingConnection(), late_ack=True, max_concurrent=10, max_priority=2
+        )
+        assert listener._max_priority == 2
+
+    def test_no_priority_is_unaffected_by_any_of_this(self):
+        """The default path must not acquire a new way to fail."""
+        assert BaseListener(RecordingConnection())._max_priority is None
+        assert BaseListener(RecordingConnection(), max_concurrent=10) is not None
+        assert BaseListener(RecordingConnection(), late_ack=True) is not None
+
+    def test_service_options_priority_without_max_concurrent_is_refused(self):
+        class _Svc(MessageService):
+            @property
+            def service_name(self) -> str:
+                return "test.BadOpts"
+
+            @property
+            def proto_file_name(self) -> str:
+                return "test.proto"
+
+        class _Ctx:
+            connection = RecordingConnection()
+            factory = None
+
+        with pytest.raises(InvalidPriorityError):
+            _Svc(_Ctx(), MessageServiceOptions(max_priority=2))
+
+    def test_service_options_priority_with_max_concurrent_is_accepted(self):
+        class _Svc(MessageService):
+            @property
+            def service_name(self) -> str:
+                return "test.GoodOpts"
+
+            @property
+            def proto_file_name(self) -> str:
+                return "test.proto"
+
+        class _Ctx:
+            connection = RecordingConnection()
+            factory = None
+
+        # MessageService derives late_ack from max_concurrent, so this is
+        # all a user has to supply.
+        svc = _Svc(_Ctx(), MessageServiceOptions(max_concurrent=10, max_priority=2))
+        assert svc._listener._max_priority == 2
+
+
+# ==========================================================================
 # 2. Service options
 # ==========================================================================
 class TestServiceOptions:
@@ -186,7 +273,7 @@ class TestServiceOptions:
         assert MessageServiceOptions().max_priority is None
 
     def test_max_priority_is_carried(self):
-        assert MessageServiceOptions(max_priority=2).max_priority == 2
+        assert MessageServiceOptions(max_concurrent=1, max_priority=2).max_priority == 2
 
     async def test_service_options_reach_the_queue_declare(self):
         class _Svc(MessageService):
@@ -204,7 +291,7 @@ class TestServiceOptions:
             connection = conn
             factory = None
 
-        svc = _Svc(_Ctx(), MessageServiceOptions(max_priority=2))
+        svc = _Svc(_Ctx(), MessageServiceOptions(max_concurrent=1, max_priority=2))
         await svc._listener.init(handler=lambda *a: None, queue_name=svc.service_name)
 
         assert declare_for("test.PrioritySvc", conn)["arguments"] == {"x-max-priority": 2}
@@ -222,11 +309,15 @@ class TestValidation:
     @pytest.mark.parametrize("bad", [0, -1, 256, 300, 1.5, 2.0, "2", True])
     def test_bad_max_priority_is_rejected(self, bad):
         with pytest.raises(InvalidPriorityError):
-            BaseListener(RecordingConnection(), max_priority=bad)
+            BaseListener(
+                RecordingConnection(), late_ack=True, max_concurrent=1, max_priority=bad
+            )
 
     @pytest.mark.parametrize("good", [1, 2, 10, 255])
     def test_good_max_priority_is_accepted(self, good):
-        listener = BaseListener(RecordingConnection(), max_priority=good)
+        listener = BaseListener(
+            RecordingConnection(), late_ack=True, max_concurrent=1, max_priority=good
+        )
         assert listener._max_priority == good
 
     def test_none_max_priority_is_accepted_and_means_off(self):
@@ -239,7 +330,7 @@ class TestValidation:
         """
         conn = RecordingConnection()
         with pytest.raises(InvalidPriorityError):
-            BaseListener(conn, max_priority=300)
+            BaseListener(conn, late_ack=True, max_concurrent=1, max_priority=300)
         assert conn.queue_declares == []
 
     @pytest.mark.parametrize("bad", [-1, 256, 1.5, 2.0, "2", True])
@@ -404,11 +495,17 @@ class TestPublishPath:
         await proxy.init()
         await proxy.doThing({}, None, False)  # must not raise TypeError
 
-        # ...and asking for a priority against such a context fails loudly
-        # rather than silently dropping the priority on the floor. It surfaces
+        # PRIORITY_NORMAL is documented as identical to passing nothing, and
+        # aio-pika normalizes unset to 0 anyway — so forwarding it would take
+        # on this compatibility risk for zero behavioural benefit. It must
+        # take the same path as omitting it.
+        await proxy.doThing({}, None, False, priority=Config.PRIORITY_NORMAL)
+
+        # Asking for a priority that actually means something does fail
+        # loudly, rather than silently dropping it on the floor. It surfaces
         # as PublishMessageError because the proxy wraps dispatch failures.
         with pytest.raises(PublishMessageError):
-            await proxy.doThing({}, None, False, priority=2)
+            await proxy.doThing({}, None, False, priority=Config.PRIORITY_CONTROL)
 
     async def test_service_proxy_priority_is_keyword_only(self):
         """
@@ -440,6 +537,103 @@ class TestPublishPath:
         await proxy.init()
         with pytest.raises(TypeError):
             await proxy.doThing({}, None, False, 2)
+
+
+# ==========================================================================
+# 4b. Retry must not demote a message
+#
+# The broker preserves `priority` across a dead-letter hop, but protobus does
+# not lean on that for retries: Connection._retry_message RE-PUBLISHES the
+# message to <routing_key>.retry. Anything that publish does not copy is lost.
+# A control message that fails once and comes back as priority 0 would land
+# behind the entire bulk backlog — exactly the failure this feature exists to
+# prevent, and invisible unless something fails first.
+# ==========================================================================
+class _FakeIncoming:
+    def __init__(self, priority=None, headers=None):
+        self.body = b"payload"
+        self.headers = headers or {}
+        self.correlation_id = "cid-1"
+        self.reply_to = "reply.q"
+        self.routing_key = "REQUEST.svc.Thing.control"
+        self.priority = priority
+
+
+class _FakeChannel:
+    def __init__(self, exchange):
+        self._exchange = exchange
+        self.default_exchange = exchange
+        self.declared = []
+
+    async def get_exchange(self, name):
+        return self._exchange
+
+    async def declare_queue(self, name, durable=False, **kwargs):
+        self.declared.append(name)
+
+        class _Q:
+            pass
+
+        return _Q()
+
+
+class TestRetryPreservesPriority:
+    async def test_retry_republish_keeps_the_original_priority(self):
+        """
+        A control message that fails and retries must come back as control
+        traffic, not as bulk.
+        """
+        ex = _CapturingExchange()
+        ch = _FakeChannel(ex)
+        c = Connection()
+        c._is_connected = True
+
+        await c._retry_message(
+            ch,
+            _FakeIncoming(priority=Config.PRIORITY_CONTROL),
+            retry_count=0,
+            error=Exception("boom"),
+            retry_opts=RetryOptions(max_retries=3, retry_delay_ms=5000),
+        )
+
+        assert ex.messages, "nothing was republished to the retry queue"
+        assert ex.messages[0].priority == Config.PRIORITY_CONTROL
+
+    async def test_retry_republish_of_an_unprioritised_message_is_unchanged(self):
+        """The default path must not acquire a priority it never had."""
+        ex = _CapturingExchange()
+        ch = _FakeChannel(ex)
+        c = Connection()
+        c._is_connected = True
+
+        await c._retry_message(
+            ch,
+            _FakeIncoming(priority=None),
+            retry_count=0,
+            error=Exception("boom"),
+            retry_opts=RetryOptions(max_retries=3, retry_delay_ms=5000),
+        )
+
+        # 0 is aio-pika's normalization of "unset" — the same frame as before.
+        assert ex.messages[0].priority == 0
+
+    async def test_dlq_republish_keeps_the_original_priority(self):
+        """
+        The DLQ is a plain queue, so priority buys no ordering there — but
+        dropping it discards information about what the message was, which is
+        the one thing a DLQ exists to preserve.
+        """
+        ex = _CapturingExchange()
+        ch = _FakeChannel(ex)
+        c = Connection()
+        c._is_connected = True
+
+        await c._send_to_dlq(
+            ch, _FakeIncoming(priority=Config.PRIORITY_CONTROL), Exception("dead")
+        )
+
+        assert ex.messages, "nothing was published to the DLQ"
+        assert ex.messages[0].priority == Config.PRIORITY_CONTROL
 
 
 # ==========================================================================
@@ -781,6 +975,84 @@ class TestEndToEnd:
             assert got["REQUEST.test.WireSvc.bulk"] == 0
         finally:
             await observer_conn.close()
+            await ctx.close()
+
+    async def test_control_jumps_a_backlog_while_the_consumer_is_already_draining(self):
+        """
+        The scenario that actually matters, and the one
+        test_a_priority_listener_drains_control_traffic_first does NOT cover.
+
+        That test queues everything before consuming, and the broker pops a
+        queue in priority order regardless of prefetch — so it passes even with
+        no prefetch bound at all. The real case is a consumer already draining
+        when the bulk arrives, where anything already pushed to the client is
+        beyond reordering.
+
+        Made deterministic with a gate: prefetch is 1, and the handler blocks,
+        so exactly ONE bulk message is in flight and everything else is still
+        in the queue when the control message is published. The control
+        message must then come out second — behind the one already prefetched,
+        ahead of the other 49. That is precisely the guarantee the docs claim:
+        priority reorders the queue, not the prefetch buffer.
+        """
+        ctx = Context()
+        await ctx.init(RABBITMQ_URL)
+        queue_name = f"pbtest.caseb.{uuid.uuid4().hex[:8]}"
+        seen: List[str] = []
+        gate = asyncio.Event()
+        first_delivered = asyncio.Event()
+
+        async def handler(body: bytes, correlation_id: str, headers=None):
+            seen.append(body.decode())
+            first_delivered.set()
+            await gate.wait()
+            return None
+
+        listener = MessageListener(
+            ctx.connection,
+            late_ack=True,
+            max_concurrent=1,
+            retry_options=RetryOptions(max_retries=0),
+            max_priority=Config.RECOMMENDED_MAX_PRIORITY,
+        )
+        try:
+            await listener.init(handler, queue_name)
+            await listener.subscribe(f"REQUEST.{queue_name}.*")
+            await listener.start()
+
+            for i in range(50):
+                await ctx.publish_message(
+                    f"bulk{i}".encode(),
+                    f"REQUEST.{queue_name}.bulk",
+                    rpc=False,
+                    priority=Config.PRIORITY_NORMAL,
+                )
+
+            # One message is now in the handler and blocked; the rest are queued.
+            await asyncio.wait_for(first_delivered.wait(), timeout=10)
+
+            await ctx.publish_message(
+                b"control",
+                f"REQUEST.{queue_name}.control",
+                rpc=False,
+                priority=Config.PRIORITY_CONTROL,
+            )
+            await asyncio.sleep(0.5)  # let it land in the queue
+
+            gate.set()
+            for _ in range(200):
+                if len(seen) >= 51:
+                    break
+                await asyncio.sleep(0.1)
+
+            assert len(seen) == 51, seen
+            assert seen[0].startswith("bulk"), seen[:3]   # the prefetched one
+            assert seen[1] == "control", seen[:3]         # jumped the other 49
+        finally:
+            gate.set()
+            await listener.close()
+            ch = await ctx.connection.open_channel()
+            await ch.queue_delete(queue_name)
             await ctx.close()
 
     async def test_a_priority_listener_drains_control_traffic_first(self):

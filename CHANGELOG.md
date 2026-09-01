@@ -43,12 +43,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Re-declaring with the *same* `x-max-priority` is idempotent, so restarts
   after the migration are fine.
   Only the service queue needs it; `.retry` and `.DLQ` are deliberately left
-  alone, because a message keeps its priority across a dead-letter hop.
+  alone, because ordering there is by TTL expiry rather than priority.
+
+- **Retries and DLQ now carry the message's priority.**
+  `Connection._retry_message` re-publishes rather than relying on the broker's
+  dead-lettering, so it was silently dropping `priority` — a control message
+  that failed once came back at priority 0 and queued behind the whole bulk
+  backlog, which is the exact failure priority exists to prevent and is only
+  visible after something has already gone wrong. `_send_to_dlq` copies it too:
+  no ordering value on a plain queue, but a DLQ exists to preserve what the
+  message was. Anywhere protobus re-publishes instead of letting the broker
+  move a message, priority has to be carried by hand.
 
 - **Priority reorders the queue, not the consumers' prefetch buffers.** With
   prefetch `N` across `R` replicas, up to `N × R` messages can still sit ahead
   of a high-priority one. It shrinks the window by orders of magnitude; it does
   not eliminate it. Lower the prefetch if you need a tighter bound.
+
+- **`max_priority` requires `max_concurrent` (and `late_ack`), and is refused
+  without them.** With no prefetch bound the broker pushes the whole queue into
+  the consumer's buffer and priority does nothing whatsoever. Measured — 300
+  bulk messages arriving while the consumer is already draining, then one
+  control message: `max_concurrent=1, late_ack=True` handled it at position 92
+  of 301; `max_concurrent=1, late_ack=False` and `max_concurrent=None` both
+  handled it at position 300 of 301. `late_ack` matters because RabbitMQ
+  ignores QoS prefetch for auto-ack consumers. This raises
+  `InvalidPriorityError` at construction rather than warning, because the
+  failure is otherwise invisible: the queue is correctly declared, the operator
+  has done the migration, and the feature is simply inert. Via
+  `MessageServiceOptions` only `max_concurrent` is needed — `MessageService`
+  sets `late_ack` itself.
 
 - **Port parity.** The TypeScript port gains the same feature in the same
   release, with the same concepts and wire behaviour (`maxPriority` /
@@ -63,7 +87,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1`; an out-of-range value surfaces as a raw `struct.error` from the encoder;
   and an out-of-range `x-max-priority` is a channel-killing 406.
 
-- Tests: 106/106 pass (55 existing + 51 priority). The broker-backed ones need
+- Tests: 116/116 pass (55 existing + 61 priority). The broker-backed ones need
   a live RabbitMQ (`docker-compose up -d`).
 
 ## [1.4.0] — 2026-06-04

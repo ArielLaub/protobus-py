@@ -10,6 +10,7 @@ from .config import Config
 from .connection import Connection, IConnection, RetryOptions
 from .errors import (
     AlreadyStartedError,
+    InvalidPriorityError,
     MissingExchangeError,
     NotConnectedError,
     NotInitializedError,
@@ -77,6 +78,43 @@ class BaseListener:
         # would otherwise surface much later as a channel-killing 406 at
         # declare time, when there is nothing useful left to say about it.
         self._max_priority = validate_max_priority(max_priority)
+
+        # Priority is refused outright when it could not possibly work.
+        #
+        # Ordering is only meaningful for messages still IN the queue. Without
+        # a bounded prefetch the broker pushes the whole queue into this
+        # consumer's buffer, and everything there is past reordering. Measured
+        # against a real broker — 300 bulk messages arriving while the consumer
+        # is already draining, then one control message:
+        #
+        #   max_concurrent=1, late_ack=True   -> control handled at 92 of 301
+        #   max_concurrent=1, late_ack=False  -> control handled at 300 of 301
+        #   max_concurrent=None               -> control handled at 300 of 301
+        #
+        # late_ack matters as much as the count because RabbitMQ ignores QoS
+        # prefetch for auto-ack consumers, so `max_concurrent` alone buys
+        # nothing. Both are required.
+        #
+        # This is refused rather than warned about because the failure is
+        # otherwise invisible: the queue is correctly declared, an operator has
+        # done the drain/delete/recreate migration to enable it, and the
+        # feature simply does nothing with no signal anywhere.
+        if self._max_priority is not None:
+            if not max_concurrent:
+                raise InvalidPriorityError(
+                    "max_priority requires max_concurrent to be set. Without a "
+                    "prefetch bound the broker pushes the whole queue to the "
+                    "consumer, so priority cannot reorder anything and the "
+                    "setting silently does nothing."
+                )
+            if not late_ack:
+                raise InvalidPriorityError(
+                    "max_priority requires late_ack=True. RabbitMQ ignores QoS "
+                    "prefetch for auto-ack consumers, so max_concurrent alone "
+                    "does not bound delivery and priority silently does "
+                    "nothing. (MessageService sets late_ack for you whenever "
+                    "max_concurrent is given.)"
+                )
 
         self._channel: Optional[AbstractChannel] = None
         self._exchange: Optional[AbstractExchange] = None

@@ -129,6 +129,32 @@ That is a two-orders-of-magnitude improvement and it is usually the difference b
 "breaches its deadline" and "fine". It is **not** a guarantee of immediate handling. If you
 need a hard bound, lower the prefetch — the two trade off directly against each other.
 
+### Priority requires a bounded prefetch — and protobus enforces it
+
+The corollary is sharp enough to be worth its own heading: with **no** prefetch bound the
+broker pushes the entire queue into the consumer's buffer, everything is past reordering, and
+priority does *nothing at all*. Measured against a real broker — 300 bulk messages arriving
+while the consumer is already draining, then one control message published after them:
+
+| Configuration | Control message handled at |
+|---|---|
+| `max_concurrent=1, late_ack=True` | **position 92** of 301 |
+| `max_concurrent=1, late_ack=False` | position 300 of 301 |
+| `max_concurrent=None` | position 300 of 301 |
+
+`late_ack` matters as much as the count, because **RabbitMQ ignores QoS prefetch for auto-ack
+consumers** — `max_concurrent` on its own buys nothing.
+
+Because that failure is completely invisible — the queue is correctly declared, an operator
+has done the drain/delete/recreate migration, and the feature simply does nothing — protobus
+**refuses** the combination rather than warning about it. `max_priority` without a real
+prefetch raises `InvalidPriorityError` at construction. Via `MessageServiceOptions` you only
+need to supply `max_concurrent`; `MessageService` sets `late_ack` for you.
+
+Note also what the numbers *don't* say: even correctly configured, the control message landed
+at position 92, not 0 — those 92 were already consumed before it was ever published. Priority
+reorders what is queued; it does not reach back in time.
+
 Also worth knowing:
 
 - Priority does nothing on a queue declared without `x-max-priority`. It is silently
@@ -139,12 +165,28 @@ Also worth knowing:
 ## Retries and dead-lettering
 
 The `.retry` and `.DLQ` queues do **not** get an `x-max-priority` of their own, on purpose.
+Ordering *within* the retry queue is by TTL expiry, not priority, so a ceiling there would
+buy nothing — and it would turn a one-queue operator migration into a three-queue one.
 
-A message keeps its `priority` property across a dead-letter hop — verified against a real
-broker. So a retried control message still carries priority 2 when the retry queue's TTL
-expires it back onto the main queue, and it re-sorts correctly there. Ordering *within* the
-retry queue is by TTL expiry, not priority, so a ceiling there would buy nothing — and it
-would turn a one-queue operator migration into a three-queue one.
+A retried control message still comes back **as** control traffic: it keeps its priority and
+re-sorts on the main queue when the retry queue's TTL expires it back. Two separate things
+have to be true for that, and only one of them was free:
+
+1. RabbitMQ preserves the `priority` property when *it* dead-letters a message. Verified
+   against a real broker.
+2. Protobus's retry path does not actually rely on (1) — `Connection._retry_message`
+   **re-publishes** the message onto `<routing_key>.retry`, so any property it does not
+   explicitly copy is lost. It did not copy `priority`.
+
+(2) was a genuine bug in the first cut of this feature, and a nasty one: a control message
+that failed once would come back at priority 0 and queue behind the entire bulk backlog —
+the exact failure priority exists to prevent, visible only after something had already gone
+wrong. `_retry_message` now copies `priority`, and `_send_to_dlq` does too (no ordering
+value on a plain queue, but a DLQ exists to preserve what the message was). Both are pinned
+by tests.
+
+The lesson generalises: **anywhere protobus re-publishes rather than letting the broker move
+a message, priority has to be carried by hand.**
 
 ## Compatibility
 
@@ -177,7 +219,8 @@ Both values are validated at the protobus seam, raising `InvalidPriorityError` (
 `ValueError`):
 
 - `max_priority` — integer, 1..255. Checked at listener construction, **before** anything is
-  sent, because the failure it prevents is a channel-killing 406 on the shared connection.
+  sent, because the failure it prevents is a 406 at declare time that closes the channel and
+  stops the listener from starting.
 - `priority` — integer, 0..255.
 
 The integer check is not pedantry. aio-pika applies `int()` to whatever it is handed, so

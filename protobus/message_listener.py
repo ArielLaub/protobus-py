@@ -95,14 +95,18 @@ class MessageListener(BaseListener):
         Set up retry and dead letter queues.
 
         These deliberately do NOT get an ``x-max-priority`` of their own, even
-        when the service queue has one. A message keeps its ``priority``
-        property across a dead-letter hop (verified against a real broker in
-        tests/test_priority.py::test_dead_lettering_preserves_priority), so a
-        retried message re-sorts correctly the moment it lands back on the
-        priority-enabled service queue. Ordering *within* the retry queue is
-        by TTL expiry, not priority, so a ceiling there would buy nothing —
-        and it would turn enabling priority from a one-queue operator
-        migration into a three-queue one.
+        when the service queue has one. Ordering *within* the retry queue is by
+        TTL expiry, not priority, so a ceiling there would buy nothing — and it
+        would turn enabling priority from a one-queue operator migration into a
+        three-queue one.
+
+        A retried message still re-sorts correctly when it lands back on the
+        priority-enabled service queue, but NOT because the broker preserves
+        priority across a dead-letter hop (it does, but this path does not use
+        it). ``Connection._retry_message`` RE-PUBLISHES the message onto the
+        retry queue, so the priority survives only because that publish
+        explicitly copies ``message.priority``. If you are tempted to simplify
+        that copy away, this justification goes with it.
         """
         if (
             self._retry_queue_setup

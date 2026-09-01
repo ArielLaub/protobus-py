@@ -125,8 +125,9 @@ class InvalidPriorityError(ValueError):
     failures it replaces are value problems:
 
     - ``x-max-priority`` outside 1..255 is a 406 PRECONDITION_FAILED at
-      declare time, which closes the channel — and protobus shares one
-      connection, so a bad value takes out every listener in the process.
+      declare time, which closes the channel it was made on. Other listeners
+      on the same connection survive that, but the declare happens inside
+      init(), so the listener never starts and the service fails to boot.
     - A message ``priority`` outside 0..255 raises a raw ``struct.error``
       from deep inside the AMQP encoder, and a *non-integer* one is worse:
       aio-pika does ``int(priority)``, so 1.5 is silently stored as 1.

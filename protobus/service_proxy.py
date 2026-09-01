@@ -2,6 +2,7 @@
 
 from typing import Any, AsyncIterator, Callable, Dict, Optional
 
+from .config import Config
 from .context import IContext
 from .errors import (
     AlreadyInitializedError,
@@ -146,11 +147,18 @@ class ServiceProxy:
                 raise InvalidRequestError("Failed parsing message")
 
             try:
-                # `priority` is passed only when one was actually asked for.
-                # IContext is a Protocol, so a caller may be supplying their
-                # own context object written before this parameter existed;
-                # the default path must stay call-compatible with those.
-                if priority is None:
+                # `priority` is passed only when it would actually change
+                # something. IContext is a Protocol, so a caller may be
+                # supplying their own context object written before this
+                # parameter existed; the default path must stay call-compatible
+                # with those.
+                #
+                # PRIORITY_NORMAL (0) counts as "not asked for": aio-pika
+                # normalizes an unset priority to 0 anyway, and RabbitMQ treats
+                # absent and 0 as the same lowest priority, so forwarding it
+                # would take on that compatibility risk for no behavioural
+                # difference whatsoever.
+                if priority is None or priority == Config.PRIORITY_NORMAL:
                     response_data = await self._context.publish_message(
                         buffer, f"REQUEST.{method_full_name}", rpc
                     )
