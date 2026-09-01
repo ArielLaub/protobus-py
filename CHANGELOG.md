@@ -37,9 +37,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ⚠️ **Enabling priority on a queue that already exists needs a one-time
   operator migration: drain, delete, recreate.** RabbitMQ answers a re-declare
   that adds `x-max-priority` with a `406 PRECONDITION_FAILED`, which closes the
-  channel — and protobus shares one connection, so that is a service-wide
-  outage rather than a local error. Re-declaring with the *same*
-  `x-max-priority` is idempotent, so restarts after the migration are fine.
+  channel it was made on. Other listeners on the same connection survive that
+  (verified), but the declare happens inside `init()`, so the listener never
+  starts and `MessageService.init()` raises — the service fails to boot.
+  Re-declaring with the *same* `x-max-priority` is idempotent, so restarts
+  after the migration are fine.
   Only the service queue needs it; `.retry` and `.DLQ` are deliberately left
   alone, because a message keeps its priority across a dead-letter hop.
 
@@ -61,7 +63,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1`; an out-of-range value surfaces as a raw `struct.error` from the encoder;
   and an out-of-range `x-max-priority` is a channel-killing 406.
 
-- Tests: 105/105 pass (55 existing + 50 priority). The broker-backed ones need
+- Tests: 106/106 pass (55 existing + 51 priority). The broker-backed ones need
   a live RabbitMQ (`docker-compose up -d`).
 
 ## [1.4.0] — 2026-06-04

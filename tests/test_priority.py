@@ -513,6 +513,83 @@ class TestAgainstRealBroker:
         ch3 = await amqp.channel()
         await ch3.queue_delete(name)
 
+    async def test_a_406_does_not_take_down_other_listeners_on_the_connection(self):
+        """
+        Bounds the migration hazard honestly.
+
+        It is tempting to say "protobus shares one connection, so a 406 is a
+        process-wide outage". Measured, that is not true: each listener holds
+        its OWN channel, and a 406 closes only that one. The connection stays
+        up and unrelated listeners keep consuming.
+
+        What it does cost is real but narrower — the declare happens inside
+        init(), so the offending listener never starts and the service fails to
+        boot. This test pins both halves so the docs cannot drift back into
+        overstating it.
+        """
+        suffix = uuid.uuid4().hex[:8]
+        victim = f"pbtest.blast.victim.{suffix}"
+        healthy = f"pbtest.blast.healthy.{suffix}"
+
+        ctx = Context()
+        await ctx.init(RABBITMQ_URL)
+        raw = await aio_pika.connect_robust(RABBITMQ_URL)
+        try:
+            # A plain queue that already exists, as a deployed service would have.
+            rch = await raw.channel()
+            await rch.declare_queue(victim, durable=True, auto_delete=False)
+
+            received: List[str] = []
+
+            async def healthy_handler(body: bytes, correlation_id: str, headers=None):
+                received.append(body.decode())
+                return None
+
+            good = MessageListener(
+                ctx.connection,
+                late_ack=True,
+                max_concurrent=1,
+                retry_options=RetryOptions(max_retries=0),
+            )
+            await good.init(healthy_handler, healthy)
+            await good.subscribe(f"REQUEST.{healthy}.*")
+            await good.start()
+
+            # Now opt a DIFFERENT listener into priority against the
+            # pre-existing plain queue. This is the migration someone forgot.
+            offender = MessageListener(
+                ctx.connection,
+                late_ack=True,
+                max_concurrent=1,
+                retry_options=RetryOptions(max_retries=0),
+                max_priority=2,
+            )
+            with pytest.raises(aio_pika.exceptions.ChannelPreconditionFailed):
+                await offender.init(lambda *a, **k: None, victim)
+
+            # The blast radius: the connection is fine...
+            assert ctx.is_connected
+            # ...and the unrelated listener is still consuming.
+            await ctx.publish_message(
+                b"ping", f"REQUEST.{healthy}.ping", rpc=False
+            )
+            for _ in range(50):
+                if received:
+                    break
+                await asyncio.sleep(0.1)
+            assert received == ["ping"]
+
+            await good.close()
+        finally:
+            ch = await raw.channel()
+            for n in (victim, healthy):
+                try:
+                    await ch.queue_delete(n)
+                except Exception:
+                    ch = await raw.channel()
+            await raw.close()
+            await ctx.close()
+
     async def test_redeclaring_with_the_same_max_priority_is_idempotent(self, amqp):
         """Restarting a service that already opted in must not 406."""
         name = f"pbtest.idem.{uuid.uuid4().hex[:8]}"

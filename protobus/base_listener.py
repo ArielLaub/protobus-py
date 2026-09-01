@@ -54,13 +54,18 @@ class BaseListener:
                 listener from before priority support existed. This default is
                 load-bearing: RabbitMQ answers a re-declare that adds
                 ``x-max-priority`` to an existing queue with a 406
-                PRECONDITION_FAILED and closes the channel, and protobus shares
-                one connection, so a silent default would take every listener
-                in the process down on upgrade.
+                PRECONDITION_FAILED, so a silent default would break every
+                already-deployed service on upgrade.
+
+                The 406 closes the channel it happened on. Each listener holds
+                its own channel, so other listeners on the same connection do
+                survive it (verified) — but the declare happens inside init(),
+                so this listener never starts and MessageService.init()
+                raises. The service fails to boot.
 
                 Enabling it on a queue that already exists therefore needs a
-                one-time drain, delete and recreate by an operator. See the
-                "Message priority" section of the README.
+                one-time drain, delete and recreate by an operator. See
+                docs/advanced/message-priority.md.
 
                 Recommended value: ``Config.RECOMMENDED_MAX_PRIORITY`` (2).
         """
@@ -69,8 +74,8 @@ class BaseListener:
         self._max_concurrent = max_concurrent
         self._message_ttl_ms = message_ttl_ms
         # Validated at construction, before anything is sent: an invalid value
-        # would otherwise surface as a channel-killing 406 on the shared
-        # connection at declare time.
+        # would otherwise surface much later as a channel-killing 406 at
+        # declare time, when there is nothing useful left to say about it.
         self._max_priority = validate_max_priority(max_priority)
 
         self._channel: Optional[AbstractChannel] = None
@@ -148,8 +153,8 @@ class BaseListener:
         # Every key here is opt-in. A listener that configured neither a TTL
         # nor a priority ceiling must reach ensure_queue with arguments=None,
         # exactly as it did before either feature existed — otherwise the
-        # declare 406s against an already-deployed queue and kills the shared
-        # connection's channel.
+        # declare 406s against an already-deployed queue and this listener
+        # never starts.
         arguments: Dict[str, Any] = {}
         if self._message_ttl_ms is not None:
             arguments["x-message-ttl"] = self._message_ttl_ms

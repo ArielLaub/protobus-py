@@ -19,9 +19,14 @@ messages are published at a higher priority and jump the bulk traffic already qu
 ## ⚠️ Enabling priority on an existing queue requires an operator migration
 
 **RabbitMQ cannot add `x-max-priority` to a queue that already exists.** Re-declaring a live
-queue with a new argument set is answered with `406 PRECONDITION_FAILED`, and a 406 closes
-the channel. Protobus shares one connection across every listener in a process, so this is
-not a local error — it is a service-wide outage on deploy.
+queue with a new argument set is answered with `406 PRECONDITION_FAILED`.
+
+What that actually costs you, measured rather than assumed: the 406 closes **the channel the
+declare was made on**. Each listener holds its own channel, so other listeners on the same
+connection keep working and the connection itself stays up. But the declare happens inside
+`init()`, so the listener never starts and `MessageService.init()` raises — **the service
+fails to boot**. Not a process-wide blast radius; still an outage of that service, and one
+that arrives on deploy rather than in testing.
 
 Verified against RabbitMQ 3:
 

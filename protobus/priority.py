@@ -5,10 +5,11 @@ Both of the values this module guards are encoded as a single AMQP octet, and
 both fail badly and late if they are wrong:
 
 - ``x-max-priority`` outside 1..255 is rejected by the broker at declare time
-  with a 406 PRECONDITION_FAILED, which closes the channel. Protobus shares one
-  connection across every listener in a process, so one bad value is a
-  service-wide outage rather than a local error. Verified against RabbitMQ 3:
-  ``x-max-priority: 300`` returns ``{max_value_exceeded,300}``.
+  with a 406 PRECONDITION_FAILED, which closes the channel the declare was made
+  on. Other listeners on the same connection survive that, but the declare
+  happens during init(), so the offending listener never starts and the service
+  fails to boot. Verified against RabbitMQ 3: ``x-max-priority: 300`` returns
+  ``{max_value_exceeded,300}``.
 
 - A message ``priority`` outside 0..255 raises a raw ``struct.error`` from
   inside the AMQP encoder ("'B' format requires 0 <= number <= 255") — and a
