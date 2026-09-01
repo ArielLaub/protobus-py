@@ -27,7 +27,9 @@ from protobus import Context, MessageService, ServiceProxy
 from protobus.errors import HandledError
 
 
-RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+from .broker_url import broker_url
+
+RABBITMQ_URL = broker_url()
 PROTO_DIR = os.path.join(os.path.dirname(__file__), "streaming_proto")
 
 

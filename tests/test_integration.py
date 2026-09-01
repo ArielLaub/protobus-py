@@ -12,7 +12,9 @@ from protobus import (
 )
 
 
-RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+from .broker_url import broker_url
+
+RABBITMQ_URL = broker_url()
 
 
 class EchoService(MessageService):

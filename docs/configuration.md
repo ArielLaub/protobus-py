@@ -13,7 +13,36 @@ This guide covers all configuration options for Protobus Python.
 | `BUS_EXCHANGE_NAME` | `proto.bus` | Main exchange for RPC requests |
 | `CALLBACKS_EXCHANGE_NAME` | `proto.bus.callback` | Exchange for RPC responses |
 | `EVENTS_EXCHANGE_NAME` | `proto.bus.events` | Exchange for pub/sub events |
-| `MESSAGE_PROCESSING_TIMEOUT` | `600000` | RPC timeout in milliseconds (10 min) |
+
+### Timeouts
+
+The two timeouts are easy to confuse and belong to opposite ends of a call.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RPC_CALL_TIMEOUT_MS` | `30000` | **Caller side.** How long a unary RPC waits for its reply before raising `RpcTimeoutError`. |
+| `MESSAGE_PROCESSING_TIMEOUT` | `600000` | **Server side.** The budget for running one handler. |
+| `STREAM_IDLE_TIMEOUT_MS` | `60000` | Longest gap allowed between two chunks of a streaming reply. A stream may legitimately run far longer than this in total. |
+
+Before 1.5.0 the caller used the *server's* budget as its own deadline, so a
+call to a service that was scaled to zero blocked its caller for ten minutes.
+
+### Connection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AMQP_HEARTBEAT_SECONDS` | `30` | Heartbeat interval negotiated with the broker. A `heartbeat=` already present in the connection URL wins, `heartbeat=0` included. Set to `0` to disable. |
+
+Without an explicit heartbeat the interval is whatever the broker proposes — 60
+seconds on RabbitMQ — and a peer that vanishes without closing its socket goes
+unnoticed for around two minutes, during which the connection reports itself
+healthy and publishes go into a dead socket.
+
+### Streaming
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STREAM_MAX_BUFFERED_CHUNKS` | `256` | Undelivered chunks a single streaming call may hold before it raises `StreamBackpressureError`. |
 
 Example:
 
@@ -21,7 +50,9 @@ Example:
 export BUS_EXCHANGE_NAME=myapp.bus
 export CALLBACKS_EXCHANGE_NAME=myapp.callbacks
 export EVENTS_EXCHANGE_NAME=myapp.events
-export MESSAGE_PROCESSING_TIMEOUT=30000  # 30 seconds
+export RPC_CALL_TIMEOUT_MS=15000          # callers give up after 15s
+export MESSAGE_PROCESSING_TIMEOUT=300000  # handlers get 5 minutes
+export AMQP_HEARTBEAT_SECONDS=30
 ```
 
 ## Context Options

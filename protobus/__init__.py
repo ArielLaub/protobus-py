@@ -54,6 +54,15 @@ from .errors import (
     MissingProtoError,
     MissingExchangeError,
     ConnectionError,
+    ProtocolError,
+    RpcTimeoutError,
+    PublishError,
+    UnroutableError,
+    StreamingError,
+    StreamTimeoutError,
+    StreamBackpressureError,
+    StreamSequenceError,
+    StreamClosedError,
 )
 
 # Custom types
@@ -75,7 +84,7 @@ from .logger import Logger, ILogger, set_logger
 # Config
 from .config import Config
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 __all__ = [
     # Context and connection
@@ -123,6 +132,15 @@ __all__ = [
     "MissingProtoError",
     "MissingExchangeError",
     "ConnectionError",
+    "ProtocolError",
+    "RpcTimeoutError",
+    "PublishError",
+    "UnroutableError",
+    "StreamingError",
+    "StreamTimeoutError",
+    "StreamBackpressureError",
+    "StreamSequenceError",
+    "StreamClosedError",
     # Custom types
     "CustomType",
     "register_custom_type",
