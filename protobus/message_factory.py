@@ -28,7 +28,12 @@ from google.protobuf.message import Message
 from google.protobuf.message_factory import GetMessageClass
 
 from .custom_types import CustomType, get_custom_type, is_custom_type, register_custom_type
-from .errors import MessageTypeRequiredError, NotInitializedError
+from .errors import (
+    InvalidRequestError,
+    MessageTypeRequiredError,
+    NotInitializedError,
+    ProtocolError,
+)
 from .logger import Logger
 
 # ---------------------------------------------------------------------------
@@ -386,9 +391,21 @@ class MessageFactory:
         return False
 
     def _decode_inner_data(self, data_bytes: bytes, type_name: Optional[str] = None) -> Any:
-        """Decode inner data bytes. Uses protobuf if type is known, else JSON fallback."""
+        """
+        Decode inner data bytes. Uses protobuf if the type is known, else JSON.
+
+        The ladder used to end in ``return {}``: a payload that decoded as
+        neither was handed to the handler as though the caller had sent an
+        empty request, and nothing anywhere could tell the difference between
+        that and a genuinely empty one. It now raises.
+
+        The protobuf→JSON fallback is kept deliberately: it is the path a peer
+        that predates binary encoding still travels.
+        """
         if not data_bytes:
             return {}
+
+        protobuf_error: Optional[Exception] = None
 
         # Try protobuf decode if we have the type
         if type_name:
@@ -399,17 +416,34 @@ class MessageFactory:
                     msg.ParseFromString(data_bytes)
                     return json_format.MessageToDict(msg, preserving_proto_field_name=True)
                 except Exception as e:
+                    protobuf_error = e
                     Logger.debug(f"Protobuf decode failed for {type_name}: {e}, trying JSON")
 
         # JSON fallback
         try:
             return json.loads(data_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            Logger.warn(f"Cannot decode inner data as JSON or protobuf")
-            return {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            # Neither shape. Do not invent an empty request.
+            detail = f" as {type_name}" if type_name else ""
+            raise ProtocolError(
+                f"Inner data could not be decoded{detail}: "
+                f"not protobuf ({type(protobuf_error).__name__ if protobuf_error else 'no type'}) "
+                f"and not JSON ({type(e).__name__})"
+            ) from e
 
     def _encode_inner_data(self, data: Any, type_name: Optional[str] = None) -> bytes:
-        """Encode inner data to bytes. Uses protobuf if type is known, else JSON."""
+        """
+        Encode inner data to bytes. Uses protobuf if the type is known, else JSON.
+
+        When a type IS declared, a failure to encode against it used to fall
+        back to ``json.dumps`` — putting JSON bytes into a field the peer will
+        decode against that declared protobuf type. That is guaranteed garbage
+        on arrival, so it raises instead.
+
+        Unknown fields are ignored rather than rejected, matching protobufjs on
+        the TS side: a stale key in a caller's payload is dropped, not turned
+        into an outage.
+        """
         if data is None:
             return b""
 
@@ -421,13 +455,22 @@ class MessageFactory:
             cls = self._get_inner_message_class(type_name)
             if cls:
                 try:
-                    msg = json_format.ParseDict(data, cls())
+                    msg = json_format.ParseDict(
+                        data, cls(), ignore_unknown_fields=True
+                    )
                     return msg.SerializeToString()
                 except Exception as e:
-                    Logger.debug(f"Protobuf encode failed for {type_name}: {e}, using JSON")
+                    raise InvalidRequestError(
+                        f"Payload does not encode as {type_name}: {e}"
+                    ) from e
 
-        # JSON fallback
-        return json.dumps(data).encode("utf-8")
+        # JSON fallback — the normal path for a service with no .proto loaded.
+        try:
+            return json.dumps(data).encode("utf-8")
+        except (TypeError, ValueError) as e:
+            raise InvalidRequestError(
+                f"Payload is not JSON-serialisable: {e}"
+            ) from e
 
     # ── Build methods ──────────────────────────────────────────────
 
@@ -515,7 +558,12 @@ class MessageFactory:
         container = _ResponseContainerMsg()
         container.ParseFromString(data)
 
-        if container.HasField("error") and container.error.method:
+        # `and container.error.method` used to gate this: an error raised
+        # before the method was known — the reply to a request that did not
+        # decode — carries an empty method, so the whole error was skipped and
+        # the response fell through to the result path. A failure was handed to
+        # the caller as a successful empty result.
+        if container.HasField("error"):
             return ResponseContainer(
                 method=container.error.method,
                 error={

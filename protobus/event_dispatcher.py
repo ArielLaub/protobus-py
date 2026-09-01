@@ -11,6 +11,7 @@ from .config import Config
 from .connection import (
     IConnection,
     detach_listener,
+    publish_confirmed,
     release_amqp_resources,
     schedule_amqp_release,
 )
@@ -155,7 +156,12 @@ class EventDispatcher:
             correlation_id=correlation_id,
         )
 
-        await self._exchange.publish(message, routing_key=routing_key)
+        # Events are deliberately NOT mandatory: having no subscribers is a
+        # normal state for an event, unlike a request. Parity with TS protobus
+        # 1e829ad.
+        await publish_confirmed(
+            self._exchange, message, routing_key, mandatory=False
+        )
         Logger.debug(f"Published event {event_type} to {routing_key}")
 
     async def _on_reconnected(self) -> None:

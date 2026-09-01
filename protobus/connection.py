@@ -1,6 +1,7 @@
 """Connection module for RabbitMQ/AMQP connections with automatic reconnection."""
 
 import asyncio
+import inspect
 import random
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from .errors import (
     DisconnectedError,
     NotConnectedError,
     ReconnectionError,
+    UnroutableError,
     is_handled_error,
 )
 from .logger import Logger
@@ -30,7 +32,8 @@ from .priority import validate_message_priority
 # Type aliases
 #
 # A handler receives the message body, correlation_id, and the incoming AMQP
-# headers. It returns one of:
+# headers — and, if it declares a fourth positional parameter, the routing key
+# the delivery arrived on. It returns one of:
 #   - bytes  → a single (unary) reply published to message.reply_to
 #   - None   → no reply (one-way event, or handler chose to suppress)
 #   - AsyncIterator[bytes] → a streaming reply. Each yielded chunk is
@@ -63,6 +66,115 @@ class RetryOptions:
 
 
 DEFAULT_RETRY_OPTIONS = RetryOptions()
+
+
+def _handler_accepts_routing_key(handler: Callable[..., Any]) -> bool:
+    """
+    Whether a message handler declares the optional 4th (routing key) argument.
+
+    Resolved once per consumer rather than per delivery. A handler taking
+    *args is assumed to accept it.
+    """
+    try:
+        params = list(inspect.signature(handler).parameters.values())
+    except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+        return False
+
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True
+
+    positional = [
+        p
+        for p in params
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= 4
+
+
+def _is_unroutable(result: Any) -> bool:
+    """
+    Whether a publish result is the broker returning the message.
+
+    aio-pika sends `mandatory` but reports the outcome in the RETURN VALUE, not
+    by raising: a routed publish resolves to a ``Basic.Ack`` frame, an
+    unroutable one to a ``DeliveredMessage`` wrapping ``Basic.Return``. Nothing
+    in this library ever looked, so every publish to a routing key with no
+    binding behind it was dropped in silence — which is what makes a service
+    with no consumers look like a timeout rather than an error.
+
+    Detected structurally rather than by importing aiormq/pamqp frame classes,
+    so a client upgrade cannot quietly turn this back into a silent drop.
+    """
+    if result is None:
+        return False
+    delivery = getattr(result, "delivery", None)
+    candidate = delivery if delivery is not None else result
+    return type(candidate).__name__ == "Return"
+
+
+async def publish_confirmed(
+    exchange: AbstractExchange,
+    message: Message,
+    routing_key: str,
+    mandatory: bool = True,
+) -> None:
+    """
+    Publish and raise if the broker could not route the message.
+
+    Requests are mandatory: a request nothing is bound to fails at once instead
+    of waiting out the caller's RPC timeout. Events are not — having no
+    subscribers is normal for an event. Parity with TS protobus 1e829ad.
+    """
+    result = await exchange.publish(message, routing_key=routing_key, mandatory=mandatory)
+    if mandatory and _is_unroutable(result):
+        raise UnroutableError(
+            f"No queue is bound for routing key {routing_key!r} on exchange "
+            f"{getattr(exchange, 'name', '?')!r}; the broker returned the message"
+        )
+
+
+def _redact_url(url: str) -> str:
+    """Hide the password in an AMQP URL before it reaches a log."""
+    try:
+        scheme, _, rest = url.partition("://")
+        if not rest or "@" not in rest:
+            return url
+        creds, _, host = rest.rpartition("@")
+        user, sep, _password = creds.partition(":")
+        return f"{scheme}://{user}{':***' if sep else ''}@{host}"
+    except Exception:  # pragma: no cover - never let logging break a connect
+        return "<amqp url>"
+
+
+def _with_heartbeat(url: str) -> str:
+    """
+    Ensure the connection negotiates a heartbeat rather than accepting the
+    broker's proposal.
+
+    Nothing set one, so the interval was whatever RabbitMQ proposed — 60
+    seconds — and a peer that vanishes without closing its socket is only
+    noticed after two missed intervals, around two minutes. For all of that
+    time the connection reports itself healthy and publishes go into a dead
+    socket with no reconnection scheduled. Parity with TS protobus 2fee268.
+
+    A heartbeat already in the URL is the caller being explicit and is left
+    alone, ``heartbeat=0`` included — that is how they are turned off. The rest
+    of the URL is preserved byte for byte: the vhost is routinely
+    percent-encoded and re-encoding it would connect to the wrong one.
+    """
+    seconds = Config.amqp_heartbeat_seconds()
+    if seconds <= 0:
+        return url
+
+    base, sep, query = url.partition("?")
+    if sep and any(
+        param.split("=", 1)[0].strip() == "heartbeat" for param in query.split("&")
+    ):
+        return url
+
+    joiner = "&" if sep and query else "?"
+    return f"{base}{sep if sep and query else ''}{query}{joiner}heartbeat={seconds}"
 
 
 class IConnection(Protocol):
@@ -327,12 +439,12 @@ class Connection:
         if self._is_connected:
             raise AlreadyConnectedError("Already connected to RabbitMQ")
 
-        self._url = url
-        Logger.info(f"Connecting to bus: {url}")
+        self._url = _with_heartbeat(url)
+        Logger.info(f"Connecting to bus: {_redact_url(self._url)}")
 
         try:
             self._connection = await aio_pika.connect_robust(
-                url,
+                self._url,
                 reconnect_interval=self._options.initial_reconnect_delay_ms / 1000,
             )
             self._is_connected = True
@@ -587,6 +699,14 @@ class Connection:
             await channel.set_qos(prefetch_count=max_concurrent)
 
         retry_opts = retry_options or DEFAULT_RETRY_OPTIONS
+        queue_name = queue.name
+
+        # The routing key is what RabbitMQ's topic permissions are granted
+        # against, and dispatch has to be able to check the message body
+        # against it. Handlers written before this took three arguments, and
+        # BaseListener.init() accepts caller-supplied ones, so the extra
+        # argument is passed only to handlers that declare it.
+        wants_routing_key = _handler_accepts_routing_key(handler)
 
         async def process_message(message: AbstractIncomingMessage) -> None:
             try:
@@ -595,9 +715,17 @@ class Connection:
                     incoming_headers = dict(message.headers or {})
 
                     try:
-                        result = await handler(
-                            message.body, correlation_id, incoming_headers
-                        )
+                        if wants_routing_key:
+                            result = await handler(
+                                message.body,
+                                correlation_id,
+                                incoming_headers,
+                                message.routing_key,
+                            )
+                        else:
+                            result = await handler(
+                                message.body, correlation_id, incoming_headers
+                            )
 
                         # Streaming reply: handler returned an async iterator.
                         # Each yielded chunk is published to reply_to with the
@@ -635,16 +763,35 @@ class Connection:
 
                         # Check retry count
                         headers = message.headers or {}
-                        retry_count = headers.get("x-retry-count", 0)
+                        try:
+                            retry_count = int(headers.get("x-retry-count", 0) or 0)
+                        except (TypeError, ValueError):
+                            retry_count = 0
 
-                        if retry_count < retry_opts.max_retries:
-                            # Retry the message
-                            await self._retry_message(
-                                channel, message, retry_count, e, retry_opts
+                        # The handoff must be confirmed BEFORE the delivery is
+                        # acked. Acking first — or acking regardless, as this
+                        # did — destroys the message when the handoff fails.
+                        try:
+                            if retry_count < retry_opts.max_retries:
+                                await self._retry_message(
+                                    channel,
+                                    message,
+                                    retry_count,
+                                    e,
+                                    retry_opts,
+                                    queue_name,
+                                )
+                            else:
+                                await self._send_to_dlq(channel, message, e)
+                        except Exception as handoff_error:
+                            Logger.error(
+                                f"Retry/DLQ handoff failed for a message on "
+                                f"{queue_name}: {handoff_error}. Requeuing "
+                                f"rather than dropping it."
                             )
-                        else:
-                            # Send to DLQ
-                            await self._send_to_dlq(channel, message, e)
+                            if late_ack:
+                                await message.nack(requeue=True)
+                            return
 
                         if late_ack:
                             await message.ack()
@@ -720,6 +867,7 @@ class Connection:
         retry_count: int,
         error: Exception,
         retry_opts: RetryOptions,
+        queue_name: str,
     ) -> None:
         """Send a message to the retry queue."""
         headers = dict(message.headers or {})
@@ -733,40 +881,65 @@ class Connection:
             f"Retrying message (attempt {retry_count + 1}/{retry_opts.max_retries})"
         )
 
-        # Re-publish with delay (using message TTL on retry queue)
-        retry_queue_name = f"{message.routing_key}.retry"
-        try:
-            retry_exchange = await channel.get_exchange(Config.bus_exchange_name())
-            # Sanitize headers: ensure numeric values are ints (aio-pika strict typing)
-            sanitized_headers = {}
-            for k, v in headers.items():
-                if isinstance(v, str) and v.isdigit():
-                    sanitized_headers[k] = int(v)
-                else:
-                    sanitized_headers[k] = v
-
-            await retry_exchange.publish(
-                Message(
-                    body=message.body,
-                    headers=sanitized_headers,
-                    correlation_id=message.correlation_id,
-                    reply_to=message.reply_to,
-                    expiration=str(retry_opts.retry_delay_ms),
-                    # Carry the priority across the retry.
-                    #
-                    # The broker preserves priority when IT dead-letters a
-                    # message, but this path does not rely on that — it
-                    # re-publishes, so anything not copied here is lost. Drop
-                    # it and a control message that fails once comes back as
-                    # priority 0 and queues behind the entire bulk backlog:
-                    # precisely the problem priority exists to solve, and only
-                    # visible after something has already gone wrong.
-                    priority=message.priority,
-                ),
-                routing_key=retry_queue_name,
+        # The retry queue is named after the CONSUMER's queue and is bound to
+        # nothing, but this published to the topic bus exchange with the key
+        # "<delivery routing key>.retry" — four segments against a three
+        # segment binding. Verified against a real broker: the broker returns
+        # it as unroutable, aio-pika reports that in the return value rather
+        # than by raising, and the message was then acked. Every message that
+        # exhausted a handler was silently destroyed on its first retry.
+        #
+        # Publish to the retry queue by name through the default exchange, the
+        # technique _send_to_dlq already used correctly.
+        retry_queue_name = f"{queue_name}.retry" if queue_name else None
+        if not retry_queue_name:
+            Logger.error(
+                "Cannot retry: the consumer's queue name is unknown, so the "
+                "retry queue cannot be addressed"
             )
-        except Exception as e:
-            Logger.error(f"Failed to retry message: {e}")
+            raise UnroutableError("No retry queue for this consumer")
+
+        # Sanitize headers: ensure numeric values are ints (aio-pika strict typing)
+        sanitized_headers = {}
+        for k, v in headers.items():
+            if isinstance(v, str) and v.isdigit():
+                sanitized_headers[k] = int(v)
+            else:
+                sanitized_headers[k] = v
+
+        await publish_confirmed(
+            channel.default_exchange,
+            Message(
+                body=message.body,
+                headers=sanitized_headers,
+                correlation_id=message.correlation_id,
+                reply_to=message.reply_to,
+                # SECONDS, as a number. aio-pika's encode_expiration is a
+                # singledispatch registered for int, float, timedelta and
+                # datetime — and NOT for str, so the previous
+                # `str(retry_delay_ms)` raised ValueError at publish time on
+                # every aio-pika >= 9. The bare `except` around this block then
+                # logged it and the delivery was acked regardless, so every
+                # message that hit a non-handled handler error was destroyed
+                # rather than retried, on every install.
+                expiration=retry_opts.retry_delay_ms / 1000,
+                # Carry the priority across the retry.
+                #
+                # The broker preserves priority when IT dead-letters a
+                # message, but this path does not rely on that — it
+                # re-publishes, so anything not copied here is lost. Drop it
+                # and a control message that fails once comes back as priority
+                # 0 and queues behind the entire bulk backlog: precisely the
+                # problem priority exists to solve, and only visible after
+                # something has already gone wrong.
+                #
+                # Still true after the routing correction above — the exchange
+                # this goes to changed, the re-publish did not.
+                priority=message.priority,
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            ),
+            retry_queue_name,
+        )
 
     async def _send_to_dlq(
         self,
@@ -782,23 +955,25 @@ class Connection:
         dlq_name = f"{message.routing_key}.DLQ"
         Logger.warn(f"Message exhausted retries, sending to DLQ: {dlq_name}")
 
-        try:
-            dlq = await channel.declare_queue(dlq_name, durable=True)
-            await channel.default_exchange.publish(
-                Message(
-                    body=message.body,
-                    headers=headers,
-                    correlation_id=message.correlation_id,
-                    # The DLQ is a plain queue, so this buys no ordering. It is
-                    # copied because a DLQ exists to preserve what the message
-                    # WAS, and whether a dead message was control or bulk
-                    # traffic is part of that.
-                    priority=message.priority,
-                ),
-                routing_key=dlq_name,
-            )
-        except Exception as e:
-            Logger.error(f"Failed to send to DLQ: {e}")
+        # No `except` here: the caller requeues if the handoff fails. Swallowing
+        # it meant the delivery was acked immediately afterwards and the message
+        # was destroyed rather than dead-lettered.
+        await channel.declare_queue(dlq_name, durable=True)
+        await publish_confirmed(
+            channel.default_exchange,
+            Message(
+                body=message.body,
+                headers=headers,
+                correlation_id=message.correlation_id,
+                # The DLQ is a plain queue, so this buys no ordering. It is
+                # copied because a DLQ exists to preserve what the message
+                # WAS, and whether a dead message was control or bulk traffic
+                # is part of that.
+                priority=message.priority,
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            ),
+            dlq_name,
+        )
 
     async def publish(
         self,
@@ -807,6 +982,7 @@ class Connection:
         routing_key: str,
         body: bytes,
         properties: Optional[Dict[str, Any]] = None,
+        mandatory: bool = True,
     ) -> None:
         """
         Publish a message to an exchange.
@@ -816,9 +992,16 @@ class Connection:
             exchange: The exchange to publish to
             routing_key: Message routing key
             body: Message body
-            properties: Additional message properties. May include an optional
-                ``priority`` (0..255); omit it and nothing about the published
-                message changes.
+            properties: Additional message properties. May include an
+                optional ``priority`` (0..255); omit it and nothing about the
+                published message changes.
+            mandatory: Fail if nothing is bound for the routing key. True for
+                requests; pass False for events, where having no subscribers
+                is normal.
+
+        Raises:
+            UnroutableError: If mandatory and the broker returned the message.
+            InvalidPriorityError: If ``priority`` is present but out of range.
         """
         if not self._is_connected:
             raise NotConnectedError("Not connected to RabbitMQ")
@@ -839,4 +1022,4 @@ class Connection:
             priority=priority,
         )
 
-        await exchange.publish(message, routing_key=routing_key)
+        await publish_confirmed(exchange, message, routing_key, mandatory=mandatory)

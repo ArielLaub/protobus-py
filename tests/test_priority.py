@@ -359,9 +359,11 @@ class TestValidation:
 class _CapturingExchange:
     def __init__(self) -> None:
         self.messages: List[Message] = []
+        self.routing_keys: List[Optional[str]] = []
 
     async def publish(self, message, routing_key=None, **kwargs):
         self.messages.append(message)
+        self.routing_keys.append(routing_key)
 
 
 class _ExplodingExchange:
@@ -594,10 +596,17 @@ class TestRetryPreservesPriority:
             retry_count=0,
             error=Exception("boom"),
             retry_opts=RetryOptions(max_retries=3, retry_delay_ms=5000),
+            queue_name="svc.Thing",
         )
 
         assert ex.messages, "nothing was republished to the retry queue"
         assert ex.messages[0].priority == Config.PRIORITY_CONTROL
+        # The audit corrected where this is addressed: the retry queue is named
+        # after the CONSUMER's queue and reached by name through the default
+        # exchange, not "<routing key>.retry" on the topic bus exchange, which
+        # was unroutable. Asserted here so the priority copy cannot be shown to
+        # survive on a publish that goes nowhere.
+        assert ex.routing_keys == ["svc.Thing.retry"]
 
     async def test_retry_republish_of_an_unprioritised_message_is_unchanged(self):
         """The default path must not acquire a priority it never had."""
@@ -612,6 +621,7 @@ class TestRetryPreservesPriority:
             retry_count=0,
             error=Exception("boom"),
             retry_opts=RetryOptions(max_retries=3, retry_delay_ms=5000),
+            queue_name="svc.Thing",
         )
 
         # 0 is aio-pika's normalization of "unset" — the same frame as before.

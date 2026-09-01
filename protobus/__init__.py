@@ -55,6 +55,15 @@ from .errors import (
     MissingProtoError,
     MissingExchangeError,
     ConnectionError,
+    ProtocolError,
+    RpcTimeoutError,
+    PublishError,
+    UnroutableError,
+    StreamingError,
+    StreamTimeoutError,
+    StreamBackpressureError,
+    StreamSequenceError,
+    StreamClosedError,
 )
 
 # Custom types
@@ -128,6 +137,15 @@ __all__ = [
     "MissingProtoError",
     "MissingExchangeError",
     "ConnectionError",
+    "ProtocolError",
+    "RpcTimeoutError",
+    "PublishError",
+    "UnroutableError",
+    "StreamingError",
+    "StreamTimeoutError",
+    "StreamBackpressureError",
+    "StreamSequenceError",
+    "StreamClosedError",
     # Custom types
     "CustomType",
     "register_custom_type",

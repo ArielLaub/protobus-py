@@ -5,6 +5,8 @@ import pytest
 
 from protobus import RunnableService, Context, MessageServiceOptions
 
+from .broker_url import broker_url
+
 
 class TestRunnableServiceProtoDerivation:
     """Tests for proto filename derivation (unit tests without context)."""
@@ -44,7 +46,7 @@ class TestRunnableServiceIntegration:
         """Create and initialize a context."""
         ctx = Context()
         try:
-            await ctx.init("amqp://guest:guest@localhost:5672/")
+            await ctx.init(broker_url())
         except Exception:
             pytest.skip("RabbitMQ not available")
         yield ctx
@@ -102,7 +104,7 @@ class TestRunnableServiceOptions:
         """Create and initialize a context."""
         ctx = Context()
         try:
-            await ctx.init("amqp://guest:guest@localhost:5672/")
+            await ctx.init(broker_url())
         except Exception:
             pytest.skip("RabbitMQ not available")
         yield ctx

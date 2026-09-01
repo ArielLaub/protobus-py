@@ -80,17 +80,31 @@ def get_custom_type_names() -> List[str]:
 
 
 # BigInt utilities
+BIGINT_WIRE_BYTES = 32
+BIGINT_MAX = (1 << (BIGINT_WIRE_BYTES * 8)) - 1
+
+
 def bigint_to_bytes(value: Union[int, str]) -> bytes:
     """
-    Convert a bigint to 32-byte big-endian representation.
+    Convert a bigint to its 32-byte big-endian wire representation.
 
-    Supports Web3/crypto applications with large integers.
+    The wire format is fixed-width and *unsigned*. A value that does not fit
+    is rejected rather than reshaped: the previous code two's-complemented a
+    negative into 256 bits, which the unsigned decoder then read back as a
+    vast positive (-5 became 2**256 - 5), and truncated anything wider than 32
+    bytes to its low 32 (2**256 + 7 became 7). Both losses were undetectable
+    by any caller.
+
+    Matches TS protobus, which raises RangeError for the same two inputs.
 
     Args:
-        value: Integer or string representation of the bigint
+        value: Non-negative integer, or a decimal/hex string form of one
 
     Returns:
         32-byte big-endian bytes
+
+    Raises:
+        ValueError: If the value is negative or wider than the wire format
     """
     if isinstance(value, str):
         # Handle hex strings
@@ -99,35 +113,45 @@ def bigint_to_bytes(value: Union[int, str]) -> bytes:
         else:
             value = int(value)
 
-    # Convert to bytes, ensuring 32 bytes with big-endian encoding
-    # Handle negative numbers with two's complement
     if value < 0:
-        # Two's complement for 256 bits
-        value = (1 << 256) + value
+        raise ValueError(
+            f"bigint must be non-negative; the wire format is unsigned "
+            f"(got {value})"
+        )
 
-    byte_length = (value.bit_length() + 7) // 8
-    byte_length = max(byte_length, 1)  # At least 1 byte
+    if value > BIGINT_MAX:
+        raise ValueError(
+            f"bigint exceeds the {BIGINT_WIRE_BYTES}-byte wire format "
+            f"(got a {(value.bit_length() + 7) // 8}-byte value)"
+        )
 
-    raw_bytes = value.to_bytes(byte_length, byteorder="big", signed=False)
-
-    # Pad or truncate to 32 bytes
-    if len(raw_bytes) < 32:
-        return b"\x00" * (32 - len(raw_bytes)) + raw_bytes
-    return raw_bytes[-32:]
+    return value.to_bytes(BIGINT_WIRE_BYTES, byteorder="big", signed=False)
 
 
 def bytes_to_bigint(data: bytes) -> int:
     """
-    Convert bytes to a bigint.
+    Convert wire bytes to a bigint.
+
+    Anything wider than the wire format is rejected rather than decoded: this
+    encoder only ever produces 32 bytes, so a wider value did not come from a
+    peer speaking this protocol.
 
     Args:
         data: Bytes to convert
 
     Returns:
         Integer value
+
+    Raises:
+        ValueError: If the input is wider than the wire format
     """
     if not data:
         return 0
+    if len(data) > BIGINT_WIRE_BYTES:
+        raise ValueError(
+            f"bigint wire value is {len(data)} bytes; the format is "
+            f"{BIGINT_WIRE_BYTES}"
+        )
     return int.from_bytes(data, byteorder="big", signed=False)
 
 
