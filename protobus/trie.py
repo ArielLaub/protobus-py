@@ -14,7 +14,12 @@ class TrieNode:
 
     def __init__(self, word: str = ""):
         self.word = word
-        self.value: Optional[Any] = None
+        # A list, not a single slot: several subscribers may register the same
+        # pattern. The previous single `value` was overwritten by each new
+        # registration, so only the last subscriber to a topic was ever called
+        # while the queue binding stayed in place and the broker kept
+        # delivering. Parity with TS protobus 2461a28.
+        self.values: List[Any] = []
         self.children: Dict[str, "TrieNode"] = {}
         self.single_wildcard: Optional["TrieNode"] = None  # '*' wildcard
         self.super_wildcard: Optional["TrieNode"] = None   # '#' wildcard
@@ -33,7 +38,7 @@ class TrieNode:
     def _add_match_deep(self, parts: List[str], index: int, value: Any) -> None:
         """Recursively add pattern parts to the trie."""
         if index >= len(parts):
-            self.value = value
+            self.values.append(value)
             return
 
         part = parts[index]
@@ -68,13 +73,12 @@ class TrieNode:
 
     def _match_topic_deep(self, parts: List[str], index: int, results: Set[Any]) -> None:
         """Recursively match topic parts against the trie."""
-        # If we've consumed all parts, check for a value at this node
+        # If we've consumed all parts, collect the values at this node
         if index >= len(parts):
-            if self.value is not None:
-                results.add(self.value)
+            results.update(self.values)
             # Also check super wildcard at this level (# can match zero segments)
-            if self.super_wildcard is not None and self.super_wildcard.value is not None:
-                results.add(self.super_wildcard.value)
+            if self.super_wildcard is not None:
+                results.update(self.super_wildcard.values)
             return
 
         current_part = parts[index]
@@ -91,8 +95,7 @@ class TrieNode:
         if self.super_wildcard is not None:
             # # can match zero or more segments
             # Try matching zero segments (skip to value check)
-            if self.super_wildcard.value is not None:
-                results.add(self.super_wildcard.value)
+            results.update(self.super_wildcard.values)
 
             # Try matching one segment
             self.super_wildcard._match_topic_deep(parts, index + 1, results)
