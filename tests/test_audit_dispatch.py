@@ -151,6 +151,10 @@ class TestMembersOutsideTheContractAreUnreachable:
         assert response.error is not None, (
             f"{framework_member} was dispatched instead of being refused"
         )
+        assert response.error["code"] == "INVALID_METHOD", (
+            f"{framework_member} produced {response.error!r} — an incidental "
+            f"failure inside the member, not a refusal to dispatch to it"
+        )
         assert service.reached == []
 
     async def test_an_undeclared_public_helper_is_reachable_without_a_proto(
@@ -186,6 +190,7 @@ class TestMembersOutsideTheContractAreUnreachable:
         )
         response = factory.decode_response(raw)
         assert response.error is not None
+        assert response.error["code"] == "INVALID_METHOD"
         assert svc.reached == []
 
     async def test_a_declared_method_still_dispatches_when_a_proto_is_loaded(self):
@@ -217,6 +222,7 @@ class TestMembersOutsideTheContractAreUnreachable:
         )
         response = _decode(factory, raw)
         assert response.error is not None
+        assert response.error["code"] == "INVALID_METHOD"
         assert service.reached == []
 
     async def test_a_foreign_service_name_is_refused(self, service):
@@ -231,7 +237,221 @@ class TestMembersOutsideTheContractAreUnreachable:
         )
         response = _decode(factory, raw)
         assert response.error is not None
+        assert response.error["code"] == "INVALID_METHOD"
         assert service.reached == []
+
+
+class TestTheGuardCoversEveryFrameworkBaseClass:
+    """
+    Stopping the walk at MessageService is not enough on its own: real services
+    subclass RunnableService or ProxiedService, and those sit ABOVE
+    MessageService in the MRO, so their members are reached before the walk
+    ever gets there. `cleanup`, `run`, `start` and `proxy` were still callable
+    from the bus.
+    """
+
+    @pytest.mark.parametrize("member", ["cleanup", "run", "start"])
+    async def test_runnable_service_members_are_unreachable(self, member):
+        from protobus.runnable_service import RunnableService
+
+        factory = MessageFactory()
+        await factory.init()
+        ctx = _FakeContext(factory)
+
+        class RunnableGuarded(RunnableService):
+            def __init__(self, context):
+                super().__init__(context)
+                self.reached = []
+
+            @property
+            def service_name(self) -> str:
+                return "audit.Runnable"
+
+            async def shoot(self, data, actor, correlation_id):
+                self.reached.append("shoot")
+                return {"hit": True}
+
+        svc = RunnableGuarded(ctx)
+        factory.parse("", svc.service_name)
+
+        method = f"audit.Runnable.{member}"
+        raw = await svc._on_message(
+            factory.build_request(method, {}, "actor-1"),
+            "corr-1",
+            {},
+            routing_key=f"REQUEST.{method}",
+        )
+        error = factory.decode_response(raw).error
+        assert error is not None, f"RunnableService.{member} was dispatched"
+        assert error["code"] == "INVALID_METHOD", (
+            f"RunnableService.{member} produced {error!r} — an incidental "
+            f"failure inside the member, not a refusal to dispatch to it"
+        )
+        assert svc.reached == []
+
+    async def test_a_runnable_services_own_method_still_dispatches(self):
+        from protobus.runnable_service import RunnableService
+
+        factory = MessageFactory()
+        await factory.init()
+        ctx = _FakeContext(factory)
+
+        class RunnableGuarded(RunnableService):
+            def __init__(self, context):
+                super().__init__(context)
+                self.reached = []
+
+            @property
+            def service_name(self) -> str:
+                return "audit.Runnable"
+
+            async def shoot(self, data, actor, correlation_id):
+                self.reached.append("shoot")
+                return {"hit": True}
+
+        svc = RunnableGuarded(ctx)
+        factory.parse("", svc.service_name)
+
+        raw = await svc._on_message(
+            factory.build_request("audit.Runnable.shoot", {}, "actor-1"),
+            "corr-1",
+            {},
+            routing_key="REQUEST.audit.Runnable.shoot",
+        )
+        assert factory.decode_response(raw).error is None
+        assert svc.reached == ["shoot"]
+
+    async def test_proxied_service_members_are_unreachable(self):
+        from protobus.proxied_service import ProxiedService
+
+        factory = MessageFactory()
+        await factory.init()
+        ctx = _FakeContext(factory)
+
+        class ProxiedGuarded(ProxiedService):
+            def __init__(self, context):
+                super().__init__(context)
+                self.reached = []
+
+            @property
+            def service_name(self) -> str:
+                return "audit.Proxied"
+
+            @property
+            def proto_file_name(self) -> str:
+                return "audit.proto"
+
+            async def shoot(self, data, actor, correlation_id):
+                self.reached.append("shoot")
+                return {"hit": True}
+
+        svc = ProxiedGuarded(ctx)
+        factory.parse("", svc.service_name)
+
+        raw = await svc._on_message(
+            factory.build_request("audit.Proxied.proxy", {}, "actor-1"),
+            "corr-1",
+            {},
+            routing_key="REQUEST.audit.Proxied.proxy",
+        )
+        error = factory.decode_response(raw).error
+        assert error is not None
+        assert error["code"] == "INVALID_METHOD", (
+            f"ProxiedService.proxy produced {error!r}; note the property must "
+            f"not be evaluated during the check"
+        )
+        assert svc.reached == []
+
+
+class TestOnlyRoutinesAreDispatchable:
+    """
+    A property on the service's OWN class is found in its ``__dict__`` like any
+    other member. Resolving it with ``getattr`` to decide whether it is
+    addressable evaluates user code during a security check — and a property
+    that raises, or that has a side effect, then does so on any request that
+    names it.
+    """
+
+    async def test_a_property_is_refused_without_being_evaluated(self):
+        evaluated = []
+
+        class PropertyService(MessageService):
+            def __init__(self, context):
+                super().__init__(context)
+                self.reached = []
+
+            @property
+            def service_name(self) -> str:
+                return "audit.Prop"
+
+            @property
+            def proto_file_name(self) -> str:
+                return "audit.proto"
+
+            @property
+            def status(self):
+                evaluated.append("status")
+                raise RuntimeError("evaluating this is itself the bug")
+
+            async def shoot(self, data, actor, correlation_id):
+                self.reached.append("shoot")
+                return {"hit": True}
+
+        factory = MessageFactory()
+        await factory.init()
+        ctx = _FakeContext(factory)
+        svc = PropertyService(ctx)
+        factory.parse("", svc.service_name)
+
+        raw = await svc._on_message(
+            factory.build_request("audit.Prop.status", {}, "actor-1"),
+            "corr-1",
+            {},
+            routing_key="REQUEST.audit.Prop.status",
+        )
+        error = factory.decode_response(raw).error
+        assert error is not None
+        assert error["code"] == "INVALID_METHOD", (
+            f"got {error!r} — the property was evaluated rather than refused"
+        )
+        assert evaluated == [], "the property was evaluated during the check"
+        assert svc.reached == []
+
+    async def test_a_plain_class_attribute_is_refused(self):
+        class AttrService(MessageService):
+            version = "1.2.3"
+
+            def __init__(self, context):
+                super().__init__(context)
+                self.reached = []
+
+            @property
+            def service_name(self) -> str:
+                return "audit.Attr"
+
+            @property
+            def proto_file_name(self) -> str:
+                return "audit.proto"
+
+            async def shoot(self, data, actor, correlation_id):
+                self.reached.append("shoot")
+                return {"hit": True}
+
+        factory = MessageFactory()
+        await factory.init()
+        ctx = _FakeContext(factory)
+        svc = AttrService(ctx)
+        factory.parse("", svc.service_name)
+
+        raw = await svc._on_message(
+            factory.build_request("audit.Attr.version", {}, "actor-1"),
+            "corr-1",
+            {},
+            routing_key="REQUEST.audit.Attr.version",
+        )
+        error = factory.decode_response(raw).error
+        assert error is not None
+        assert error["code"] == "INVALID_METHOD"
 
 
 class TestTheRoutingKeyIsEnforced:
@@ -249,6 +469,7 @@ class TestTheRoutingKeyIsEnforced:
         )
         response = _decode(factory, raw)
         assert response.error is not None
+        assert response.error["code"] == "INVALID_METHOD"
         assert service.reached == []
 
     async def test_dispatch_still_works_when_no_routing_key_is_supplied(self, service):
@@ -279,6 +500,7 @@ class TestAnUndecodableBodyIsAnsweredNotRetried:
         assert raw is not None, "no reply was produced for an undecodable body"
         response = _decode(factory, raw)
         assert response.error is not None
+        assert response.error["code"] == "PROTOCOL_ERROR"
         assert service.reached == []
 
     async def test_the_error_reply_does_not_quote_the_payload(self, service):

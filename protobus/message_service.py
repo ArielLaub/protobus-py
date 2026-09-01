@@ -188,22 +188,38 @@ class MessageService(ABC):
         ``getattr(self, name)`` walked the whole MRO, so every member of
         MessageService, RunnableService, ProxiedService, ABC and object was
         addressable from the bus: naming ``init``, ``publish_event``,
-        ``cleanup`` or ``_on_message`` reached them. The walk now stops at
-        MessageService — the same boundary TS protobus draws in 4085332.
+        ``cleanup`` or ``_on_message`` reached them. The walk now stops at the
+        framework — the same boundary TS protobus draws in 4085332.
 
-        Resolution goes through each class's ``__dict__`` rather than
-        ``getattr`` so that a property is not evaluated just to decide whether
-        it is addressable.
+        The boundary is "declared in the protobus package", not "is
+        MessageService": RunnableService and ProxiedService sit ABOVE
+        MessageService in a real service's MRO, so stopping at MessageService
+        alone would still have exposed ``cleanup``, ``run``, ``start`` and
+        ``proxy`` — and RunnableService is what services actually subclass.
+
+        Only a routine (a plain function on the class) is accepted. A property
+        is not evaluated just to decide whether it is addressable: doing so
+        would both invoke user code during a security check and, for
+        ProxiedService.proxy, raise out of the dispatcher.
         """
         if not method_name or method_name.startswith("_"):
             return None
 
         for klass in type(self).__mro__:
-            if klass in (MessageService, ABC, object):
+            module = getattr(klass, "__module__", "") or ""
+            if module == "protobus" or module.startswith("protobus."):
                 break
-            if method_name in klass.__dict__:
-                handler = getattr(self, method_name, None)
-                return handler if callable(handler) else None
+            if klass in (ABC, object):
+                break
+            raw = klass.__dict__.get(method_name)
+            if raw is None:
+                continue
+            if not inspect.isroutine(raw):
+                # A property, a class attribute, a nested class — none of these
+                # are RPC handlers.
+                return None
+            handler = getattr(self, method_name, None)
+            return handler if callable(handler) else None
         return None
 
     def _resolve_contract_method(
