@@ -9,11 +9,14 @@ from aio_pika.abc import AbstractChannel, AbstractExchange
 
 from .callback_listener import CallbackListener
 from .config import Config
-from .connection import IConnection
+from .connection import IConnection, publish_confirmed
 from .errors import (
     DisconnectedError,
     NotConnectedError,
     NotInitializedError,
+    RpcTimeoutError,
+    StreamBackpressureError,
+    StreamSequenceError,
     StreamTimeoutError,
 )
 from .logger import Logger
@@ -35,8 +38,41 @@ def _parse_final_header(headers: Dict[str, Any]) -> bool:
     return bool(v)
 
 
+def _parse_seq_header(headers: Dict[str, Any]) -> Optional[int]:
+    """Read the x-protobus-seq header tolerantly across AMQP client encodings."""
+    v = headers.get(Config.HEADER_SEQ)
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode("utf-8", errors="ignore")
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # Sentinel pushed into a stream's chunk queue to indicate "no more chunks."
 _STREAM_END = object()
+
+
+class _StreamFailure:
+    """
+    Sentinel carrying the reason a stream ended early.
+
+    Distinct from _STREAM_END, which means "the producer finished". Pushing
+    _STREAM_END on a disconnect made a truncated stream indistinguishable from
+    a complete one: the caller's ``async for`` simply ended, and the missing
+    tail looked like a short answer.
+    """
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: BaseException):
+        self.error = error
 
 
 class MessageDispatcher:
@@ -61,6 +97,9 @@ class MessageDispatcher:
         # correlation_id -> queue of streaming chunks. Replies for streaming
         # calls land here; the consuming async iterator drains them.
         self._pending_streams: Dict[str, asyncio.Queue] = {}
+        # Next sequence number expected on each stream, so a gap is detected
+        # rather than delivered as a shorter complete stream.
+        self._stream_next_seq: Dict[str, int] = {}
         self._is_initialized = False
 
         # Set up connection event handlers
@@ -71,6 +110,23 @@ class MessageDispatcher:
     def is_initialized(self) -> bool:
         """Check if the dispatcher has been initialized."""
         return self._is_initialized
+
+    def _fail_stream(self, correlation_id: str, error: BaseException) -> None:
+        """
+        End a streaming call by raising, not by looking finished.
+
+        The queue is left holding the failure so the consuming iterator raises
+        on its next pull; the slot is dropped here so a late chunk for a dead
+        stream is reported as unknown rather than accumulating.
+        """
+        queue = self._pending_streams.pop(correlation_id, None)
+        self._stream_next_seq.pop(correlation_id, None)
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(_StreamFailure(error))
+        except Exception:  # pragma: no cover - unbounded queue
+            pass
 
     async def init(self) -> None:
         """Initialize the message dispatcher."""
@@ -123,9 +179,38 @@ class MessageDispatcher:
         if correlation_id in self._pending_streams:
             queue = self._pending_streams[correlation_id]
             is_final = _parse_final_header(hdrs)
+
+            # A gap in the sequence means a chunk was lost. Without this the
+            # caller receives a shorter but apparently complete stream — the
+            # producer's output silently truncated in the middle.
+            seq = _parse_seq_header(hdrs)
+            if seq is not None:
+                expected = self._stream_next_seq.get(correlation_id, 0)
+                if seq != expected:
+                    self._fail_stream(
+                        correlation_id,
+                        StreamSequenceError(
+                            f"Streaming chunk out of sequence: expected {expected}, "
+                            f"got {seq}"
+                        ),
+                    )
+                    return None
+                self._stream_next_seq[correlation_id] = seq + 1
+
             # Non-empty payload → deliver. Empty body on a final-only terminal
             # is treated as "end of stream, no extra data."
             if data:
+                # Bounded: a producer outrunning its consumer would otherwise
+                # buffer without limit inside this dispatcher.
+                if queue.qsize() >= Config.stream_max_buffered_chunks():
+                    self._fail_stream(
+                        correlation_id,
+                        StreamBackpressureError(
+                            f"Streaming reply buffer exceeded "
+                            f"{Config.stream_max_buffered_chunks()} undelivered chunks"
+                        ),
+                    )
+                    return None
                 await queue.put(data)
             if is_final:
                 await queue.put(_STREAM_END)
@@ -192,18 +277,28 @@ class MessageDispatcher:
                 reply_to=reply_to,
             )
 
-            await self._exchange.publish(message, routing_key=routing_key)
+            # Mandatory: a request nothing is bound to fails now rather than
+            # after the caller's whole RPC timeout. This is the difference
+            # between "that service is not running" and "that call was slow".
+            await publish_confirmed(self._exchange, message, routing_key)
             Logger.debug(f"Published message to {routing_key}")
 
-            # Wait for response if RPC
+            # Wait for response if RPC.
+            #
+            # The deadline is the CALLER's (RPC_CALL_TIMEOUT_MS, 30s), not the
+            # server's handler budget (MESSAGE_PROCESSING_TIMEOUT, 600s). Using
+            # the latter meant a call to a service that was scaled to zero, or
+            # simply not running, blocked its caller for ten minutes.
             if rpc and response_future:
-                timeout = (timeout_ms or Config.message_processing_timeout()) / 1000
+                timeout = (timeout_ms or Config.rpc_call_timeout()) / 1000
                 try:
                     return await asyncio.wait_for(response_future, timeout=timeout)
                 except asyncio.TimeoutError:
                     # Clean up the pending callback
                     self._pending_callbacks.pop(correlation_id, None)
-                    raise
+                    raise RpcTimeoutError(
+                        f"No reply to {routing_key} within {timeout}s"
+                    ) from None
 
             return None
 
@@ -243,6 +338,7 @@ class MessageDispatcher:
         correlation_id = str(uuid.uuid4())
         chunk_queue: asyncio.Queue = asyncio.Queue()
         self._pending_streams[correlation_id] = chunk_queue
+        self._stream_next_seq[correlation_id] = 0
 
         try:
             reply_to = self._callback_listener.callback_queue
@@ -251,7 +347,7 @@ class MessageDispatcher:
                 correlation_id=correlation_id,
                 reply_to=reply_to,
             )
-            await self._exchange.publish(message, routing_key=routing_key)
+            await publish_confirmed(self._exchange, message, routing_key)
             Logger.debug(f"Published streaming request to {routing_key}")
 
             idle_timeout = (
@@ -271,9 +367,15 @@ class MessageDispatcher:
                 if item is _STREAM_END:
                     return
 
+                # A stream that ended early raises. It must not be mistaken
+                # for one that finished.
+                if isinstance(item, _StreamFailure):
+                    raise item.error
+
                 yield item
         finally:
             self._pending_streams.pop(correlation_id, None)
+            self._stream_next_seq.pop(correlation_id, None)
 
     async def _on_reconnected(self) -> None:
         """Handle reconnection event."""
@@ -295,15 +397,18 @@ class MessageDispatcher:
                 future.set_exception(error)
         self._pending_callbacks.clear()
 
-        # Terminate any in-flight streams with the disconnection sentinel.
-        # The waiting async iterators will raise StreamTimeoutError on their
-        # next idle window, surfacing the disconnect to callers.
-        for correlation_id, queue in list(self._pending_streams.items()):
-            try:
-                queue.put_nowait(_STREAM_END)
-            except Exception:
-                pass
+        # Fail any in-flight streams. This used to push _STREAM_END — the same
+        # sentinel a *complete* stream ends with — so a caller whose stream was
+        # cut in half saw its `async for` end normally and treated the prefix
+        # as the whole answer. (The old docstring claimed StreamTimeoutError
+        # would be raised on the next idle window; it never was.)
+        for correlation_id in list(self._pending_streams):
+            self._fail_stream(
+                correlation_id,
+                DisconnectedError("Connection lost while streaming a reply"),
+            )
         self._pending_streams.clear()
+        self._stream_next_seq.clear()
 
         self._channel = None
         self._exchange = None
