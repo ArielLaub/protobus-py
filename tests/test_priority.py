@@ -1076,6 +1076,20 @@ class TestEndToEnd:
         exceeds the backlog, priority is completely inert. max_concurrent is
         therefore NOT an independent throughput dial once priority is in play
         — it IS the width of the window priority cannot see into.
+
+        PRECONDITION, asserted below rather than assumed: the consumer must be
+        SATURATED — every prefetch slot occupied by an in-flight handler. The
+        gate here holds EVERY delivery, not just the first, which is what makes
+        that true. It matters because protobus does not serialise deliveries: a
+        free prefetch slot keeps pulling from the queue while other handlers
+        run, so with a fast handler the backlog drains itself and the control
+        message has nothing left to jump. Measured, same setup but holding only
+        the first delivery: prefetch 5 and 20 both consumed all 50 bulk
+        messages before the control message was even published, putting it at
+        index 50. That is not a counter-example — it is measuring the drain
+        rate rather than the prefetch window. Hence the peak-in-flight
+        assertion: if this test ever stops saturating, it must fail loudly
+        rather than quietly measure something else.
         """
         bulk = 30
         ctx = Context()
@@ -1084,11 +1098,17 @@ class TestEndToEnd:
         seen: List[str] = []
         gate = asyncio.Event()
         first_delivered = asyncio.Event()
+        in_flight = 0
+        peak_in_flight = 0
 
         async def handler(body: bytes, correlation_id: str, headers=None):
+            nonlocal in_flight, peak_in_flight
+            in_flight += 1
+            peak_in_flight = max(peak_in_flight, in_flight)
             seen.append(body.decode())
             first_delivered.set()
-            await gate.wait()
+            await gate.wait()   # holds EVERY delivery — see PRECONDITION above
+            in_flight -= 1
             return None
 
         listener = MessageListener(
@@ -1113,6 +1133,19 @@ class TestEndToEnd:
 
             await asyncio.wait_for(first_delivered.wait(), timeout=10)
             await asyncio.sleep(1.0)  # let the broker fill the prefetch window
+
+            # The precondition, asserted before the thing it makes true: every
+            # prefetch slot must be occupied. Without this the test could still
+            # go green while measuring how fast the backlog drained itself.
+            assert peak_in_flight == prefetch, (
+                f"consumer not saturated: peak in-flight {peak_in_flight} != "
+                f"prefetch {prefetch}; this test would be measuring the drain "
+                f"rate, not the prefetch window"
+            )
+            assert len(seen) == prefetch, (
+                f"expected exactly {prefetch} bulk messages held in flight, "
+                f"got {len(seen)}"
+            )
 
             await ctx.publish_message(
                 b"control",

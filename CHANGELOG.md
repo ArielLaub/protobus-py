@@ -60,13 +60,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of a high-priority one. It shrinks the window by orders of magnitude; it does
   not eliminate it.
 
-  The relationship is an exact equality, measured on one replica with a
-  50-message backlog and only the prefetch varying: `max_concurrent` of
-  1/5/20 puts the control message at index 1/5/20, and `max_concurrent=100`
-  puts it at index 50 — the whole backlog was prefetched and **priority is
-  inert**. So `max_concurrent` is not an independent throughput dial once
-  priority is in play: raising it widens the window priority cannot see into
-  by exactly the amount you raise it.
+  **While the consumer is saturated** — every prefetch slot occupied by an
+  in-flight handler — the relationship is an exact equality. Measured on one
+  replica with a 50-message backlog and only the prefetch varying:
+  `max_concurrent` of 1/5/20 puts the control message at index 1/5/20, and
+  `max_concurrent=100` puts it at index 50 — the whole backlog was prefetched
+  and **priority is inert**. So `max_concurrent` is not an independent
+  throughput dial once priority is in play: raising it widens the window
+  priority cannot see into by exactly the amount you raise it.
+
+  The saturation condition is load-bearing and is stated in the docs, because
+  protobus does not serialise deliveries — a free prefetch slot keeps pulling
+  from the queue while other handlers run. With a **fast** handler the backlog
+  drains itself and there is nothing left to jump: same setup holding only the
+  first delivery, prefetch 5 and 20 both consumed all 50 bulk messages before
+  the control message was published. That measures the drain rate, not the
+  prefetch window. The test asserts peak in-flight == prefetch so the
+  precondition is encoded rather than assumed.
 
 - **`max_priority` requires `max_concurrent` (and `late_ack`), and is refused
   without them.** With no prefetch bound the broker pushes the whole queue into

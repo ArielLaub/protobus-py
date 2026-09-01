@@ -130,15 +130,16 @@ That is a two-orders-of-magnitude improvement and it is usually the difference b
 
 ### `max_concurrent` is not a throughput dial — it is the width of the blind spot
 
-The relationship is an exact equality, not a rule of thumb. Measured on one replica with a
-50-message backlog, a gated handler, and only the prefetch varying:
+**While the consumer is saturated** — every prefetch slot occupied by an in-flight handler —
+the relationship is an exact equality, not a rule of thumb. Measured on one replica with a
+50-message backlog and only the prefetch varying:
 
-| `max_concurrent` | Control message handled at |
-|---|---|
-| 1 | index **1** |
-| 5 | index **5** |
-| 20 | index **20** |
-| 100 | index **50** — the whole backlog was prefetched; priority is **inert** |
+| `max_concurrent` | In flight | Control message handled at |
+|---|---|---|
+| 1 | 1 | index **1** |
+| 5 | 5 | index **5** |
+| 20 | 20 | index **20** |
+| 100 | 50 | index **50** — the whole backlog was prefetched; priority is **inert** |
 
 The control message comes out at index == prefetch: the N messages already pushed to this
 consumer are past reordering, and it jumps everything still in the queue behind them. The
@@ -147,8 +148,32 @@ working entirely**, silently.
 
 So `max_concurrent` cannot be tuned independently once priority is in play. Raising it for
 throughput widens the window priority cannot see into, by exactly the amount you raise it.
-Pinned by a parametrized test that asserts the equality, and mutation-checked: with the
-prefetch not applied at all, the control message lands last.
+
+#### The saturation condition, and what you measure without it
+
+That equality holds *because* every slot is busy. Protobus does not serialise deliveries — a
+free prefetch slot keeps pulling from the queue while other handlers run — so with a **fast**
+handler the backlog drains itself and there is nothing left for the control message to jump.
+Same setup, same 50-message backlog, but only the first delivery held:
+
+| `max_concurrent` | Peak in flight | Bulk consumed before control was published | Control handled at |
+|---|---|---|---|
+| 1 | 1 | 1 | index **1** |
+| 5 | 2 | **50** | index 50 |
+| 20 | 2 | **50** | index 50 |
+
+The `index 50` rows are not a counter-example to the law — they are measuring something
+else. The backlog was already gone. (Prefetch 1 still matches, because holding one message
+saturates a one-slot consumer by definition.)
+
+This matters for anyone benchmarking it: **a fast handler measures the drain rate, not the
+prefetch window**, and will make the table above look wrong. It is not a bug and not a
+hazard — a backlog that drains in milliseconds is not a backlog, and priority has nothing to
+do. The saturated case is the one the feature exists for: slow handlers, real queue depth.
+
+Pinned by a parametrized test that asserts the equality **and** asserts peak in-flight ==
+prefetch, so the precondition is encoded rather than assumed. Mutation-checked: with the
+prefetch never applied, the control message lands last in every case.
 
 ### Priority requires a bounded prefetch — and protobus enforces it
 
