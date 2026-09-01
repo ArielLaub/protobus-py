@@ -7,7 +7,7 @@ from aio_pika import ExchangeType, Message
 from aio_pika.abc import AbstractChannel, AbstractExchange
 
 from .config import Config
-from .connection import IConnection
+from .connection import IConnection, publish_confirmed
 from .errors import InvalidMessageError, NotConnectedError, NotInitializedError
 from .logger import Logger
 from .message_factory import MessageFactory
@@ -106,7 +106,12 @@ class EventDispatcher:
             correlation_id=correlation_id,
         )
 
-        await self._exchange.publish(message, routing_key=routing_key)
+        # Events are deliberately NOT mandatory: having no subscribers is a
+        # normal state for an event, unlike a request. Parity with TS protobus
+        # 1e829ad.
+        await publish_confirmed(
+            self._exchange, message, routing_key, mandatory=False
+        )
         Logger.debug(f"Published event {event_type} to {routing_key}")
 
     async def _on_reconnected(self) -> None:
