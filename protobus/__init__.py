@@ -50,6 +50,7 @@ from .errors import (
     InvalidServiceNameError,
     InvalidMethodError,
     InvalidResultError,
+    InvalidPriorityError,
     PublishMessageError,
     MissingProtoError,
     MissingExchangeError,
@@ -83,6 +84,9 @@ from .logger import Logger, ILogger, set_logger
 
 # Config
 from .config import Config
+
+# Priority helpers
+from .priority import validate_max_priority, validate_message_priority
 
 __version__ = "1.5.0"
 
@@ -128,6 +132,7 @@ __all__ = [
     "InvalidServiceNameError",
     "InvalidMethodError",
     "InvalidResultError",
+    "InvalidPriorityError",
     "PublishMessageError",
     "MissingProtoError",
     "MissingExchangeError",
@@ -157,4 +162,7 @@ __all__ = [
     "set_logger",
     # Config
     "Config",
+    # Priority
+    "validate_max_priority",
+    "validate_message_priority",
 ]

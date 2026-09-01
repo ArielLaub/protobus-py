@@ -25,6 +25,7 @@ Since Protobus uses standard Protobuf schemas and AMQP protocol, implementing cl
 - **Event System**: Publish-subscribe with topic-based routing and wildcards
 - **Auto-Reconnection**: Exponential backoff with jitter for resilient connections
 - **Message Retry**: Automatic retry with dead-letter queue (DLQ) support
+- **Message Priority**: Opt-in priority queues so control traffic jumps a bulk backlog on the same queue. See [priority docs](docs/advanced/message-priority.md) — enabling it on an existing queue needs a one-time operator migration.
 - **Custom Types**: Extensible type system (BigInt, Timestamp built-in)
 - **Async/Await**: Built on asyncio and aio-pika for modern Python
 - **CLI Tools**: Generate types and service stubs from .proto files
@@ -162,6 +163,7 @@ servicesDir = "./services"
 
 - [Streaming RPC](docs/advanced/streaming.md) - Server-streaming responses
 - [Error Handling](docs/advanced/error-handling.md) - Retries and DLQ
+- [Message Priority](docs/advanced/message-priority.md) - Priority queues, and the migration an existing queue needs
 - [Custom Logger](docs/advanced/custom-logger.md) - Logging integration
 - [Custom Types](docs/advanced/custom-types.md) - Extending the type system
 

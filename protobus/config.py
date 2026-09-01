@@ -84,3 +84,21 @@ class Config:
     # Headers used by the streaming wire protocol. See docs/advanced/streaming.md.
     HEADER_FINAL = "x-protobus-final"
     HEADER_SEQ = "x-protobus-seq"
+
+    # ---- Message priority -------------------------------------------------
+    # Three rungs, deliberately. RabbitMQ builds internal structures per
+    # priority level, so a large x-max-priority costs real memory and
+    # throughput; the broker's own guidance is to stay in single digits. Two
+    # rungs cover the motivating case (control traffic jumping its own bulk
+    # fan-out) and the third costs nothing measurable while saving a breaking
+    # change later.
+    #
+    # PRIORITY_NORMAL is 0, which is also what RabbitMQ assumes for a message
+    # published with no priority property at all — so an old publisher and a
+    # new one that passes PRIORITY_NORMAL sort identically.
+    PRIORITY_NORMAL = 0
+    PRIORITY_HIGH = 1
+    PRIORITY_CONTROL = 2
+
+    # The value to pass as max_priority to make the constants above usable.
+    RECOMMENDED_MAX_PRIORITY = 2

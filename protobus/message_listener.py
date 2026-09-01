@@ -34,6 +34,7 @@ class MessageListener(BaseListener):
         late_ack: bool = False,
         max_concurrent: Optional[int] = None,
         retry_options: Optional[RetryOptions] = None,
+        max_priority: Optional[int] = None,
     ):
         """
         Initialize the message listener.
@@ -43,6 +44,8 @@ class MessageListener(BaseListener):
             late_ack: Whether to use late acknowledgment
             max_concurrent: Maximum concurrent messages (prefetch count)
             retry_options: Options for retry behavior
+            max_priority: Optional queue priority ceiling (``x-max-priority``).
+                Applies to the SERVICE queue only — see _setup_retry_queues.
         """
         message_ttl = None
         if retry_options and retry_options.message_ttl_ms:
@@ -53,6 +56,7 @@ class MessageListener(BaseListener):
             late_ack=late_ack,
             max_concurrent=max_concurrent,
             message_ttl_ms=message_ttl,
+            max_priority=max_priority,
         )
 
         self._exchange_name = Config.bus_exchange_name()
@@ -87,7 +91,23 @@ class MessageListener(BaseListener):
         )
 
     async def _setup_retry_queues(self) -> None:
-        """Set up retry and dead letter queues."""
+        """
+        Set up retry and dead letter queues.
+
+        These deliberately do NOT get an ``x-max-priority`` of their own, even
+        when the service queue has one. Ordering *within* the retry queue is by
+        TTL expiry, not priority, so a ceiling there would buy nothing — and it
+        would turn enabling priority from a one-queue operator migration into a
+        three-queue one.
+
+        A retried message still re-sorts correctly when it lands back on the
+        priority-enabled service queue, but NOT because the broker preserves
+        priority across a dead-letter hop (it does, but this path does not use
+        it). ``Connection._retry_message`` RE-PUBLISHES the message onto the
+        retry queue, so the priority survives only because that publish
+        explicitly copies ``message.priority``. If you are tempted to simplify
+        that copy away, this justification goes with it.
+        """
         if (
             self._retry_queue_setup
             or self._retry_config.max_retries <= 0

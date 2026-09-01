@@ -54,6 +54,8 @@ class _FakeExchange:
 
 class _FakeCallbackListener:
     callback_queue = "amq.gen-fake-callback-queue"
+    # publish()/publish_streaming() gained an is_ready gate on main.
+    is_ready = True
 
 
 def _dispatcher():
