@@ -136,9 +136,12 @@ the pull request rather than half-fixed here.
 
 ### Notes
 
-- Tests: 128 pass (55 pre-existing + 73 new), against a real RabbitMQ. Every
+- Tests: 135 pass (55 pre-existing + 80 new), against a real RabbitMQ. Every
   new fix was mutation-checked: the fix was reverted one at a time and the test
-  naming it confirmed to fail.
+  naming it confirmed to fail, 18/18. Two of those reverts stayed green on the
+  first attempt and exposed real gaps — the dispatch boundary had to move from
+  MessageService to the whole protobus package, and several refusal assertions
+  were being satisfied by an incidental TypeError rather than by the guard.
 - Routing, publisher confirms, `basic.return` and heartbeat negotiation are
   verified against a real broker in `tests/test_audit_broker.py`; they cannot
   be established with mocks.
