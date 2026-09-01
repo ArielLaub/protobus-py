@@ -17,6 +17,7 @@ from .errors import (
     StreamTimeoutError,
 )
 from .logger import Logger
+from .priority import validate_message_priority
 
 
 def _parse_final_header(headers: Dict[str, Any]) -> bool:
@@ -147,6 +148,7 @@ class MessageDispatcher:
         routing_key: str,
         rpc: bool = True,
         timeout_ms: Optional[int] = None,
+        priority: Optional[int] = None,
     ) -> Optional[bytes]:
         """
         Publish a message and optionally wait for a response.
@@ -156,6 +158,17 @@ class MessageDispatcher:
             routing_key: Routing key for the message
             rpc: Whether to wait for a response
             timeout_ms: Timeout for RPC response in milliseconds
+            priority: Optional AMQP message priority (0..255).
+
+                Only meaningful when the destination queue was declared with
+                ``x-max-priority``; publishing a priority to a queue without
+                one is accepted and simply ignored by the broker (verified —
+                this is what lets a new publisher talk to an old consumer).
+
+                Priority reorders only messages STILL SITTING in the queue.
+                Anything already prefetched by a consumer is not reordered, so
+                with prefetch N across R replicas up to N*R messages can still
+                be ahead of a high-priority one.
 
         Returns:
             Response data if rpc=True, None otherwise
@@ -174,6 +187,10 @@ class MessageDispatcher:
         if not self._channel or not self._exchange:
             raise NotConnectedError("Channel or exchange not available")
 
+        # Validate before anything is allocated or sent — see priority.py for
+        # why aio-pika's own handling is not a safe backstop.
+        priority = validate_message_priority(priority)
+
         correlation_id = str(uuid.uuid4())
 
         # Set up response future if RPC
@@ -190,6 +207,7 @@ class MessageDispatcher:
                 body=data,
                 correlation_id=correlation_id,
                 reply_to=reply_to,
+                priority=priority,
             )
 
             await self._exchange.publish(message, routing_key=routing_key)

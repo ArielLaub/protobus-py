@@ -116,6 +116,27 @@ class InvalidResultError(Exception):
     pass
 
 
+class InvalidPriorityError(ValueError):
+    """
+    Raised for an out-of-range or non-integer queue/message priority.
+
+    Subclasses ValueError because that is what a caller would already be
+    catching around a bad argument, and because both of the underlying
+    failures it replaces are value problems:
+
+    - ``x-max-priority`` outside 1..255 is a 406 PRECONDITION_FAILED at
+      declare time, which closes the channel — and protobus shares one
+      connection, so a bad value takes out every listener in the process.
+    - A message ``priority`` outside 0..255 raises a raw ``struct.error``
+      from deep inside the AMQP encoder, and a *non-integer* one is worse:
+      aio-pika does ``int(priority)``, so 1.5 is silently stored as 1.
+
+    Validating at our own seam turns all of that into one clear error, and
+    keeps the Python port's behaviour identical to the TypeScript port's.
+    """
+    pass
+
+
 class PublishMessageError(Exception):
     """Raised when publishing a message fails."""
     pass

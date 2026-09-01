@@ -28,9 +28,22 @@ class MessageServiceOptions:
         self,
         max_concurrent: Optional[int] = None,
         retry: Optional[RetryOptions] = None,
+        max_priority: Optional[int] = None,
     ):
+        """
+        Args:
+            max_concurrent: Maximum concurrent messages (prefetch count)
+            retry: Retry behaviour options
+            max_priority: Opt in to a priority-ordered service queue by giving
+                the queue's ``x-max-priority`` ceiling. Defaults to None, which
+                declares the queue exactly as before — see BaseListener for why
+                that default cannot change, and the README for the one-time
+                migration an existing queue needs. Recommended value:
+                ``Config.RECOMMENDED_MAX_PRIORITY`` (2).
+        """
         self.max_concurrent = max_concurrent
         self.retry = retry or DEFAULT_RETRY_OPTIONS
+        self.max_priority = max_priority
 
 
 class MessageService(ABC):
@@ -67,6 +80,7 @@ class MessageService(ABC):
             late_ack=bool(opts.max_concurrent),
             max_concurrent=opts.max_concurrent,
             retry_options=self._retry_options,
+            max_priority=opts.max_priority,
         )
 
         self._event_listener = EventListener(context.connection, context.factory)

@@ -15,6 +15,7 @@ from .errors import (
     NotInitializedError,
 )
 from .logger import Logger
+from .priority import validate_max_priority
 
 # Type alias for message handlers.
 # Handlers may return bytes (unary reply), None (no reply), or an
@@ -36,6 +37,7 @@ class BaseListener:
         late_ack: bool = False,
         max_concurrent: Optional[int] = None,
         message_ttl_ms: Optional[int] = None,
+        max_priority: Optional[int] = None,
     ):
         """
         Initialize the base listener.
@@ -45,11 +47,31 @@ class BaseListener:
             late_ack: Whether to use late acknowledgment
             max_concurrent: Maximum concurrent messages (prefetch count)
             message_ttl_ms: Optional message TTL in milliseconds
+            max_priority: Optional queue priority ceiling (``x-max-priority``).
+
+                Defaults to None, which declares the queue with no
+                ``x-max-priority`` argument at all — byte-identical to a
+                listener from before priority support existed. This default is
+                load-bearing: RabbitMQ answers a re-declare that adds
+                ``x-max-priority`` to an existing queue with a 406
+                PRECONDITION_FAILED and closes the channel, and protobus shares
+                one connection, so a silent default would take every listener
+                in the process down on upgrade.
+
+                Enabling it on a queue that already exists therefore needs a
+                one-time drain, delete and recreate by an operator. See the
+                "Message priority" section of the README.
+
+                Recommended value: ``Config.RECOMMENDED_MAX_PRIORITY`` (2).
         """
         self._connection = connection
         self._late_ack = late_ack
         self._max_concurrent = max_concurrent
         self._message_ttl_ms = message_ttl_ms
+        # Validated at construction, before anything is sent: an invalid value
+        # would otherwise surface as a channel-killing 406 on the shared
+        # connection at declare time.
+        self._max_priority = validate_max_priority(max_priority)
 
         self._channel: Optional[AbstractChannel] = None
         self._exchange: Optional[AbstractExchange] = None
@@ -121,10 +143,18 @@ class BaseListener:
             self._exchange_type,
         )
 
-        # Prepare queue arguments
+        # Prepare queue arguments.
+        #
+        # Every key here is opt-in. A listener that configured neither a TTL
+        # nor a priority ceiling must reach ensure_queue with arguments=None,
+        # exactly as it did before either feature existed — otherwise the
+        # declare 406s against an already-deployed queue and kills the shared
+        # connection's channel.
         arguments: Dict[str, Any] = {}
         if self._message_ttl_ms is not None:
             arguments["x-message-ttl"] = self._message_ttl_ms
+        if self._max_priority is not None:
+            arguments["x-max-priority"] = self._max_priority
 
         # Declare queue
         self._queue = await self._connection.ensure_queue(
