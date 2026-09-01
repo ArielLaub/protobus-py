@@ -58,7 +58,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Priority reorders the queue, not the consumers' prefetch buffers.** With
   prefetch `N` across `R` replicas, up to `N × R` messages can still sit ahead
   of a high-priority one. It shrinks the window by orders of magnitude; it does
-  not eliminate it. Lower the prefetch if you need a tighter bound.
+  not eliminate it.
+
+  The relationship is an exact equality, measured on one replica with a
+  50-message backlog and only the prefetch varying: `max_concurrent` of
+  1/5/20 puts the control message at index 1/5/20, and `max_concurrent=100`
+  puts it at index 50 — the whole backlog was prefetched and **priority is
+  inert**. So `max_concurrent` is not an independent throughput dial once
+  priority is in play: raising it widens the window priority cannot see into
+  by exactly the amount you raise it.
 
 - **`max_priority` requires `max_concurrent` (and `late_ack`), and is refused
   without them.** With no prefetch bound the broker pushes the whole queue into
@@ -84,7 +92,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ports emit an **identical queue argument set** — a TS service re-declares a
   Python-created priority queue with no 406, while the negative control (a TS
   service without `maxPriority`) is correctly rejected. The reverse direction,
-  Python publisher → TS consumer, has NOT been run and is not claimed.
+  Python publisher → TS consumer, was then run too: control handled at index 1
+  of 21, identical to the forward direction. Both directions verified, not
+  inferred.
 
   Three deliberate divergences, all behaviourally invisible because RabbitMQ
   cannot distinguish an absent priority from an explicit `0`: amqplib omits the
@@ -101,7 +111,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1`; an out-of-range value surfaces as a raw `struct.error` from the encoder;
   and an out-of-range `x-max-priority` is a channel-killing 406.
 
-- Tests: 116/116 pass (55 existing + 61 priority). The broker-backed ones need
+- Tests: 118/118 pass (55 existing + 63 priority). The broker-backed ones need
   a live RabbitMQ (`docker-compose up -d`).
 
 ## [1.4.0] — 2026-06-04

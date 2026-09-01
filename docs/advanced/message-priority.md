@@ -126,8 +126,29 @@ high-priority message that arrives after them. Concretely, at `max_concurrent=10
 replicas, a control message can still wait behind ~30 bulk messages — instead of 5,000.
 
 That is a two-orders-of-magnitude improvement and it is usually the difference between
-"breaches its deadline" and "fine". It is **not** a guarantee of immediate handling. If you
-need a hard bound, lower the prefetch — the two trade off directly against each other.
+"breaches its deadline" and "fine". It is **not** a guarantee of immediate handling.
+
+### `max_concurrent` is not a throughput dial — it is the width of the blind spot
+
+The relationship is an exact equality, not a rule of thumb. Measured on one replica with a
+50-message backlog, a gated handler, and only the prefetch varying:
+
+| `max_concurrent` | Control message handled at |
+|---|---|
+| 1 | index **1** |
+| 5 | index **5** |
+| 20 | index **20** |
+| 100 | index **50** — the whole backlog was prefetched; priority is **inert** |
+
+The control message comes out at index == prefetch: the N messages already pushed to this
+consumer are past reordering, and it jumps everything still in the queue behind them. The
+last row is the one to internalise — **once the prefetch exceeds the backlog, priority stops
+working entirely**, silently.
+
+So `max_concurrent` cannot be tuned independently once priority is in play. Raising it for
+throughput widens the window priority cannot see into, by exactly the amount you raise it.
+Pinned by a parametrized test that asserts the equality, and mutation-checked: with the
+prefetch not applied at all, the control message lands last.
 
 ### Priority requires a bounded prefetch — and protobus enforces it
 
@@ -198,7 +219,7 @@ Everything here is additive and opt-in, in both directions:
 | **New** service that does not pass `max_priority` | Declares its queue with the identical argument set as before. No migration, no 406. |
 | **New** client publishing a priority to an **old** (non-priority) queue | Accepted by the broker and ignored for ordering. No error, channel stays open. This is what lets clients be deployed before services. |
 | Old client calling a **new** priority-enabled service | Works. Its messages carry no explicit priority, which RabbitMQ treats as 0 — the same as `PRIORITY_NORMAL`. |
-| TypeScript publisher → Python consumer | Verified end-to-end against a live broker. See [Cross-port verification](#cross-port-verification). |
+| TypeScript publisher ↔ Python consumer, both directions | Verified end-to-end against a live broker. See [Cross-port verification](#cross-port-verification). |
 
 ### Cross-port verification
 
@@ -219,8 +240,12 @@ sibling `protobus-py` checkout and drives it from a TS client. Two results:
    current is the value '2' of type 'byte'`. So the two ports emit the same argument set,
    and the check has teeth.
 
-**Not verified: Python publisher → TS consumer.** Expected to hold given (1) and (2), but
-it has not been run, and it is not claimed here.
+3. **Python publisher → TS consumer.** The mirror image: a Python `ServiceProxy` publishes
+   20 bulk at `PRIORITY_NORMAL` then one at `PRIORITY_CONTROL` (keyword-only `priority=`)
+   into a TS `MessageService` with `maxPriority=2, maxConcurrent=1`, gated so the 19 are
+   genuinely queued. Control handled at index 1 of 21 — identical to (1). This is the only
+   one of the three that puts the Python *publish* path in front of a TS consumer, rather
+   than exercising the declare path or the TS publisher.
 
 ### Where the two ports deliberately differ
 

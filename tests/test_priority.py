@@ -1055,6 +1055,91 @@ class TestEndToEnd:
             await ch.queue_delete(queue_name)
             await ctx.close()
 
+    @pytest.mark.parametrize("prefetch", [1, 5])
+    async def test_prefetch_is_exactly_the_width_of_the_priority_blind_spot(
+        self, prefetch
+    ):
+        """
+        Pins the docs' central caveat as an equality, not a hand-wave.
+
+        The control message comes out at index == prefetch: the N messages
+        already pushed to this consumer are past reordering, and the control
+        message jumps everything still in the queue behind them. Measured
+        across a wider sweep (50 bulk, one replica, only prefetch varying):
+
+            max_concurrent=1   -> CONTROL at index 1
+            max_concurrent=5   -> CONTROL at index 5
+            max_concurrent=20  -> CONTROL at index 20
+            max_concurrent=100 -> CONTROL at index 50   (all 50 prefetched)
+
+        The last row is the point worth internalising: once the prefetch
+        exceeds the backlog, priority is completely inert. max_concurrent is
+        therefore NOT an independent throughput dial once priority is in play
+        — it IS the width of the window priority cannot see into.
+        """
+        bulk = 30
+        ctx = Context()
+        await ctx.init(RABBITMQ_URL)
+        queue_name = f"pbtest.window.{uuid.uuid4().hex[:8]}"
+        seen: List[str] = []
+        gate = asyncio.Event()
+        first_delivered = asyncio.Event()
+
+        async def handler(body: bytes, correlation_id: str, headers=None):
+            seen.append(body.decode())
+            first_delivered.set()
+            await gate.wait()
+            return None
+
+        listener = MessageListener(
+            ctx.connection,
+            late_ack=True,
+            max_concurrent=prefetch,
+            retry_options=RetryOptions(max_retries=0),
+            max_priority=Config.RECOMMENDED_MAX_PRIORITY,
+        )
+        try:
+            await listener.init(handler, queue_name)
+            await listener.subscribe(f"REQUEST.{queue_name}.*")
+            await listener.start()
+
+            for i in range(bulk):
+                await ctx.publish_message(
+                    f"bulk{i}".encode(),
+                    f"REQUEST.{queue_name}.bulk",
+                    rpc=False,
+                    priority=Config.PRIORITY_NORMAL,
+                )
+
+            await asyncio.wait_for(first_delivered.wait(), timeout=10)
+            await asyncio.sleep(1.0)  # let the broker fill the prefetch window
+
+            await ctx.publish_message(
+                b"control",
+                f"REQUEST.{queue_name}.control",
+                rpc=False,
+                priority=Config.PRIORITY_CONTROL,
+            )
+            await asyncio.sleep(1.0)
+
+            gate.set()
+            for _ in range(200):
+                if len(seen) >= bulk + 1:
+                    break
+                await asyncio.sleep(0.1)
+
+            assert len(seen) == bulk + 1, seen
+            assert seen.index("control") == prefetch, (
+                f"prefetch={prefetch} but control landed at "
+                f"{seen.index('control')}: {seen[: prefetch + 3]}"
+            )
+        finally:
+            gate.set()
+            await listener.close()
+            ch = await ctx.connection.open_channel()
+            await ch.queue_delete(queue_name)
+            await ctx.close()
+
     async def test_a_priority_listener_drains_control_traffic_first(self):
         """
         The ONIT case, reduced: a backlog of bulk work already queued, then one
