@@ -9,7 +9,12 @@ from aio_pika.abc import AbstractChannel, AbstractExchange
 
 from .callback_listener import CallbackListener
 from .config import Config
-from .connection import IConnection
+from .connection import (
+    IConnection,
+    detach_listener,
+    release_amqp_resources,
+    schedule_amqp_release,
+)
 from .errors import (
     DisconnectedError,
     NotConnectedError,
@@ -57,16 +62,31 @@ class MessageDispatcher:
         self._connection = connection
         self._channel: Optional[AbstractChannel] = None
         self._exchange: Optional[AbstractExchange] = None
-        self._callback_listener: Optional[CallbackListener] = None
+        # Built once, here. Building it per reconnect leaked a channel, an
+        # exclusive queue and a consumer each time — and because the discarded
+        # listener stayed subscribed to the connection's reconnection events it
+        # kept opening more channels, turning a linear leak into O(N^2).
+        self._callback_listener: CallbackListener = CallbackListener(connection)
         self._pending_callbacks: Dict[str, asyncio.Future] = {}
         # correlation_id -> queue of streaming chunks. Replies for streaming
         # calls land here; the consuming async iterator drains them.
         self._pending_streams: Dict[str, asyncio.Queue] = {}
         self._is_initialized = False
+        self._is_closed = False
 
-        # Set up connection event handlers
-        self._connection.on("reconnected", self._on_reconnected)
-        self._connection.on("disconnected", self._on_disconnected)
+        # Serialises channel setup. A flapping broker can deliver a second
+        # 'reconnected' while the first re-setup is still awaiting a round-trip,
+        # and _emit dispatches handlers with create_task, so the two would
+        # otherwise interleave and each leave the other's channel and consumer
+        # behind. _setup_channel/_teardown_channel assume the caller holds this.
+        self._setup_lock = asyncio.Lock()
+
+        # Set up connection event handlers. Bound refs are stored so close()
+        # can unregister exactly these callbacks (TS parity).
+        self._bound_on_reconnected = self._on_reconnected
+        self._bound_on_disconnected = self._on_disconnected
+        self._connection.on("reconnected", self._bound_on_reconnected)
+        self._connection.on("disconnected", self._bound_on_disconnected)
 
     @property
     def is_initialized(self) -> bool:
@@ -75,11 +95,24 @@ class MessageDispatcher:
 
     async def init(self) -> None:
         """Initialize the message dispatcher."""
-        await self._setup_channel()
-        self._is_initialized = True
+        async with self._setup_lock:
+            if self._is_initialized:
+                return
+            await self._setup_channel()
+            self._is_initialized = True
 
     async def _setup_channel(self) -> None:
-        """Set up the channel and callback listener."""
+        """
+        Set up the dispatcher's own channel and, on first call, its callback
+        listener.
+
+        Also called on reconnect, so the previous channel is closed first. The
+        CallbackListener is *not* rebuilt: it restores itself through its own
+        inherited reconnection handler, including re-binding its (newly
+        generated) callback queue to the callbacks exchange.
+        """
+        await self._teardown_channel()
+
         self._channel = await self._connection.open_channel()
 
         # Declare the main exchange
@@ -89,20 +122,66 @@ class MessageDispatcher:
             ExchangeType.TOPIC,
         )
 
-        # Set up callback listener for RPC responses
-        self._callback_listener = CallbackListener(self._connection)
-        await self._callback_listener.init(self._on_result, "")
+        # init()/start() are idempotent, so this is a no-op on reconnect.
+        if not self._callback_listener.is_initialized:
+            await self._callback_listener.init(self._on_result, "")
+            await self._callback_listener.start()
+        elif not self._callback_listener.is_ready:
+            # Its own restore ran first and failed (or has not run yet).
+            # is_initialized stays True either way, so without this the
+            # dispatcher would log a successful reconnect while every reply
+            # went to a queue that no longer exists.
+            await self._callback_listener.restore()
 
-        # Bind the callback queue to the callback exchange
-        if self._callback_listener._queue and self._callback_listener._exchange:
-            await self._connection.bind_queue(
-                self._callback_listener._queue,
-                self._callback_listener._exchange,
-                self._callback_listener.callback_queue,
-            )
+        if not self._callback_listener.is_ready:
+            raise NotConnectedError("Callback listener could not be restored")
 
-        await self._callback_listener.start()
         Logger.debug("MessageDispatcher initialized")
+
+    async def _teardown_channel(self) -> None:
+        """Best-effort release of the dispatcher's own channel."""
+        channel = self._channel
+        self._channel = None
+        self._exchange = None
+        await release_amqp_resources(channel)
+
+    async def close(self) -> None:
+        """Detach from the connection and release the dispatcher's resources."""
+        if self._is_closed:
+            return
+        self._is_closed = True
+
+        detach_listener(self._connection, "reconnected", self._bound_on_reconnected)
+        detach_listener(
+            self._connection, "disconnected", self._bound_on_disconnected
+        )
+
+        # Detaching removed the only thing that resolves in-flight calls, so
+        # release them here rather than making every caller wait out its
+        # timeout.
+        self._fail_pending(DisconnectedError("Dispatcher closed"))
+
+        await self._callback_listener.close()
+        async with self._setup_lock:
+            await self._teardown_channel()
+        Logger.debug("MessageDispatcher closed")
+
+    def _fail_pending(self, error: Exception) -> None:
+        """Release every in-flight unary call and stream with `error`."""
+        for _correlation_id, future in list(self._pending_callbacks.items()):
+            if not future.done():
+                future.set_exception(error)
+        self._pending_callbacks.clear()
+
+        # Terminate any in-flight streams with the disconnection sentinel.
+        # The waiting async iterators will raise StreamTimeoutError on their
+        # next idle window, surfacing the disconnect to callers.
+        for _correlation_id, queue in list(self._pending_streams.items()):
+            try:
+                queue.put_nowait(_STREAM_END)
+            except Exception:
+                pass
+        self._pending_streams.clear()
 
     async def _on_result(
         self,
@@ -195,7 +274,9 @@ class MessageDispatcher:
 
         # Set up response future if RPC
         response_future: Optional[asyncio.Future] = None
-        if rpc and self._callback_listener:
+        if rpc:
+            if not self._callback_listener.is_ready:
+                raise NotConnectedError("Callback listener not available")
             response_future = asyncio.get_event_loop().create_future()
             self._pending_callbacks[correlation_id] = response_future
 
@@ -255,7 +336,7 @@ class MessageDispatcher:
             raise NotConnectedError("Not connected to RabbitMQ")
         if not self._channel or not self._exchange:
             raise NotConnectedError("Channel or exchange not available")
-        if not self._callback_listener:
+        if not self._callback_listener.is_ready:
             raise NotConnectedError("Callback listener not available")
 
         correlation_id = str(uuid.uuid4())
@@ -295,33 +376,30 @@ class MessageDispatcher:
 
     async def _on_reconnected(self) -> None:
         """Handle reconnection event."""
+        if not self._is_initialized or self._is_closed:
+            return
+
         Logger.debug("MessageDispatcher reconnecting...")
-        try:
-            await self._setup_channel()
-            Logger.debug("MessageDispatcher reconnected")
-        except Exception as e:
-            Logger.error(f"Error reconnecting MessageDispatcher: {e}")
+        async with self._setup_lock:
+            if self._is_closed:
+                return
+            try:
+                await self._setup_channel()
+                Logger.debug("MessageDispatcher reconnected")
+            except Exception as e:
+                Logger.error(f"Error reconnecting MessageDispatcher: {e}")
 
     def _on_disconnected(self) -> None:
         """Handle disconnection event."""
         Logger.debug("MessageDispatcher disconnected")
 
-        # Fail all pending callbacks
-        error = DisconnectedError("Connection lost while waiting for response")
-        for correlation_id, future in list(self._pending_callbacks.items()):
-            if not future.done():
-                future.set_exception(error)
-        self._pending_callbacks.clear()
+        self._fail_pending(
+            DisconnectedError("Connection lost while waiting for response")
+        )
 
-        # Terminate any in-flight streams with the disconnection sentinel.
-        # The waiting async iterators will raise StreamTimeoutError on their
-        # next idle window, surfacing the disconnect to callers.
-        for correlation_id, queue in list(self._pending_streams.items()):
-            try:
-                queue.put_nowait(_STREAM_END)
-            except Exception:
-                pass
-        self._pending_streams.clear()
-
+        # Release rather than merely forget: an event delivered while the
+        # connection is still up would otherwise strand a live channel.
+        channel = self._channel
         self._channel = None
         self._exchange = None
+        schedule_amqp_release(channel)

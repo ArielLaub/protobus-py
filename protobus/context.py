@@ -147,7 +147,16 @@ class Context:
         Logger.info("Context initialized")
 
     async def close(self) -> None:
-        """Close the context and connection."""
+        """Close the context, its dispatchers and the connection."""
+        # Dispatchers first: closing them detaches their reconnection handlers
+        # and releases their channels and callback queue.
+        if self._message_dispatcher:
+            await self._message_dispatcher.close()
+            self._message_dispatcher = None
+        if self._event_dispatcher:
+            await self._event_dispatcher.close()
+            self._event_dispatcher = None
+
         await self._connection.close()
         Logger.info("Context closed")
 
