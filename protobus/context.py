@@ -46,7 +46,11 @@ class IContext(Protocol):
         ...
 
     async def publish_message(
-        self, data: bytes, routing_key: str, rpc: bool = True
+        self,
+        data: bytes,
+        routing_key: str,
+        rpc: bool = True,
+        priority: Optional[int] = None,
     ) -> Optional[bytes]:
         ...
 
@@ -161,6 +165,7 @@ class Context:
         data: bytes,
         routing_key: str,
         rpc: bool = True,
+        priority: Optional[int] = None,
     ) -> Optional[bytes]:
         """
         Publish a message, optionally waiting for a response.
@@ -169,6 +174,10 @@ class Context:
             data: Message data
             routing_key: Routing key for the message
             rpc: Whether to wait for a response
+            priority: Optional AMQP message priority (0..255). Only affects
+                ordering on a queue declared with ``x-max-priority``; harmless
+                and ignored on any other queue. See MessageDispatcher.publish
+                for the prefetch caveat.
 
         Returns:
             Response data if rpc=True, None otherwise
@@ -176,7 +185,9 @@ class Context:
         if not self._message_dispatcher:
             raise RuntimeError("Context not initialized")
 
-        return await self._message_dispatcher.publish(data, routing_key, rpc)
+        return await self._message_dispatcher.publish(
+            data, routing_key, rpc, priority=priority
+        )
 
     def publish_streaming_message(
         self,

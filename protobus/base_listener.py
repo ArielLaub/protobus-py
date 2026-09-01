@@ -18,11 +18,13 @@ from .connection import (
 from .errors import (
     AlreadyStartedError,
     ConnectionError,
+    InvalidPriorityError,
     MissingExchangeError,
     NotConnectedError,
     NotInitializedError,
 )
 from .logger import Logger
+from .priority import validate_max_priority
 
 # Type alias for message handlers.
 # Handlers may return bytes (unary reply), None (no reply), or an
@@ -44,6 +46,7 @@ class BaseListener:
         late_ack: bool = False,
         max_concurrent: Optional[int] = None,
         message_ttl_ms: Optional[int] = None,
+        max_priority: Optional[int] = None,
     ):
         """
         Initialize the base listener.
@@ -53,11 +56,73 @@ class BaseListener:
             late_ack: Whether to use late acknowledgment
             max_concurrent: Maximum concurrent messages (prefetch count)
             message_ttl_ms: Optional message TTL in milliseconds
+            max_priority: Optional queue priority ceiling (``x-max-priority``).
+
+                Defaults to None, which declares the queue with no
+                ``x-max-priority`` argument at all — byte-identical to a
+                listener from before priority support existed. This default is
+                load-bearing: RabbitMQ answers a re-declare that adds
+                ``x-max-priority`` to an existing queue with a 406
+                PRECONDITION_FAILED, so a silent default would break every
+                already-deployed service on upgrade.
+
+                The 406 closes the channel it happened on. Each listener holds
+                its own channel, so other listeners on the same connection do
+                survive it (verified) — but the declare happens inside init(),
+                so this listener never starts and MessageService.init()
+                raises. The service fails to boot.
+
+                Enabling it on a queue that already exists therefore needs a
+                one-time drain, delete and recreate by an operator. See
+                docs/advanced/message-priority.md.
+
+                Recommended value: ``Config.RECOMMENDED_MAX_PRIORITY`` (2).
         """
         self._connection = connection
         self._late_ack = late_ack
         self._max_concurrent = max_concurrent
         self._message_ttl_ms = message_ttl_ms
+        # Validated at construction, before anything is sent: an invalid value
+        # would otherwise surface much later as a channel-killing 406 at
+        # declare time, when there is nothing useful left to say about it.
+        self._max_priority = validate_max_priority(max_priority)
+
+        # Priority is refused outright when it could not possibly work.
+        #
+        # Ordering is only meaningful for messages still IN the queue. Without
+        # a bounded prefetch the broker pushes the whole queue into this
+        # consumer's buffer, and everything there is past reordering. Measured
+        # against a real broker — 300 bulk messages arriving while the consumer
+        # is already draining, then one control message:
+        #
+        #   max_concurrent=1, late_ack=True   -> control handled at 92 of 301
+        #   max_concurrent=1, late_ack=False  -> control handled at 300 of 301
+        #   max_concurrent=None               -> control handled at 300 of 301
+        #
+        # late_ack matters as much as the count because RabbitMQ ignores QoS
+        # prefetch for auto-ack consumers, so `max_concurrent` alone buys
+        # nothing. Both are required.
+        #
+        # This is refused rather than warned about because the failure is
+        # otherwise invisible: the queue is correctly declared, an operator has
+        # done the drain/delete/recreate migration to enable it, and the
+        # feature simply does nothing with no signal anywhere.
+        if self._max_priority is not None:
+            if not max_concurrent:
+                raise InvalidPriorityError(
+                    "max_priority requires max_concurrent to be set. Without a "
+                    "prefetch bound the broker pushes the whole queue to the "
+                    "consumer, so priority cannot reorder anything and the "
+                    "setting silently does nothing."
+                )
+            if not late_ack:
+                raise InvalidPriorityError(
+                    "max_priority requires late_ack=True. RabbitMQ ignores QoS "
+                    "prefetch for auto-ack consumers, so max_concurrent alone "
+                    "does not bound delivery and priority silently does "
+                    "nothing. (MessageService sets late_ack for you whenever "
+                    "max_concurrent is given.)"
+                )
 
         self._channel: Optional[AbstractChannel] = None
         self._exchange: Optional[AbstractExchange] = None
@@ -175,10 +240,18 @@ class BaseListener:
             self._exchange_type,
         )
 
-        # Prepare queue arguments
+        # Prepare queue arguments.
+        #
+        # Every key here is opt-in. A listener that configured neither a TTL
+        # nor a priority ceiling must reach ensure_queue with arguments=None,
+        # exactly as it did before either feature existed — otherwise the
+        # declare 406s against an already-deployed queue and this listener
+        # never starts.
         arguments: Dict[str, Any] = {}
         if self._message_ttl_ms is not None:
             arguments["x-message-ttl"] = self._message_ttl_ms
+        if self._max_priority is not None:
+            arguments["x-max-priority"] = self._max_priority
 
         # Declare queue. Anonymous queues always ask for a fresh one: the
         # previous broker-generated name died with the previous connection.

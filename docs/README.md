@@ -44,6 +44,7 @@ Detailed documentation for each component:
 
 - [Streaming RPC](advanced/streaming.md) - Server-streaming responses (`rpc foo (Req) returns (stream Chunk)`)
 - [Error Handling](advanced/error-handling.md) - Retries, DLQ, and HandledError
+- [Message Priority](advanced/message-priority.md) - `x-max-priority` queues, per-message priority, and the one-time migration an existing queue needs
 - [Custom Logger](advanced/custom-logger.md) - Integrating with your logging system
 - [Custom Types](advanced/custom-types.md) - Extending the type system
 

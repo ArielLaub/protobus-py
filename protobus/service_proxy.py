@@ -2,6 +2,7 @@
 
 from typing import Any, AsyncIterator, Callable, Dict, Optional
 
+from .config import Config
 from .context import IContext
 from .errors import (
     AlreadyInitializedError,
@@ -11,6 +12,7 @@ from .errors import (
     PublishMessageError,
 )
 from .logger import Logger
+from .priority import validate_message_priority
 
 
 class ServiceProxy:
@@ -102,6 +104,8 @@ class ServiceProxy:
             request_message: Any,
             actor: Optional[str] = None,
             rpc: bool = True,
+            *,
+            priority: Optional[int] = None,
         ) -> Any:
             """
             Call the remote service method.
@@ -110,10 +114,27 @@ class ServiceProxy:
                 request_message: Request data
                 actor: Optional actor identifier
                 rpc: Whether to wait for response (default True)
+                priority: Optional AMQP message priority (0..255), keyword-only.
+
+                    Keyword-only on purpose: no existing call site can bind a
+                    4th positional argument to it by accident, so every caller
+                    written before this parameter existed keeps its exact
+                    meaning.
+
+                    Only affects ordering when the target service declared its
+                    queue with ``x-max-priority`` (MessageServiceOptions
+                    ``max_priority``). Against a service that did not, the
+                    broker accepts the property and ignores it — which is what
+                    makes a new client safe to deploy against an old service.
 
             Returns:
                 Response data if rpc=True, empty dict otherwise
             """
+            # Validated here, outside the try below, so an invalid priority
+            # surfaces as InvalidPriorityError rather than being flattened
+            # into a PublishMessageError about a dispatch that never happened.
+            priority = validate_message_priority(priority)
+
             try:
                 buffer = self._context.factory.build_request(
                     method_full_name, request_message, actor
@@ -126,9 +147,25 @@ class ServiceProxy:
                 raise InvalidRequestError("Failed parsing message")
 
             try:
-                response_data = await self._context.publish_message(
-                    buffer, f"REQUEST.{method_full_name}", rpc
-                )
+                # `priority` is passed only when it would actually change
+                # something. IContext is a Protocol, so a caller may be
+                # supplying their own context object written before this
+                # parameter existed; the default path must stay call-compatible
+                # with those.
+                #
+                # PRIORITY_NORMAL (0) counts as "not asked for": aio-pika
+                # normalizes an unset priority to 0 anyway, and RabbitMQ treats
+                # absent and 0 as the same lowest priority, so forwarding it
+                # would take on that compatibility risk for no behavioural
+                # difference whatsoever.
+                if priority is None or priority == Config.PRIORITY_NORMAL:
+                    response_data = await self._context.publish_message(
+                        buffer, f"REQUEST.{method_full_name}", rpc
+                    )
+                else:
+                    response_data = await self._context.publish_message(
+                        buffer, f"REQUEST.{method_full_name}", rpc, priority=priority
+                    )
             except Exception as error:
                 Logger.error(str(error))
                 raise PublishMessageError(

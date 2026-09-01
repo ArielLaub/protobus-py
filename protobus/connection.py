@@ -25,6 +25,7 @@ from .errors import (
     is_handled_error,
 )
 from .logger import Logger
+from .priority import validate_message_priority
 
 # Type aliases
 #
@@ -751,6 +752,16 @@ class Connection:
                     correlation_id=message.correlation_id,
                     reply_to=message.reply_to,
                     expiration=str(retry_opts.retry_delay_ms),
+                    # Carry the priority across the retry.
+                    #
+                    # The broker preserves priority when IT dead-letters a
+                    # message, but this path does not rely on that — it
+                    # re-publishes, so anything not copied here is lost. Drop
+                    # it and a control message that fails once comes back as
+                    # priority 0 and queues behind the entire bulk backlog:
+                    # precisely the problem priority exists to solve, and only
+                    # visible after something has already gone wrong.
+                    priority=message.priority,
                 ),
                 routing_key=retry_queue_name,
             )
@@ -778,6 +789,11 @@ class Connection:
                     body=message.body,
                     headers=headers,
                     correlation_id=message.correlation_id,
+                    # The DLQ is a plain queue, so this buys no ordering. It is
+                    # copied because a DLQ exists to preserve what the message
+                    # WAS, and whether a dead message was control or bulk
+                    # traffic is part of that.
+                    priority=message.priority,
                 ),
                 routing_key=dlq_name,
             )
@@ -800,18 +816,27 @@ class Connection:
             exchange: The exchange to publish to
             routing_key: Message routing key
             body: Message body
-            properties: Additional message properties
+            properties: Additional message properties. May include an optional
+                ``priority`` (0..255); omit it and nothing about the published
+                message changes.
         """
         if not self._is_connected:
             raise NotConnectedError("Not connected to RabbitMQ")
 
         props = properties or {}
+        # Validated before the Message is built, not after: aio-pika applies
+        # int() to whatever it is given, so 1.5 would become 1 with no error
+        # anywhere, and 256 would blow up later as a raw struct.error from the
+        # encoder. Both become one InvalidPriorityError here.
+        priority = validate_message_priority(props.get("priority"))
+
         message = Message(
             body=body,
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
             correlation_id=props.get("correlation_id"),
             reply_to=props.get("reply_to"),
             headers=props.get("headers"),
+            priority=priority,
         )
 
         await exchange.publish(message, routing_key=routing_key)
