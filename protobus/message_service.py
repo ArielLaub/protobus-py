@@ -14,6 +14,7 @@ from .errors import (
     InvalidResultError,
     MissingProto,
     ProtocolError,
+    TimeoutError,
     is_handled_error,
     sanitize_error_for_client,
 )
@@ -344,6 +345,17 @@ class MessageService:
                 f"unparseable request payload for {envelope.method} ({len(envelope.data) if envelope.data else 0} bytes, {correlation_id})"
             )
             return self._protocol_error(envelope.method, f"payload did not decode as the request type of {envelope.method}")
+
+        # A processing timeout is raised by the connection layer, which has
+        # no factory to encode a reply with. Leave one ready, so the caller is
+        # told rather than left to wait out its own deadline.
+        if context is not None:
+            try:
+                context.timeout_reply = factory.build_response(
+                    envelope.method, TimeoutError(f"message {correlation_id} exceeded the processing timeout"),
+                )
+            except Exception as encode_err:
+                Logger.debug(f"could not pre-encode a timeout reply for {envelope.method}: {encode_err}")
 
         args = (request_data, envelope.actor, correlation_id)
         if _handler_wants_context(handler):

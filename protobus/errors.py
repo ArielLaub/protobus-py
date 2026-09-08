@@ -140,7 +140,9 @@ class AlreadyConnectedError(Exception):
 
 
 class TimeoutError(Exception):  # noqa: A001 - mirrors the TS name
-    """An operation (a handler, most often) exceeded its processing budget."""
+    """A handler exceeded its processing budget."""
+
+    code = "PROCESSING_TIMEOUT"
 
 
 class ReconnectionError(Exception):

@@ -83,6 +83,10 @@ class MessageHandlerContext:
     routing_key: str
     message_id: Optional[str] = None
     redelivered: bool = False
+    #: An encoded error reply for the processing-timeout path, set by a
+    #: handler that knows how to encode one (MessageService does) so the
+    #: caller hears about the timeout instead of waiting out its own deadline.
+    timeout_reply: Optional[bytes] = None
 
 
 MessageHandler = Callable[..., Awaitable[MessageHandlerResult]]
@@ -951,7 +955,10 @@ class Connection(EventEmitter):
                     # Python gets to interrupting it. A handler that swallows
                     # the cancellation runs on, still counted as running.
                     handler_task.cancel()
-                    raise TimeoutError(f"message {correlation_id} exceeded the {limit}ms processing timeout")
+                    timeout_error = TimeoutError(f"message {correlation_id} exceeded the {limit}ms processing timeout")
+                    if context.timeout_reply is not None:
+                        setattr(timeout_error, RESPONSE_BUFFER_ATTR, context.timeout_reply)
+                    raise timeout_error
                 result = handler_task.result()
 
                 # The reply is published before the request is settled, so the
