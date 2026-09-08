@@ -1,305 +1,268 @@
-"""Service proxy for dynamic remote service method calls."""
+"""ServiceProxy: a typed-by-schema client for a remote service."""
 
-from typing import Any, AsyncIterator, Callable, Dict, Optional
+import contextlib
+from typing import Any, AsyncIterator, Optional
 
-from .config import Config
 from .context import IContext
 from .errors import (
     AlreadyInitializedError,
     InvalidRequestError,
     InvalidResponseError,
     InvalidServiceNameError,
-    PublishMessageError,
 )
 from .logger import Logger
-from .priority import validate_message_priority
+from .message_dispatcher import CallOptions, StreamOptions
+from .message_factory import ResponseContainer
+
+
+class RemoteError(Exception):
+    """
+    An error the remote service returned. ``code`` is whatever the service
+    put on its error (``HANDLED_ERROR``, ``PROTOCOL_ERROR``, ``INTERNAL_ERROR``,
+    or a custom code); ``''`` when it had none.
+    """
+
+    def __init__(self, message: str, code: str = "", method: str = "") -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.method = method
 
 
 class ServiceProxy:
     """
-    Dynamic wrapper for remote service method calls.
-
-    Automatically creates methods based on the service definition,
-    allowing for type-safe RPC calls.
+    Installs one method per rpc the contract declares. A unary method is
+    ``async def method(request, actor=None, rpc=True, timeout_ms=None,
+    options=None)``; a server-streaming one is ``def method(request,
+    actor=None, idle_timeout_ms=None, options=None)`` returning an async
+    iterator of decoded chunks.
     """
 
-    def __init__(self, context: IContext, service_name: str):
-        """
-        Initialize the service proxy.
-
-        Args:
-            context: The context to use for messaging
-            service_name: Fully qualified service name (e.g., "package.ServiceName")
-        """
+    def __init__(self, context: IContext, service_name: str) -> None:
         self._context = context
         self._service_name = service_name
         self._is_initialized = False
-        self._methods: Dict[str, Callable[..., Any]] = {}
+        # The service as the .proto declares it, which is not always the name
+        # the proxy was constructed with; see _resolve_contract().
+        self._contract_service_name: Optional[str] = None
 
     @property
     def service_name(self) -> str:
-        """Get the service name."""
         return self._service_name
 
-    async def init(self) -> None:
+    @property
+    def contract_service_name(self) -> Optional[str]:
+        return self._contract_service_name
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._is_initialized
+
+    @property
+    def context(self) -> IContext:
+        return self._context
+
+    def _resolve_contract(self) -> str:
         """
-        Initialize the service proxy.
-
-        Creates dynamic methods based on the service definition.
+        Find the contract this proxy addresses, by trimming runtime segments
+        off the name until one names a service in the root.
         """
-        if self._is_initialized:
-            Logger.error(f"Already initialized service proxy {self._service_name}")
-            raise AlreadyInitializedError()
-
-        # In the TypeScript version, this looks up the service definition
-        # from the protobuf root and creates methods dynamically.
-        # For Python, we'll create a generic call mechanism.
-
-        # Check if service exists in factory
-        root = self._context.factory.root
-        service = root.lookup_service(self._service_name)
-
-        # If service definition is found, create typed methods
-        if service:
-            # Create methods from service definition
-            # methods can be a dict (older protobuf) or a list-like sequence (newer protobuf)
-            methods = getattr(service, "methods", [])
-            if hasattr(methods, "items"):
-                for method_name, method_desc in methods.items():
-                    self._create_method(method_name)
-            else:
-                for method_desc in methods:
-                    self._create_method(method_desc.name)
-        else:
-            # Service not found in proto definitions
-            # This is okay - methods will be created on demand via __getattr__
-            Logger.debug(
-                f"Service {self._service_name} not found in proto definitions, "
-                "using dynamic method creation"
+        factory = self._context.factory
+        if factory.root is None:
+            raise InvalidServiceNameError(
+                f"cannot resolve '{self._service_name}': the message factory has not been "
+                "initialised, so no schema is loaded yet. Await Context.init() before "
+                "constructing a proxy."
             )
+        candidate = self._service_name
+        while True:
+            if factory.has_service(candidate):
+                if candidate != self._service_name:
+                    # Said out loud, because trimming is a guess.
+                    Logger.info(
+                        f"service proxy '{self._service_name}' resolved to contract '{candidate}'; "
+                        f"requests will route to REQUEST.{self._service_name}.*"
+                    )
+                return candidate
+            cut = candidate.rfind(".")
+            if cut <= 0:
+                raise InvalidServiceNameError(
+                    f"no service in the schema matches '{self._service_name}' or any prefix of it; "
+                    "the .proto must declare the service this proxy addresses"
+                )
+            candidate = candidate[:cut]
 
+    async def init(self) -> None:
+        if self._is_initialized:
+            Logger.error(f"already initialized service proxy {self._service_name}")
+            raise AlreadyInitializedError(f"service proxy {self._service_name} is already initialized")
+        self._contract_service_name = self._resolve_contract()
+        factory = self._context.factory
+        service = factory.root.lookup_service(self._contract_service_name)  # type: ignore[union-attr]
+
+        for method in service.methods:
+            name = method.name
+            # Proto method names are assigned straight onto this instance, so
+            # a method called `init` or `is_initialized` would clobber the
+            # proxy's own members. Fail loudly instead of half-working.
+            if hasattr(self, name):
+                raise InvalidServiceNameError(
+                    f"proto method '{self._service_name}.{name}' collides with a ServiceProxy member; "
+                    "rename it in the .proto"
+                )
+            # The ENVELOPE carries the contract method name, which the
+            # receiving MessageService validates the body against; the
+            # ROUTING KEY carries the runtime name, which reaches this
+            # instance's queue.
+            method_full_name = f"{self._contract_service_name}.{name}"
+            routing_key = f"REQUEST.{self._service_name}.{name}"
+            if factory.is_streaming_method(method_full_name):
+                setattr(self, name, self._make_streaming_call(method_full_name, routing_key, method.input_type.full_name))
+            else:
+                setattr(self, name, self._make_unary_call(method_full_name, routing_key, method.input_type.full_name))
         self._is_initialized = True
 
-    def _create_method(self, method_name: str) -> Callable[..., Any]:
-        """
-        Create a proxy method for a service method.
+    def _make_unary_call(self, method_full_name: str, routing_key: str, request_type: str) -> Any:
+        proxy = self
 
-        Branches at build time on whether the method is declared as
-        server-streaming in its .proto (the gRPC `stream` keyword on the
-        response type). Streaming methods return an AsyncIterator; unary
-        methods return a coroutine that awaits a single response.
-
-        Args:
-            method_name: Name of the method to create
-
-        Returns:
-            The proxy method
-        """
-        method_full_name = f"{self._service_name}.{method_name}"
-
-        if self._context.factory.is_streaming_method(method_full_name):
-            return self._create_streaming_method(method_name)
-
-        async def proxy_method(
-            request_message: Any,
+        async def call(
+            request_message: Any = None,
             actor: Optional[str] = None,
             rpc: bool = True,
+            timeout_ms: Optional[int] = None,
+            options: Optional[CallOptions] = None,
             *,
             priority: Optional[int] = None,
+            message_id: Optional[str] = None,
         ) -> Any:
-            """
-            Call the remote service method.
-
-            Args:
-                request_message: Request data
-                actor: Optional actor identifier
-                rpc: Whether to wait for response (default True)
-                priority: Optional AMQP message priority (0..255), keyword-only.
-
-                    Keyword-only on purpose: no existing call site can bind a
-                    4th positional argument to it by accident, so every caller
-                    written before this parameter existed keeps its exact
-                    meaning.
-
-                    Only affects ordering when the target service declared its
-                    queue with ``x-max-priority`` (MessageServiceOptions
-                    ``max_priority``). Against a service that did not, the
-                    broker accepts the property and ignores it — which is what
-                    makes a new client safe to deploy against an old service.
-
-            Returns:
-                Response data if rpc=True, empty dict otherwise
-            """
-            # Validated here, outside the try below, so an invalid priority
-            # surfaces as InvalidPriorityError rather than being flattened
-            # into a PublishMessageError about a dispatch that never happened.
-            priority = validate_message_priority(priority)
-
+            if priority is not None or message_id is not None:
+                options = options or CallOptions()
+                if priority is not None:
+                    options.priority = priority
+                if message_id is not None:
+                    options.message_id = message_id
             try:
-                buffer = self._context.factory.build_request(
-                    method_full_name, request_message, actor
-                )
+                buffer = proxy._context.factory.build_request(method_full_name, request_message, actor)
             except Exception as error:
-                Logger.error(
-                    f"Failed building message for {method_full_name} "
-                    f"from {request_message}\n{error}"
-                )
-                raise InvalidRequestError("Failed parsing message")
-
-            try:
-                # `priority` is passed only when it would actually change
-                # something. IContext is a Protocol, so a caller may be
-                # supplying their own context object written before this
-                # parameter existed; the default path must stay call-compatible
-                # with those.
-                #
-                # PRIORITY_NORMAL (0) counts as "not asked for": aio-pika
-                # normalizes an unset priority to 0 anyway, and RabbitMQ treats
-                # absent and 0 as the same lowest priority, so forwarding it
-                # would take on that compatibility risk for no behavioural
-                # difference whatsoever.
-                if priority is None or priority == Config.PRIORITY_NORMAL:
-                    response_data = await self._context.publish_message(
-                        buffer, f"REQUEST.{method_full_name}", rpc
-                    )
-                else:
-                    response_data = await self._context.publish_message(
-                        buffer, f"REQUEST.{method_full_name}", rpc, priority=priority
-                    )
-            except Exception as error:
-                Logger.error(str(error))
-                raise PublishMessageError(
-                    f"Failed dispatching request to {method_full_name}"
-                )
-
+                # No payload in the log line — requests carry secrets and PII.
+                Logger.error(f"failed building message '{request_type}': {error}")
+                raise InvalidRequestError("failed parsing message") from error
+            # The delivery error is raised as it stands: UnroutableError and
+            # PublishNackedError are definite failures a caller may safely
+            # retry, PublishConfirmTimeoutError and ChannelClosedError are
+            # ambiguous and retrying either can duplicate.
+            response_data = await proxy._context.publish_message(buffer, routing_key, rpc, timeout_ms, options)
             if rpc is False:
-                Logger.debug("Received non-rpc result, sending back empty answer")
+                Logger.debug("received non rpc result sending back empty answer")
                 return {}
+            return proxy._unwrap(method_full_name, response_data)
 
-            try:
-                response = self._context.factory.decode_response(response_data)
-                Logger.debug(f"Received result for message {method_full_name}")
-            except Exception as error:
-                Logger.error(str(error))
-                raise InvalidResponseError(
-                    f"Failed parsing result for {method_full_name}"
-                )
+        call.__name__ = method_full_name.rsplit(".", 1)[-1]
+        return call
 
-            if response.error:
-                err = Exception(response.error.get("message", "Unknown error"))
-                if response.error.get("code"):
-                    setattr(err, "code", response.error["code"])
-                raise err
+    def _unwrap(self, method_full_name: str, response_data: Any) -> Any:
+        try:
+            response: ResponseContainer = self._context.factory.decode_response(response_data)
+            Logger.debug(f"received result for message {method_full_name}")
+        except Exception as error:
+            Logger.error(f"failed parsing result for {method_full_name}: {error}")
+            raise InvalidResponseError(f"failed parsing result for {method_full_name}") from error
+        if response.error is not None:
+            raise RemoteError(response.error.message, response.error.code, response.error.method)
+        if response.result is None:
+            raise InvalidResponseError(f"response for {method_full_name} carried neither a result nor an error")
+        return response.result.data
 
-            if response.result is None:
-                return None
-            # Binary protobuf decode returns the inner message directly;
-            # legacy JSON format wraps in {"data": ...}
-            if isinstance(response.result, dict) and "data" in response.result and len(response.result) <= 2:
-                return response.result["data"]
-            return response.result
+    def _make_streaming_call(self, method_full_name: str, routing_key: str, request_type: str) -> Any:
+        proxy = self
 
-        self._methods[method_name] = proxy_method
-        setattr(self, method_name, proxy_method)
-        return proxy_method
-
-    def _create_streaming_method(self, method_name: str) -> Callable[..., Any]:
-        """
-        Create a proxy method that returns an AsyncIterator of decoded chunks.
-
-        The returned function is an async-generator function — callers iterate
-        it with ``async for``. Internally it publishes one request and drains
-        the streaming reply queue, decoding each chunk's ResponseContainer.
-        A terminal chunk carrying an error raises out of the iteration.
-        """
-        method_full_name = f"{self._service_name}.{method_name}"
-
-        async def streaming_proxy_method(
-            request_message: Any,
+        def call(
+            request_message: Any = None,
             actor: Optional[str] = None,
-            *,
-            stream_idle_timeout_ms: Optional[int] = None,
-        ) -> AsyncIterator[Any]:
+            idle_timeout_ms: Optional[int] = None,
+            options: Optional[StreamOptions] = None,
+        ) -> "StreamingCall":
+            return StreamingCall(proxy, method_full_name, routing_key, request_type, request_message, actor, idle_timeout_ms, options)
+
+        call.__name__ = method_full_name.rsplit(".", 1)[-1]
+        return call
+
+
+class StreamingCall:
+    """
+    The async iterator a streaming proxy method returns. Iterate it with
+    ``async for``; close it early with ``await call.aclose()`` or by using it
+    as ``async with``, which also tells the server to stop producing.
+    """
+
+    def __init__(
+        self,
+        proxy: ServiceProxy,
+        method_full_name: str,
+        routing_key: str,
+        request_type: str,
+        request_message: Any,
+        actor: Optional[str],
+        idle_timeout_ms: Optional[int],
+        options: Optional[StreamOptions],
+    ) -> None:
+        self._proxy = proxy
+        self._method_full_name = method_full_name
+        self._chunks: Any = None
+        self._build_error: Optional[BaseException] = None
+        factory = proxy.context.factory
+        try:
+            buffer = factory.build_request(method_full_name, request_message, actor)
+        except Exception as error:
+            Logger.error(f"failed building streaming request '{request_type}' for {method_full_name}: {error}")
+            # Surfaces inside the caller's try/except around `async for`.
+            self._build_error = InvalidRequestError("failed parsing message")
+            self._build_error.__cause__ = error
+            return
+        self._chunks = proxy.context.publish_streaming_message(buffer, routing_key, idle_timeout_ms, options)
+
+    @property
+    def correlation_id(self) -> Optional[str]:
+        return getattr(self._chunks, "correlation_id", None)
+
+    def __aiter__(self) -> "StreamingCall":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._build_error is not None:
+            error, self._build_error = self._build_error, None
+            raise error
+        if self._chunks is None:
+            raise StopAsyncIteration
+        while True:
+            chunk = await self._chunks.__anext__()
+            factory = self._proxy.context.factory
             try:
-                buffer = self._context.factory.build_request(
-                    method_full_name, request_message, actor
-                )
+                response = factory.decode_response(chunk)
             except Exception as error:
-                Logger.error(
-                    f"Failed building streaming request for {method_full_name} "
-                    f"from {request_message}\n{error}"
-                )
-                raise InvalidRequestError("Failed parsing message")
+                Logger.error(f"failed parsing streaming chunk for {self._method_full_name}: {error}")
+                await self.aclose()
+                raise InvalidResponseError(f"failed parsing streaming chunk for {self._method_full_name}") from error
+            # Terminal chunks may carry an error instead of a result.
+            if response.error is not None:
+                await self.aclose()
+                raise RemoteError(response.error.message, response.error.code, response.error.method)
+            if response.result is not None:
+                return response.result.data
 
-            chunk_iter = self._context.publish_streaming_message(
-                buffer,
-                f"REQUEST.{method_full_name}",
-                stream_idle_timeout_ms=stream_idle_timeout_ms,
-            )
+    async def aclose(self) -> None:
+        if self._chunks is not None:
+            aclose = getattr(self._chunks, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
-            try:
-                async for response_data in chunk_iter:
-                    try:
-                        response = self._context.factory.decode_response(response_data)
-                    except Exception as error:
-                        Logger.error(str(error))
-                        raise InvalidResponseError(
-                            f"Failed parsing streaming chunk for {method_full_name}"
-                        )
+    async def __aenter__(self) -> "StreamingCall":
+        return self
 
-                    # Errors arrive as terminal chunks with response.error set.
-                    if response.error:
-                        err = Exception(response.error.get("message", "Unknown error"))
-                        if response.error.get("code"):
-                            setattr(err, "code", response.error["code"])
-                        raise err
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.aclose()
 
-                    # Same unwrapping rule as the unary path: legacy JSON shape
-                    # wraps in {"data": ...}; protobuf decode returns the inner
-                    # message directly.
-                    result = response.result
-                    if result is None:
-                        continue
-                    if (
-                        isinstance(result, dict)
-                        and "data" in result
-                        and len(result) <= 2
-                    ):
-                        yield result["data"]
-                    else:
-                        yield result
-            finally:
-                # If the caller breaks out, this closes the underlying
-                # dispatcher iterator and releases the pending-streams slot.
-                aclose = getattr(chunk_iter, "aclose", None)
-                if aclose is not None:
-                    try:
-                        await aclose()
-                    except Exception:
-                        pass
 
-        self._methods[method_name] = streaming_proxy_method
-        setattr(self, method_name, streaming_proxy_method)
-        return streaming_proxy_method
-
-    def __getattr__(self, name: str) -> Any:
-        """
-        Dynamic method access for service methods.
-
-        Creates methods on-demand if not already created.
-        """
-        # Avoid recursion for private attributes
-        if name.startswith("_"):
-            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
-
-        # Check if method already exists
-        if name in self._methods:
-            return self._methods[name]
-
-        # Create method dynamically
-        if self._is_initialized:
-            return self._create_method(name)
-
-        raise AttributeError(
-            f"ServiceProxy not initialized. Call init() first."
-        )
+def aclosing(stream: Any) -> Any:
+    """``contextlib.aclosing`` re-exported for callers on Python 3.10+."""
+    return contextlib.aclosing(stream)

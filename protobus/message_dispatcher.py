@@ -1,25 +1,20 @@
-"""Message dispatcher for RPC communication."""
+"""Dispatcher for RPC: publishes requests and routes replies — unary and
+streaming — back to the waiting caller."""
 
 import asyncio
 import uuid
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional
-
-from aio_pika import ExchangeType, Message
-from aio_pika.abc import AbstractChannel, AbstractExchange
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Callable, Deque, Dict, Optional
 
 from .callback_listener import CallbackListener
+from .cancellation import AbortSignal
 from .config import Config
-from .connection import (
-    IConnection,
-    detach_listener,
-    publish_confirmed,
-    release_amqp_resources,
-    schedule_amqp_release,
-)
+from .connection import IConnection, attach_restorer
 from .errors import (
     DisconnectedError,
+    InvalidMessageIdError,
     NotConnectedError,
-    NotInitializedError,
     RpcTimeoutError,
     StreamBackpressureError,
     StreamSequenceError,
@@ -29,8 +24,85 @@ from .logger import Logger
 from .priority import validate_message_priority
 
 
-def _parse_final_header(headers: Dict[str, Any]) -> bool:
-    """Read the x-protobus-final header tolerantly across AMQP client encodings."""
+@dataclass
+class CallOptions:
+    """
+    Per-call options for a unary RPC / fire-and-forget publish.
+
+    ``priority``: AMQP message priority, 0-255. Only has an effect on a queue
+    declared with ``max_priority``; a broker silently ignores it elsewhere.
+
+    ``message_id``: the message's identity, as the consumer sees it in
+    ``MessageHandlerContext.message_id``. Defaults to a fresh UUID. Set it to
+    make a caller-driven republish recognisable: a PublishConfirmTimeoutError
+    or ChannelClosedError leaves the outcome unknown, so calling again can
+    produce two copies, and the same ``message_id`` on the second attempt is
+    what lets an idempotent consumer see them as one. Derive it from the
+    request (an order id), never from a clock or a counter. Rejected if
+    blank, rather than quietly falling back to a UUID.
+    """
+
+    priority: Optional[int] = None
+    message_id: Optional[str] = None
+
+
+@dataclass
+class StreamOptions:
+    """
+    Per-call streaming options.
+
+    ``signal``: cancels the stream when aborted, from anywhere — a Stop
+    button, an HTTP request's own cancellation, a timeout. Breaking out of
+    the ``async for`` cancels too, once the iterator is closed (see
+    ``publish_streaming``); a signal takes effect immediately.
+    """
+
+    signal: Optional[AbortSignal] = None
+
+
+# AMQP carries message-id as a shortstr: one length byte, so 255 max.
+MAX_MESSAGE_ID_BYTES = 255
+
+
+def validate_message_id(message_id: Any) -> Optional[str]:
+    """A caller-supplied message_id, or None to let the publish path mint one.
+    Blank is refused rather than treated as absent."""
+    if message_id is None:
+        return None
+    if not isinstance(message_id, str) or message_id.strip() == "":
+        raise InvalidMessageIdError(
+            f"message_id must be a non-empty string, got {message_id!r}. Leave it unset to have one generated."
+        )
+    size = len(message_id.encode("utf-8"))
+    if size > MAX_MESSAGE_ID_BYTES:
+        raise InvalidMessageIdError(
+            f"message_id is {size} bytes; AMQP carries message-id as a shortstr, so it must be at "
+            f"most {MAX_MESSAGE_ID_BYTES}. Hash a long key rather than concatenating it."
+        )
+    return message_id
+
+
+def parse_seq_header(headers: Optional[Dict[str, Any]]) -> Optional[int]:
+    """Read x-protobus-seq tolerantly. None when absent or unparseable, which
+    disables validation rather than manufacturing a violation."""
+    if not headers:
+        return None
+    v = headers.get(Config.HEADER_SEQ)
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", errors="ignore")
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def parse_final_header(headers: Optional[Dict[str, Any]]) -> bool:
+    """Read x-protobus-final tolerantly across AMQP client encodings."""
+    if not headers:
+        return False
     v = headers.get(Config.HEADER_FINAL)
     if v is None:
         return False
@@ -41,470 +113,517 @@ def _parse_final_header(headers: Dict[str, Any]) -> bool:
     if isinstance(v, (bytes, bytearray)):
         v = v.decode("utf-8", errors="ignore")
     if isinstance(v, str):
-        return v.lower() in ("true", "1", "yes")
+        return v.lower() == "true" or v == "1"
     return bool(v)
 
 
-def _parse_seq_header(headers: Dict[str, Any]) -> Optional[int]:
-    """Read the x-protobus-seq header tolerantly across AMQP client encodings."""
-    v = headers.get(Config.HEADER_SEQ)
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, int):
-        return v
-    if isinstance(v, (bytes, bytearray)):
-        v = v.decode("utf-8", errors="ignore")
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
+class _CallbackEntry:
+    __slots__ = ("future", "timer")
+
+    def __init__(self, future: "asyncio.Future[bytes]", timer: Optional[asyncio.TimerHandle]) -> None:
+        self.future = future
+        self.timer = timer
 
 
-# Sentinel pushed into a stream's chunk queue to indicate "no more chunks."
-_STREAM_END = object()
+class _StreamEntry:
+    """A pending streaming RPC: replies arriving as multiple messages with
+    the same correlation id, buffered until the consumer pulls them."""
 
+    __slots__ = ("chunks", "buffered_bytes", "last_seq", "waiter", "ended", "error", "touch")
 
-class _StreamFailure:
-    """
-    Sentinel carrying the reason a stream ended early.
+    def __init__(self) -> None:
+        self.chunks: Deque[bytes] = deque()
+        self.buffered_bytes = 0
+        self.last_seq: Optional[int] = None
+        self.waiter: Optional["asyncio.Future[None]"] = None
+        self.ended = False
+        self.error: Optional[BaseException] = None
+        self.touch: Optional[Callable[[], None]] = None
 
-    Distinct from _STREAM_END, which means "the producer finished". Pushing
-    _STREAM_END on a disconnect made a truncated stream indistinguishable from
-    a complete one: the caller's ``async for`` simply ended, and the missing
-    tail looked like a short answer.
-    """
-
-    __slots__ = ("error",)
-
-    def __init__(self, error: BaseException):
-        self.error = error
+    def wake(self, error: Optional[BaseException] = None) -> None:
+        waiter, self.waiter = self.waiter, None
+        if waiter is not None and not waiter.done():
+            if error is not None:
+                waiter.set_exception(error)
+            else:
+                waiter.set_result(None)
 
 
 class MessageDispatcher:
-    """
-    Dispatcher for RPC (Request-Response) message patterns.
+    """Owns the publishing channel and the callback listener."""
 
-    Manages pending callbacks and routes responses to waiting callers.
-    """
-
-    def __init__(self, connection: IConnection):
-        """
-        Initialize the message dispatcher.
-
-        Args:
-            connection: The connection to use
-        """
+    def __init__(self, connection: IConnection) -> None:
         self._connection = connection
-        self._channel: Optional[AbstractChannel] = None
-        self._exchange: Optional[AbstractExchange] = None
-        # Built once, here. Building it per reconnect leaked a channel, an
-        # exclusive queue and a consumer each time — and because the discarded
-        # listener stayed subscribed to the connection's reconnection events it
-        # kept opening more channels, turning a linear leak into O(N^2).
-        self._callback_listener: CallbackListener = CallbackListener(connection)
-        self._pending_callbacks: Dict[str, asyncio.Future] = {}
-        # correlation_id -> queue of streaming chunks. Replies for streaming
-        # calls land here; the consuming async iterator drains them.
-        self._pending_streams: Dict[str, asyncio.Queue] = {}
-        # Next sequence number expected on each stream, so a gap is detected
-        # rather than delivered as a shorter complete stream.
-        self._stream_next_seq: Dict[str, int] = {}
+        self._callbacks: Dict[str, _CallbackEntry] = {}
+        # correlation id -> in-flight streaming reply state. Distinct from
+        # _callbacks so a streaming reply cannot resolve the wrong future.
+        self._pending_streams: Dict[str, _StreamEntry] = {}
+        self._callback_listener = CallbackListener(connection)
+        self._channel: Any = None
+        # Bytes buffered across every pending stream; bounds the process.
+        self._total_buffered_bytes = 0
         self._is_initialized = False
-        self._is_closed = False
+        self._cancel_tasks: set = set()
 
-        # Serialises channel setup. A flapping broker can deliver a second
-        # 'reconnected' while the first re-setup is still awaiting a round-trip,
-        # and _emit dispatches handlers with create_task, so the two would
-        # otherwise interleave and each leave the other's channel and consumer
-        # behind. _setup_channel/_teardown_channel assume the caller holds this.
-        self._setup_lock = asyncio.Lock()
-
-        # Set up connection event handlers. Bound refs are stored so close()
-        # can unregister exactly these callbacks (TS parity).
-        self._bound_on_reconnected = self._on_reconnected
         self._bound_on_disconnected = self._on_disconnected
-        self._connection.on("reconnected", self._bound_on_reconnected)
         self._connection.on("disconnected", self._bound_on_disconnected)
+        self._detach_restorer = attach_restorer(connection, self._restore, "MessageDispatcher")
 
     @property
     def is_initialized(self) -> bool:
-        """Check if the dispatcher has been initialized."""
         return self._is_initialized
 
-    def _fail_stream(self, correlation_id: str, error: BaseException) -> None:
-        """
-        End a streaming call by raising, not by looking finished.
+    @property
+    def channel(self) -> Any:
+        return self._channel
 
-        The queue is left holding the failure so the consuming iterator raises
-        on its next pull; the slot is dropped here so a late chunk for a dead
-        stream is reported as unknown rather than accumulating.
-        """
-        queue = self._pending_streams.pop(correlation_id, None)
-        self._stream_next_seq.pop(correlation_id, None)
-        if queue is None:
+    @property
+    def callback_listener(self) -> CallbackListener:
+        return self._callback_listener
+
+    @property
+    def pending_callbacks(self) -> Dict[str, Any]:
+        return self._callbacks
+
+    @property
+    def pending_streams(self) -> Dict[str, Any]:
+        return self._pending_streams
+
+    # -- connection lifecycle -------------------------------------------------
+
+    def _on_disconnected(self, *_args: Any) -> None:
+        """Reject every pending call: nothing will answer on the old socket."""
+        Logger.debug("MessageDispatcher: connection lost, rejecting pending callbacks")
+        self._channel = None
+        error = DisconnectedError()
+        for entry in list(self._callbacks.values()):
+            if entry.timer is not None:
+                entry.timer.cancel()
+            if not entry.future.done():
+                entry.future.set_exception(error)
+        self._callbacks.clear()
+        for stream in list(self._pending_streams.values()):
+            stream.error = error
+            stream.ended = True
+            stream.wake(error)
+        self._pending_streams.clear()
+        self._total_buffered_bytes = 0
+
+    async def _restore(self, _generation: int = 0) -> None:
+        """Reopen the publishing channel. A failure propagates so the
+        generation is retried rather than announced."""
+        if not self._is_initialized:
             return
-        try:
-            queue.put_nowait(_StreamFailure(error))
-        except Exception:  # pragma: no cover - unbounded queue
-            pass
+        Logger.info("MessageDispatcher: reconnected, re-initializing channel")
+        self._channel = await self._connection.open_channel()
+        Logger.info("MessageDispatcher: successfully re-initialized after reconnection")
 
     async def init(self) -> None:
-        """Initialize the message dispatcher."""
-        async with self._setup_lock:
-            if self._is_initialized:
-                return
-            await self._setup_channel()
-            self._is_initialized = True
-
-    async def _setup_channel(self) -> None:
-        """
-        Set up the dispatcher's own channel and, on first call, its callback
-        listener.
-
-        Also called on reconnect, so the previous channel is closed first. The
-        CallbackListener is *not* rebuilt: it restores itself through its own
-        inherited reconnection handler, including re-binding its (newly
-        generated) callback queue to the callbacks exchange.
-        """
-        await self._teardown_channel()
-
+        if self._is_initialized:
+            return
         self._channel = await self._connection.open_channel()
-
-        # Declare the main exchange
-        self._exchange = await self._connection.ensure_exchange(
-            self._channel,
-            Config.bus_exchange_name(),
-            ExchangeType.TOPIC,
-        )
-
-        # init()/start() are idempotent, so this is a no-op on reconnect.
-        if not self._callback_listener.is_initialized:
-            await self._callback_listener.init(self._on_result, "")
-            await self._callback_listener.start()
-        elif not self._callback_listener.is_ready:
-            # Its own restore ran first and failed (or has not run yet).
-            # is_initialized stays True either way, so without this the
-            # dispatcher would log a successful reconnect while every reply
-            # went to a queue that no longer exists.
-            await self._callback_listener.restore()
-
-        if not self._callback_listener.is_ready:
-            raise NotConnectedError("Callback listener could not be restored")
-
-        Logger.debug("MessageDispatcher initialized")
-
-    async def _teardown_channel(self) -> None:
-        """Best-effort release of the dispatcher's own channel."""
-        channel = self._channel
-        self._channel = None
-        self._exchange = None
-        await release_amqp_resources(channel)
+        await self._callback_listener.init(self._on_result)
+        await self._callback_listener.start()
+        self._is_initialized = True
 
     async def close(self) -> None:
-        """Detach from the connection and release the dispatcher's resources."""
-        if self._is_closed:
+        self._connection.off("disconnected", self._bound_on_disconnected)
+        self._detach_restorer()
+        if self._callback_listener.is_initialized:
+            await self._callback_listener.close()
+
+    # -- replies --------------------------------------------------------------
+
+    async def _on_result(self, content: bytes, correlation_id: str, headers: Optional[Dict[str, Any]] = None, *_args: Any) -> None:
+        stream = self._pending_streams.get(correlation_id)
+        if stream is not None:
+            self._on_stream_chunk(stream, correlation_id, content, headers)
             return
-        self._is_closed = True
 
-        detach_listener(self._connection, "reconnected", self._bound_on_reconnected)
-        detach_listener(
-            self._connection, "disconnected", self._bound_on_disconnected
-        )
+        entry = self._callbacks.pop(correlation_id, None)
+        if entry is not None:
+            if entry.timer is not None:
+                entry.timer.cancel()
+            if not entry.future.done():
+                entry.future.set_result(bytes(content))
 
-        # Detaching removed the only thing that resolves in-flight calls, so
-        # release them here rather than making every caller wait out its
-        # timeout.
-        self._fail_pending(DisconnectedError("Dispatcher closed"))
+    def _on_stream_chunk(self, stream: _StreamEntry, correlation_id: str, content: bytes, headers: Optional[Dict[str, Any]]) -> None:
+        is_final = parse_final_header(headers)
+        seq = parse_seq_header(headers)
+        if seq is not None:
+            expected = 0 if stream.last_seq is None else stream.last_seq + 1
+            if seq < expected:
+                # Already seen — a broker redelivery, not new data.
+                Logger.debug(f"stream {correlation_id}: dropping duplicate chunk seq={seq} (expected {expected})")
+                if is_final:
+                    stream.ended = True
+                stream.wake()
+                return
+            if seq > expected:
+                stream.error = StreamSequenceError(
+                    f"stream {correlation_id} lost at least one chunk: got seq={seq}, expected {expected}"
+                )
+                stream.ended = True
+                self._drop_buffer(stream)
+                stream.wake()
+                return
+            stream.last_seq = seq
 
-        await self._callback_listener.close()
-        async with self._setup_lock:
-            await self._teardown_channel()
-        Logger.debug("MessageDispatcher closed")
+        body = bytes(content) if content else b""
+        if body:
+            max_chunks = Config.stream_max_buffered_chunks()
+            max_bytes = Config.stream_max_buffered_bytes()
+            max_total = Config.stream_max_total_buffered_bytes()
+            would_be_bytes = stream.buffered_bytes + len(body)
+            would_be_total = self._total_buffered_bytes + len(body)
+            if len(stream.chunks) + 1 > max_chunks or would_be_bytes > max_bytes or would_be_total > max_total:
+                stream.error = StreamBackpressureError(
+                    f"stream {correlation_id} exceeded a buffer limit "
+                    f"({len(stream.chunks) + 1} chunks / {would_be_bytes} bytes for this call, "
+                    f"{would_be_total} bytes across all calls; limits are {max_chunks} chunks / "
+                    f"{max_bytes} bytes / {max_total} bytes total) — the consumer is not keeping up with the producer"
+                )
+                stream.ended = True
+                self._drop_buffer(stream)
+                stream.wake()
+                return
+            stream.chunks.append(body)
+            stream.buffered_bytes = would_be_bytes
+            self._total_buffered_bytes = would_be_total
+            if stream.touch is not None:
+                stream.touch()
+        if is_final:
+            stream.ended = True
+        stream.wake()
 
-    def _fail_pending(self, error: Exception) -> None:
-        """Release every in-flight unary call and stream with `error`."""
-        for _correlation_id, future in list(self._pending_callbacks.items()):
-            if not future.done():
-                future.set_exception(error)
-        self._pending_callbacks.clear()
+    def _drop_buffer(self, stream: _StreamEntry) -> None:
+        stream.chunks.clear()
+        self._total_buffered_bytes = max(0, self._total_buffered_bytes - stream.buffered_bytes)
+        stream.buffered_bytes = 0
 
-        # Fail any in-flight streams. This used to push _STREAM_END — the same
-        # sentinel a *complete* stream ends with — so a caller whose stream was
-        # cut in half saw its `async for` end normally and treated the prefix
-        # as the whole answer. (The old comment here claimed the iterators
-        # would raise StreamTimeoutError on their next idle window; they never
-        # did, because the sentinel ends iteration before any idle window
-        # arrives.)
-        for correlation_id in list(self._pending_streams):
-            self._fail_stream(correlation_id, error)
-        self._pending_streams.clear()
-        self._stream_next_seq.clear()
+    # -- publishing -----------------------------------------------------------
 
-    async def _on_result(
-        self,
-        data: bytes,
-        correlation_id: str,
-        headers: Optional[Dict[str, Any]] = None,
-    ) -> Optional[bytes]:
+    async def _await_publishable(self) -> None:
         """
-        Handle incoming RPC responses (unary or streaming).
-
-        Streaming replies arrive as multiple messages sharing one correlation_id.
-        Each carries x-protobus-final in its headers; the last one has it set
-        to true. We route by checking _pending_streams first, falling back to
-        the unary _pending_callbacks map.
+        Hold a publish until the connection can carry it. A reconnection in
+        progress is waited through rather than failed on; anything else with
+        no connection is a caller error.
         """
-        hdrs = headers or {}
-
-        # Streaming reply path
-        if correlation_id in self._pending_streams:
-            queue = self._pending_streams[correlation_id]
-            is_final = _parse_final_header(hdrs)
-
-            # A gap in the sequence means a chunk was lost. Without this the
-            # caller receives a shorter but apparently complete stream — the
-            # producer's output silently truncated in the middle.
-            seq = _parse_seq_header(hdrs)
-            if seq is not None:
-                expected = self._stream_next_seq.get(correlation_id, 0)
-                if seq != expected:
-                    self._fail_stream(
-                        correlation_id,
-                        StreamSequenceError(
-                            f"Streaming chunk out of sequence: expected {expected}, "
-                            f"got {seq}"
-                        ),
-                    )
-                    return None
-                self._stream_next_seq[correlation_id] = seq + 1
-
-            # Non-empty payload → deliver. Empty body on a final-only terminal
-            # is treated as "end of stream, no extra data."
-            if data:
-                # Bounded: a producer outrunning its consumer would otherwise
-                # buffer without limit inside this dispatcher.
-                if queue.qsize() >= Config.stream_max_buffered_chunks():
-                    self._fail_stream(
-                        correlation_id,
-                        StreamBackpressureError(
-                            f"Streaming reply buffer exceeded "
-                            f"{Config.stream_max_buffered_chunks()} undelivered chunks"
-                        ),
-                    )
-                    return None
-                await queue.put(data)
-            if is_final:
-                await queue.put(_STREAM_END)
-            return None
-
-        # Unary reply path (existing behavior)
-        if correlation_id in self._pending_callbacks:
-            future = self._pending_callbacks.pop(correlation_id)
-            if not future.done():
-                future.set_result(data)
-            return None
-
-        Logger.warn(f"Received response for unknown correlation ID: {correlation_id}")
-        return None
+        if not self._connection.is_connected and not self._connection.is_reconnecting:
+            raise NotConnectedError("not connected")
+        when_ready = getattr(self._connection, "when_ready", None)
+        if callable(when_ready):
+            await when_ready()
 
     async def publish(
         self,
-        data: bytes,
+        content: bytes,
         routing_key: str,
         rpc: bool = True,
         timeout_ms: Optional[int] = None,
+        options: Optional[CallOptions] = None,
         priority: Optional[int] = None,
     ) -> Optional[bytes]:
         """
-        Publish a message and optionally wait for a response.
+        Publish a request; with ``rpc`` wait for the reply.
 
-        Args:
-            data: Message data to publish
-            routing_key: Routing key for the message
-            rpc: Whether to wait for a response
-            timeout_ms: Timeout for RPC response in milliseconds
-            priority: Optional AMQP message priority (0..255).
-
-                Only meaningful when the destination queue was declared with
-                ``x-max-priority``; publishing a priority to a queue without
-                one is accepted and simply ignored by the broker (verified —
-                this is what lets a new publisher talk to an old consumer).
-
-                Priority reorders only messages STILL SITTING in the queue.
-                Anything already prefetched by a consumer is not reordered, so
-                with prefetch N across R replicas up to N*R messages can still
-                be ahead of a high-priority one.
-
-        Returns:
-            Response data if rpc=True, None otherwise
-
-        Raises:
-            NotConnectedError: If not connected
-            NotInitializedError: If not initialized
-            asyncio.TimeoutError: If RPC times out
+        The deadline starts before the message is published, so it bounds
+        the broker confirm as well as the reply. When more than one outcome
+        is available, the publish result wins: a failed publish raises the
+        broker's error rather than the expired deadline, because "the request
+        never left" is the more specific answer.
         """
-        if not self._is_initialized:
-            raise NotInitializedError("MessageDispatcher not initialized")
-
-        if not self._connection.is_connected:
-            raise NotConnectedError("Not connected to RabbitMQ")
-
-        if not self._channel or not self._exchange:
-            raise NotConnectedError("Channel or exchange not available")
-
-        # Validate before anything is allocated or sent — see priority.py for
-        # why aio-pika's own handling is not a safe backstop.
-        priority = validate_message_priority(priority)
+        options = options or CallOptions()
+        if priority is not None and options.priority is None:
+            options.priority = priority
+        prio = validate_message_priority(options.priority)
+        caller_message_id = validate_message_id(options.message_id)
+        await self._await_publishable()
+        rpc = rpc is not False
 
         correlation_id = str(uuid.uuid4())
+        properties: Dict[str, Any] = {
+            "content_type": "application/octet-stream",
+            "correlation_id": correlation_id,
+            "reply_to": self._callback_listener.callback_queue if rpc else None,
+            "delivery_mode": 2,
+            # An RPC request that routes nowhere is a definite error, worth
+            # learning immediately rather than after a full RPC timeout.
+            # Deliberately NOT set for events: no subscribers is normal.
+            "mandatory": rpc,
+        }
+        if prio is not None:
+            properties["priority"] = prio
+        if caller_message_id is not None:
+            properties["message_id"] = caller_message_id
 
-        # Set up response future if RPC
-        response_future: Optional[asyncio.Future] = None
-        if rpc:
-            if not self._callback_listener.is_ready:
-                raise NotConnectedError("Callback listener not available")
-            response_future = asyncio.get_event_loop().create_future()
-            self._pending_callbacks[correlation_id] = response_future
-
-        try:
-            # Build message properties
-            reply_to = self._callback_listener.callback_queue if rpc else None
-
-            message = Message(
-                body=data,
-                correlation_id=correlation_id,
-                reply_to=reply_to,
-                priority=priority,
-            )
-
-            # Mandatory: a request nothing is bound to fails now rather than
-            # after the caller's whole RPC timeout. This is the difference
-            # between "that service is not running" and "that call was slow".
-            await publish_confirmed(self._exchange, message, routing_key)
-            Logger.debug(f"Published message to {routing_key}")
-
-            # Wait for response if RPC.
-            #
-            # The deadline is the CALLER's (RPC_CALL_TIMEOUT_MS, 30s), not the
-            # server's handler budget (MESSAGE_PROCESSING_TIMEOUT, 600s). Using
-            # the latter meant a call to a service that was scaled to zero, or
-            # simply not running, blocked its caller for ten minutes.
-            if rpc and response_future:
-                timeout = (timeout_ms or Config.rpc_call_timeout()) / 1000
-                try:
-                    return await asyncio.wait_for(response_future, timeout=timeout)
-                except asyncio.TimeoutError:
-                    # Clean up the pending callback
-                    self._pending_callbacks.pop(correlation_id, None)
-                    raise RpcTimeoutError(
-                        f"No reply to {routing_key} within {timeout}s"
-                    ) from None
-
+        if not rpc:
+            await self._connection.publish(self._channel, Config.bus_exchange_name(), routing_key, content, properties)
             return None
 
-        except Exception as e:
-            # Clean up on error
-            self._pending_callbacks.pop(correlation_id, None)
-            raise
+        limit = timeout_ms if timeout_ms is not None else Config.rpc_call_timeout_ms()
+        loop = asyncio.get_running_loop()
+        future: "asyncio.Future[bytes]" = loop.create_future()
 
-    async def publish_streaming(
-        self,
-        data: bytes,
-        routing_key: str,
-        stream_idle_timeout_ms: Optional[int] = None,
-    ) -> AsyncIterator[bytes]:
-        """
-        Publish a request that expects a streaming reply.
+        # Arm the reply callback BEFORE publishing: a fast service can reply
+        # while the confirm is still in flight.
+        def on_timeout() -> None:
+            entry = self._callbacks.get(correlation_id)
+            if entry is not None and entry.future is future:
+                self._callbacks.pop(correlation_id, None)
+                if not future.done():
+                    future.set_exception(RpcTimeoutError(
+                        f"no reply for {routing_key} (correlationId {correlation_id}) within {limit}ms"
+                    ))
 
-        Returns an async iterator that yields each chunk's raw response bytes
-        as they arrive on the callback queue. Iteration ends when a message
-        with x-protobus-final=true arrives. Raises StreamTimeoutError if no
-        chunk arrives within the idle timeout.
-
-        Cleanup happens automatically when the iterator is exhausted, when the
-        caller breaks out of the loop, or when an exception propagates.
-
-        See ``docs/advanced/streaming.md`` for full semantics.
-        """
-        if not self._is_initialized:
-            raise NotInitializedError("MessageDispatcher not initialized")
-        if not self._connection.is_connected:
-            raise NotConnectedError("Not connected to RabbitMQ")
-        if not self._channel or not self._exchange:
-            raise NotConnectedError("Channel or exchange not available")
-        if not self._callback_listener.is_ready:
-            raise NotConnectedError("Callback listener not available")
-
-        correlation_id = str(uuid.uuid4())
-        chunk_queue: asyncio.Queue = asyncio.Queue()
-        self._pending_streams[correlation_id] = chunk_queue
-        self._stream_next_seq[correlation_id] = 0
+        timer = loop.call_later(limit / 1000, on_timeout)
+        self._callbacks[correlation_id] = _CallbackEntry(future, timer)
 
         try:
-            reply_to = self._callback_listener.callback_queue
-            message = Message(
-                body=data,
-                correlation_id=correlation_id,
-                reply_to=reply_to,
-            )
-            await publish_confirmed(self._exchange, message, routing_key)
-            Logger.debug(f"Published streaming request to {routing_key}")
-
-            idle_timeout = (
-                stream_idle_timeout_ms or Config.stream_idle_timeout()
-            ) / 1000
-
-            while True:
-                try:
-                    item = await asyncio.wait_for(
-                        chunk_queue.get(), timeout=idle_timeout
-                    )
-                except asyncio.TimeoutError:
-                    raise StreamTimeoutError(
-                        f"No streaming chunk received within {idle_timeout}s"
-                    )
-
-                if item is _STREAM_END:
-                    return
-
-                # A stream that ended early raises. It must not be mistaken
-                # for one that finished.
-                if isinstance(item, _StreamFailure):
-                    raise item.error
-
-                yield item
+            try:
+                await self._connection.publish(self._channel, Config.bus_exchange_name(), routing_key, content, properties)
+            except BaseException:
+                # The request never made it, so no reply is coming. Release
+                # the slot now and surface the publish failure — it wins over
+                # a deadline that may have expired meanwhile.
+                self._release_callback(correlation_id, timer)
+                raise
+            return await future
         finally:
-            self._pending_streams.pop(correlation_id, None)
-            self._stream_next_seq.pop(correlation_id, None)
+            # Cancellation-safe: whatever ended the wait, the slot is freed.
+            self._release_callback(correlation_id, timer)
 
-    async def _on_reconnected(self) -> None:
-        """Handle reconnection event."""
-        if not self._is_initialized or self._is_closed:
+    def _release_callback(self, correlation_id: str, timer: asyncio.TimerHandle) -> None:
+        timer.cancel()
+        entry = self._callbacks.get(correlation_id)
+        if entry is not None and entry.timer is timer:
+            self._callbacks.pop(correlation_id, None)
+            if not entry.future.done():
+                entry.future.cancel()
+
+    def publish_streaming(
+        self,
+        content: bytes,
+        routing_key: str,
+        idle_timeout_ms: Optional[int] = None,
+        options: Optional[StreamOptions] = None,
+    ) -> "StreamingReply":
+        """
+        Publish a request that expects a streaming reply. Returns an async
+        iterator over raw reply bodies; iteration ends on x-protobus-final.
+        Raises StreamTimeoutError if no chunk arrives within the idle timeout.
+
+        Closing the iterator early — ``await stream.aclose()``, or ``async
+        with stream:`` — releases the slot, stops buffering, and sends a
+        best-effort cancellation notice to the server. A bare ``break`` out
+        of ``async for`` does NOT close a Python async iterator by itself:
+        wrap it in ``contextlib.aclosing`` or use the ``async with`` form.
+        """
+        if not self._connection.is_connected and not self._connection.is_reconnecting:
+            raise NotConnectedError("not connected")
+        options = options or StreamOptions()
+        return StreamingReply(self, content, routing_key, idle_timeout_ms, options)
+
+
+class StreamingReply:
+    """The async iterator ``publish_streaming`` returns. See its docstring."""
+
+    def __init__(
+        self,
+        dispatcher: MessageDispatcher,
+        content: bytes,
+        routing_key: str,
+        idle_timeout_ms: Optional[int],
+        options: StreamOptions,
+    ) -> None:
+        self._dispatcher = dispatcher
+        self._id = str(uuid.uuid4())
+        self._stream = _StreamEntry()
+        self._timeout_ms = idle_timeout_ms if idle_timeout_ms is not None else Config.stream_idle_timeout_ms()
+        self._idle_timer: Optional[asyncio.TimerHandle] = None
+        self._cancelled = False
+        self._released = False
+        self._signal = options.signal
+        self._publish_task: Optional["asyncio.Task[None]"] = None
+        self._loop = asyncio.get_running_loop()
+
+        dispatcher._pending_streams[self._id] = self._stream
+        self._stream.touch = self._arm_idle
+
+        aborted_before_start = self._signal is not None and self._signal.aborted
+        if self._signal is not None and not aborted_before_start:
+            self._signal.add_listener(self._on_abort)
+
+        if aborted_before_start:
+            # Aborted before it began: nothing to send and nothing to wait for.
+            self._stream.ended = True
+            dispatcher._pending_streams.pop(self._id, None)
+        else:
+            self._arm_idle()
+            # Publish in the background; a failure surfaces on first iteration.
+            # The channel is read after readiness, not before: a reconnection
+            # replaces it, and capturing the old one would publish onto a
+            # channel that is already gone.
+            self._publish_task = self._loop.create_task(self._publish(content, routing_key))
+
+    @property
+    def correlation_id(self) -> str:
+        return self._id
+
+    async def _publish(self, content: bytes, routing_key: str) -> None:
+        try:
+            when_ready = getattr(self._dispatcher._connection, "when_ready", None)
+            if callable(when_ready):
+                await when_ready()
+            await self._dispatcher._connection.publish(
+                self._dispatcher._channel, Config.bus_exchange_name(), routing_key, content,
+                {
+                    "content_type": "application/octet-stream",
+                    "correlation_id": self._id,
+                    "reply_to": self._dispatcher._callback_listener.callback_queue,
+                    "delivery_mode": 2,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as err:
+            self._stream.error = err
+            self._stream.ended = True
+            self._stream.wake(err)
+
+    # -- idle deadline --------------------------------------------------------
+
+    def _clear_idle(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _arm_idle(self) -> None:
+        """Idle deadline for the whole call, armed at creation rather than on
+        the first pull, so a caller that never iterates still releases."""
+        self._clear_idle()
+        self._idle_timer = self._loop.call_later(self._timeout_ms / 1000, self._on_idle)
+
+    def _on_idle(self) -> None:
+        self._idle_timer = None
+        if self._stream.ended:
+            return
+        self._stream.error = StreamTimeoutError(f"No streaming chunk received within {self._timeout_ms}ms")
+        self._stream.ended = True
+        # The producer is still generating for a caller that has stopped
+        # listening, so tell it to stop.
+        self._cancel(notify_only=True)
+        self._stream.wake(self._stream.error)
+
+    # -- release / cancel -----------------------------------------------------
+
+    def _release_signal(self) -> None:
+        if self._signal is not None:
+            self._signal.remove_listener(self._on_abort)
+
+    def _release_call(self) -> None:
+        """Everything this call holds, released on any terminal outcome."""
+        if self._released:
+            return
+        self._released = True
+        self._clear_idle()
+        self._release_signal()
+        self._dispatcher._pending_streams.pop(self._id, None)
+        self._dispatcher._drop_buffer(self._stream)
+
+    def _on_abort(self) -> None:
+        self._cancel()
+
+    def _cancel(self, notify_only: bool = False) -> None:
+        """
+        Stop the producer and release everything this call holds. Best effort
+        and delivered at most once: the notice is an ordinary message, and if
+        it is lost the producer runs to completion — the same outcome as
+        never cancelling.
+        """
+        if self._cancelled:
+            return
+        self._cancelled = True
+        self._release_call()
+        if not notify_only:
+            self._stream.ended = True
+            # Wake a consumer parked on the next chunk so it observes the end.
+            self._stream.wake()
+
+        Logger.debug(f"cancelling stream {self._id}")
+        dispatcher = self._dispatcher
+        channel = dispatcher._channel
+        if channel is None:
             return
 
-        Logger.debug("MessageDispatcher reconnecting...")
-        async with self._setup_lock:
-            if self._is_closed:
-                return
+        async def notify() -> None:
             try:
-                await self._setup_channel()
-                Logger.debug("MessageDispatcher reconnected")
-            except Exception as e:
-                Logger.error(f"Error reconnecting MessageDispatcher: {e}")
+                await dispatcher._connection.publish(
+                    channel, Config.cancel_exchange_name(), "", b"",
+                    {"correlation_id": self._id, "content_type": "application/octet-stream"},
+                )
+            except Exception as err:
+                Logger.debug(f"failed to publish cancel for stream {self._id}: {err}")
 
-    def _on_disconnected(self) -> None:
-        """Handle disconnection event."""
-        Logger.debug("MessageDispatcher disconnected")
+        try:
+            task = self._loop.create_task(notify())
+        except RuntimeError:
+            return
+        dispatcher._cancel_tasks.add(task)
+        task.add_done_callback(dispatcher._cancel_tasks.discard)
 
-        self._fail_pending(
-            DisconnectedError("Connection lost while waiting for response")
-        )
+    # -- iteration ------------------------------------------------------------
 
-        # Release rather than merely forget: an event delivered while the
-        # connection is still up would otherwise strand a live channel.
-        channel = self._channel
-        self._channel = None
-        self._exchange = None
-        schedule_amqp_release(channel)
+    def __aiter__(self) -> "StreamingReply":
+        return self
+
+    async def __anext__(self) -> bytes:
+        # Wait for the publish to settle once before consuming.
+        if self._publish_task is not None:
+            try:
+                await asyncio.shield(self._publish_task)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                pass
+            self._publish_task = None
+
+        stream = self._stream
+        while True:
+            if stream.error is not None:
+                error = stream.error
+                self._release_call()
+                raise error
+            if stream.chunks:
+                value = stream.chunks.popleft()
+                stream.buffered_bytes -= len(value)
+                self._dispatcher._total_buffered_bytes = max(0, self._dispatcher._total_buffered_bytes - len(value))
+                self._arm_idle()
+                return value
+            if stream.ended:
+                self._release_call()
+                raise StopAsyncIteration
+            waiter: "asyncio.Future[None]" = self._loop.create_future()
+            stream.waiter = waiter
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                if stream.waiter is waiter:
+                    stream.waiter = None
+                raise
+            except BaseException:
+                # The error is on the entry; the loop above raises it.
+                pass
+
+    async def aclose(self) -> None:
+        """Stop the producer, not just our own buffering."""
+        self._cancel()
+
+    async def __aenter__(self) -> "StreamingReply":
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.aclose()
+
+
+AsyncStream = AsyncIterator[bytes]

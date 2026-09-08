@@ -1,157 +1,211 @@
-"""Generate Python type definitions from .proto files."""
+"""
+Generate Python typing from .proto files — no protoc needed.
+
+For every message a ``TypedDict`` (``total=False``: proto3 fields are all
+optional on input), for every enum a ``Literal`` of its value names (what the
+decoder produces), and for every service a ``Protocol`` whose methods carry
+the exact signatures ``ServiceProxy`` installs — a unary method is an
+``async def`` returning the response dict, a server-streaming one returns an
+``AsyncIterator`` of chunk dicts. Plus ``SERVICE_NAME`` constants.
+
+The counterpart of the TypeScript port's ``exportTS()`` / ``protobus generate``.
+"""
 
 import os
 import re
-import subprocess
-import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
-from .config import CliConfig, find_proto_files, load_config
+from google.protobuf.descriptor import Descriptor, EnumDescriptor, FieldDescriptor, ServiceDescriptor
+
+from ..custom_types import get_custom_type
+from ..logger import Logger
+from ..message_factory import MessageFactory, Root, _custom_type_of, _is_map
+from .config import CliConfig, load_config, resolve_path
+
+_SCALARS: Dict[int, str] = {
+    FieldDescriptor.TYPE_DOUBLE: "float",
+    FieldDescriptor.TYPE_FLOAT: "float",
+    FieldDescriptor.TYPE_INT64: "int",
+    FieldDescriptor.TYPE_UINT64: "int",
+    FieldDescriptor.TYPE_INT32: "int",
+    FieldDescriptor.TYPE_FIXED64: "int",
+    FieldDescriptor.TYPE_FIXED32: "int",
+    FieldDescriptor.TYPE_BOOL: "bool",
+    FieldDescriptor.TYPE_STRING: "str",
+    FieldDescriptor.TYPE_BYTES: "bytes",
+    FieldDescriptor.TYPE_UINT32: "int",
+    FieldDescriptor.TYPE_SFIXED32: "int",
+    FieldDescriptor.TYPE_SFIXED64: "int",
+    FieldDescriptor.TYPE_SINT32: "int",
+    FieldDescriptor.TYPE_SINT64: "int",
+}
+
+
+def _class_name(full_name: str, package: str) -> str:
+    """``Combat.Player.Nested`` in package ``Combat`` -> ``Player_Nested``;
+    a type from another package keeps its package as a prefix."""
+    name = full_name[len(package) + 1:] if package and full_name.startswith(package + ".") else full_name
+    return name.replace(".", "_")
+
+
+class _Emitter:
+    def __init__(self, root: Root) -> None:
+        self.root = root
+        self.lines: List[str] = []
+        self.emitted: Set[str] = set()
+        self.uses_datetime = False
+        self.uses_literal = False
+        self.uses_any = False
+
+    def field_type(self, field: FieldDescriptor, package: str, pending: List[str]) -> str:
+        custom = _custom_type_of(field)
+        if custom is not None:
+            if custom.py_type == "datetime":
+                self.uses_datetime = True
+            elif custom.py_type == "Any":
+                self.uses_any = True
+            base = custom.py_type
+        elif field.type == FieldDescriptor.TYPE_MESSAGE:
+            pending.append(field.message_type.full_name)
+            base = f'"{_class_name(field.message_type.full_name, package)}"'
+        elif field.type == FieldDescriptor.TYPE_ENUM:
+            pending.append(field.enum_type.full_name)
+            base = f'"{_class_name(field.enum_type.full_name, package)}"'
+        else:
+            base = _SCALARS.get(field.type, "Any")
+            if base == "Any":
+                self.uses_any = True
+        if _is_map(field):
+            value_field = field.message_type.fields_by_name["value"]
+            key_type = _SCALARS.get(field.message_type.fields_by_name["key"].type, "str")
+            inner: List[str] = []
+            value_type = self.field_type(value_field, package, inner)
+            pending.extend(inner)
+            return f"Dict[{key_type}, {value_type}]"
+        if field.label == FieldDescriptor.LABEL_REPEATED:
+            return f"List[{base}]"
+        if field.type == FieldDescriptor.TYPE_MESSAGE:
+            return f"Optional[{base}]"
+        return base
+
+    def emit_type(self, full_name: str, package: str) -> None:
+        if full_name in self.emitted:
+            return
+        self.emitted.add(full_name)
+        descriptor = self.root.lookup(full_name)
+        if isinstance(descriptor, EnumDescriptor):
+            self.uses_literal = True
+            names = ", ".join(f'"{v.name}"' for v in descriptor.values)
+            self.lines.append(f"{_class_name(full_name, package)} = Literal[{names}]")
+            self.lines.append("")
+            return
+        if not isinstance(descriptor, Descriptor):
+            return
+        if descriptor.GetOptions().map_entry:
+            return
+        pending: List[str] = []
+        body = []
+        for field in descriptor.fields:
+            body.append(f"    {field.name}: {self.field_type(field, package, pending)}")
+        self.lines.append(f"class {_class_name(full_name, package)}(TypedDict, total=False):")
+        self.lines.extend(body or ["    pass"])
+        self.lines.append("")
+        for name in pending:
+            self.emit_type(name, package)
+
+    def emit_service(self, service: ServiceDescriptor) -> None:
+        package = service.file.package
+        class_name = _class_name(service.full_name, package)
+        self.lines.append(f'{class_name.upper()}_NAME = "{service.full_name}"')
+        self.lines.append("")
+        methods = []
+        for method in service.methods:
+            req = _class_name(method.input_type.full_name, package)
+            res = _class_name(method.output_type.full_name, package)
+            if method.server_streaming:
+                methods.append(
+                    f"    def {method.name}(self, request: \"{req}\", actor: Optional[str] = None, "
+                    f"idle_timeout_ms: Optional[int] = None, options: Optional[StreamOptions] = None) "
+                    f"-> AsyncIterator[\"{res}\"]: ..."
+                )
+            else:
+                methods.append(
+                    f"    async def {method.name}(self, request: \"{req}\", actor: Optional[str] = None, "
+                    f"rpc: bool = True, timeout_ms: Optional[int] = None, options: Optional[CallOptions] = None) "
+                    f"-> \"{res}\": ..."
+                )
+        self.lines.append(f"class {class_name}(Protocol):")
+        self.lines.extend(methods or ["    pass"])
+        self.lines.append("")
+        for method in service.methods:
+            self.emit_type(method.input_type.full_name, package)
+            self.emit_type(method.output_type.full_name, package)
+
+
+def export_python(root: Root, service_names: List[str]) -> str:
+    """Generate typing for ``service_names`` from ``root``."""
+    emitter = _Emitter(root)
+    for name in service_names:
+        emitter.emit_service(root.lookup_service(name))
+
+    header = [
+        "# Auto-generated by protobus CLI - do not edit manually",
+        "from typing import AsyncIterator, Dict, List, Optional, Protocol, TypedDict"
+        + (", Literal" if emitter.uses_literal else "")
+        + (", Any" if emitter.uses_any else ""),
+    ]
+    if emitter.uses_datetime:
+        header.append("from datetime import datetime")
+    header.append("from protobus import CallOptions, StreamOptions")
+    header.append("")
+    header.append("")
+    return "\n".join(header + emitter.lines).rstrip() + "\n"
+
+
+def services_in(root: Root) -> List[str]:
+    """Every service declared by a user schema in ``root``."""
+    names: List[str] = []
+    for file_name, fdp in root.files.items():
+        if file_name.startswith("google/protobuf/") or file_name.startswith("protobus/"):
+            continue
+        for service in fdp.service:
+            names.append(f"{fdp.package}.{service.name}" if fdp.package else service.name)
+    return names
 
 
 def generate_types(
     config: Optional[CliConfig] = None,
     proto_dir: Optional[str] = None,
     output: Optional[str] = None,
-) -> bool:
+    cwd: Optional[str] = None,
+) -> str:
     """
-    Generate Python type definitions from Protocol Buffer files.
-
-    This command:
-    1. Finds all .proto files in the proto directory
-    2. Uses protoc to generate Python code
-    3. Creates type stubs with service name constants
-
-    Args:
-        config: CLI configuration (loaded from pyproject.toml if not provided)
-        proto_dir: Override proto directory from config
-        output: Override output path from config
-
-    Returns:
-        True if generation succeeded, False otherwise
+    Generate typing for every service under the proto directory into the
+    types output file. Returns the output path. Raises on any failure.
     """
-    cfg = config or load_config()
-    proto_directory = proto_dir or cfg.proto_dir
-    output_path = output or cfg.types_output
+    cwd = cwd or os.getcwd()
+    cfg = config or load_config(cwd)
+    proto_directory = resolve_path(proto_dir or cfg.proto_dir, cwd)
+    types_output = resolve_path(output or cfg.types_output, cwd)
 
-    print(f"Generating types from {proto_directory}...")
+    if not os.path.isdir(proto_directory):
+        raise FileNotFoundError(
+            f"Proto directory not found: {proto_directory}. Create it and add your .proto files, "
+            "or configure [tool.protobus] proto_dir in pyproject.toml"
+        )
 
-    # Find all proto files
-    proto_files = find_proto_files(proto_directory)
+    factory = MessageFactory()
+    factory.init([proto_directory])
+    assert factory.root is not None
+    service_names = services_in(factory.root)
+    if not service_names:
+        raise ValueError(f"No services found in the .proto files under {proto_directory}")
 
-    if not proto_files:
-        print(f"No .proto files found in {proto_directory}")
-        return False
-
-    print(f"Found {len(proto_files)} proto file(s)")
-
-    # Ensure output directory exists
-    output_dir = Path(output_path).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Generate Python code using protoc
-    try:
-        for proto_file in proto_files:
-            result = subprocess.run(
-                [
-                    "protoc",
-                    f"--proto_path={proto_directory}",
-                    f"--python_out={output_dir}",
-                    f"--pyi_out={output_dir}",
-                    proto_file,
-                ],
-                capture_output=True,
-                text=True,
-            )
-
-            if result.returncode != 0:
-                print(f"Error generating types for {proto_file}:")
-                print(result.stderr)
-                return False
-
-            print(f"  Generated types for {proto_file}")
-
-    except FileNotFoundError:
-        print("Error: protoc not found. Please install Protocol Buffers compiler.")
-        print("  macOS: brew install protobuf")
-        print("  Ubuntu: apt install protobuf-compiler")
-        print("  Windows: choco install protoc")
-        return False
-
-    # Generate service name constants
-    _generate_service_constants(proto_files, output_path, proto_directory)
-
-    print(f"Types generated successfully to {output_path}")
-    return True
-
-
-def _generate_service_constants(
-    proto_files: list[str],
-    output_path: str,
-    proto_dir: str,
-) -> None:
-    """Generate a Python file with service name constants."""
-    services: list[tuple[str, str]] = []  # (service_name, proto_file)
-
-    for proto_file in proto_files:
-        with open(proto_file, "r") as f:
-            content = f.read()
-
-        # Extract package name
-        package_match = re.search(r'package\s+([a-zA-Z0-9_.]+)\s*;', content)
-        package = package_match.group(1) if package_match else ""
-
-        # Extract service names
-        service_matches = re.findall(r'service\s+([a-zA-Z0-9_]+)\s*\{', content)
-
-        for service_name in service_matches:
-            full_name = f"{package}.{service_name}" if package else service_name
-            proto_name = Path(proto_file).relative_to(proto_dir)
-            services.append((full_name, str(proto_name)))
-
-    if services:
-        constants_file = Path(output_path)
-
-        with open(constants_file, "w") as f:
-            f.write('"""Auto-generated service name constants."""\n\n')
-            f.write("# Service name constants\n")
-            f.write("# Use these constants instead of hardcoding service names\n\n")
-
-            for service_name, proto_file in services:
-                # Create a Python-friendly constant name
-                const_name = service_name.upper().replace(".", "_")
-                f.write(f'{const_name} = "{service_name}"\n')
-
-            f.write("\n# Proto file mappings\n")
-            f.write("SERVICE_PROTOS = {\n")
-            for service_name, proto_file in services:
-                f.write(f'    "{service_name}": "{proto_file}",\n')
-            f.write("}\n")
-
-
-def main() -> int:
-    """CLI entry point for generate types command."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Generate Python types from Protocol Buffer files"
-    )
-    parser.add_argument(
-        "--proto-dir",
-        help="Directory containing .proto files",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        help="Output file path",
-    )
-
-    args = parser.parse_args()
-
-    success = generate_types(proto_dir=args.proto_dir, output=args.output)
-    return 0 if success else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    print(f"Found {len(service_names)} service(s) in {proto_directory}")
+    source = export_python(factory.root, service_names)
+    Path(types_output).parent.mkdir(parents=True, exist_ok=True)
+    with open(types_output, "w", encoding="utf-8") as fh:
+        fh.write(source)
+    print(f"Types generated successfully: {types_output}")
+    return types_output

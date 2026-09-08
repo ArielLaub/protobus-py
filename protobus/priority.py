@@ -13,8 +13,8 @@ both fail badly and late if they are wrong:
 
 - A message ``priority`` outside 0..255 raises a raw ``struct.error`` from
   inside the AMQP encoder ("'B' format requires 0 <= number <= 255") — and a
-  *non-integer* one does not raise at all: aio-pika does ``int(priority)``, so
-  ``1.5`` is silently stored as ``1``. The silent case is the dangerous one.
+  *non-integer* one does not raise at all: the encoder does ``int(priority)``,
+  so ``1.5`` is silently stored as ``1``. The silent case is the dangerous one.
 
 Validating here turns all of that into one clear ``InvalidPriorityError``, and
 keeps this port's behaviour identical to the TypeScript port's, which validates
@@ -46,8 +46,8 @@ def _require_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise InvalidPriorityError(
             f"{label} must be an integer, got {value!r} ({type(value).__name__}). "
-            "Note that a float is not silently truncated here: aio-pika would "
-            "have stored 1.5 as 1 with no error."
+            "Note that a float is not silently truncated here: the AMQP encoder "
+            "would have stored 1.5 as 1 with no error."
         )
     return value
 
@@ -95,3 +95,7 @@ def validate_message_priority(value: Optional[int]) -> Optional[int]:
             f"{MAX_MESSAGE_PRIORITY}, got {value}."
         )
     return value
+
+
+# TS parity alias: the TypeScript port calls this validatePriority().
+validate_priority = validate_message_priority

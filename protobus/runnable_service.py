@@ -1,148 +1,191 @@
-"""Runnable service - base class for services with lifecycle management."""
+"""
+RunnableService: a MessageService with lifecycle management.
+
+- Convention-based proto file name (derived from the service name)
+- Graceful shutdown on SIGINT / SIGTERM: stop consuming, drain in-flight
+  work, run the cleanup hook, disconnect
+- ``start()`` to bootstrap a service, ``run()`` to block until shutdown
+"""
 
 import asyncio
+import os
 import signal
-from abc import abstractmethod
-from typing import Any, Callable, Optional, Type, TypeVar
+from typing import Any, Awaitable, Callable, Optional, Type, TypeVar
 
-from .context import Context, IContext
-from .errors import MissingProtoError
+from .context import IContext
 from .logger import Logger
 from .message_service import MessageService, MessageServiceOptions
 
 T = TypeVar("T", bound="RunnableService")
 
+# Signals a running service shuts down on. Not every platform has SIGTERM.
+_SHUTDOWN_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM") if hasattr(signal, name))
+
 
 class RunnableService(MessageService):
-    """
-    Abstract base class for services with lifecycle management.
-
-    Extends MessageService with:
-    - Automatic proto filename resolution from service name
-    - Graceful shutdown handling (SIGINT, SIGTERM)
-    - Static bootstrap method for easy service startup
-    - Cleanup hook for custom shutdown logic
-
-    Example:
-        class CalculatorService(RunnableService):
-            @property
-            def service_name(self) -> str:
-                return "Calculator.Service"
-
-            async def add(self, data: dict, actor: str, correlation_id: str) -> dict:
-                return {"result": data["a"] + data["b"]}
-
-        # Start the service
-        asyncio.run(CalculatorService.start(ctx, CalculatorService))
-    """
-
-    def __init__(
-        self,
-        context: IContext,
-        options: Optional[MessageServiceOptions] = None,
-    ):
-        """
-        Initialize the runnable service.
-
-        Args:
-            context: The context to use for messaging
-            options: Optional service configuration
-        """
-        super().__init__(context, options)
+    def __init__(self, context: IContext, options: Optional[MessageServiceOptions] = None, **kwargs: Any) -> None:
+        super().__init__(context, options, **kwargs)
         self._shutdown_event: Optional[asyncio.Event] = None
-        self._shutdown_handlers_installed = False
-
-    @property
-    @abstractmethod
-    def service_name(self) -> str:
-        """Get the service name."""
-        ...
+        self._shutting_down = False
 
     @property
     def proto_file_name(self) -> str:
         """
-        Get the proto file name.
-
-        Derives the proto filename from service_name by convention:
-        - "Calculator.Service" -> "Calculator.proto"
-        - "combat.Player" -> "combat.proto"
+        Convention-based proto file resolution: ``Calculator.Service`` ->
+        ``Calculator.proto``, in ``PROTO_PATH`` (default ``./proto``).
+        Override for a different layout.
         """
-        # Take the first part of the service name as the proto filename
-        parts = self.service_name.split(".")
-        return f"{parts[0]}.proto"
+        if type(self).ProtoFileName is not MessageService.ProtoFileName:
+            return self.ProtoFileName
+        package_name = self.service_name.split(".")[0] or self.service_name
+        return os.path.join(os.environ.get("PROTO_PATH", "./proto"), f"{package_name}.proto")
 
     async def cleanup(self) -> None:
-        """
-        Clean up resources on shutdown.
+        """Optional hook run during shutdown, after in-flight work drained.
+        Override to close databases, flush buffers, etc."""
 
-        Override this method to implement custom cleanup logic,
-        such as closing database connections or flushing caches.
-        """
-        pass
+    # -- shutdown -------------------------------------------------------------
 
-    def _setup_signal_handlers(self) -> None:
-        """Set up signal handlers for graceful shutdown."""
-        if self._shutdown_handlers_installed:
+    async def shutdown(self, reason: str = "", exit_code: int = 0) -> None:
+        """
+        Graceful shutdown, in the order that keeps user resources safe:
+
+        1. stop taking new work, keeping channels open;
+        2. let work already in hand finish — including the reply, retry or
+           DLQ publish that settles it — within ``SHUTDOWN_DRAIN_TIMEOUT_MS``;
+        3. run ``cleanup()``;
+        4. disconnect.
+        """
+        if self._shutting_down:
             return
+        self._shutting_down = True
+        Logger.info(f"Shutdown initiated{f' ({reason})' if reason else ''}")
 
-        loop = asyncio.get_event_loop()
+        try:
+            await self.stop_consuming()
+            Logger.info("Stopped accepting new messages")
+        except Exception as err:
+            Logger.error(f"Failed to stop consumers: {err}")
 
-        def signal_handler(sig: signal.Signals) -> None:
-            Logger.info(f"Received {sig.name}, shutting down gracefully...")
-            if self._shutdown_event:
-                self._shutdown_event.set()
+        connection = self.context.connection
+        try:
+            budget = int(os.environ.get("SHUTDOWN_DRAIN_TIMEOUT_MS") or 30000)
+            in_flight = getattr(connection, "in_flight_deliveries", 0)
+            if in_flight > 0:
+                Logger.info(f"Draining {in_flight} in-flight message(s), up to {budget}ms")
+                drained = await connection.drain_in_flight(budget)
+                Logger.info(
+                    "In-flight messages drained" if drained else
+                    f"Drain deadline reached with {connection.in_flight_deliveries} still running; "
+                    "they stay unacknowledged and will be redelivered"
+                )
+        except Exception as err:
+            Logger.error(f"Drain failed: {err}")
 
-        # Register signal handlers
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            await self.cleanup()
+            Logger.info("Service cleanup completed")
+        except Exception as err:
+            Logger.error(f"Service cleanup failed: {err}")
+
+        try:
+            await connection.disconnect()
+            Logger.info("Connection closed")
+        except Exception as err:
+            Logger.error(f"Connection close failed: {err}")
+
+        self._exit_code = exit_code
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
+
+    _exit_code = 0
+
+    @property
+    def exit_code(self) -> int:
+        return self._exit_code
+
+    def _install_signal_handlers(self) -> Callable[[], None]:
+        loop = asyncio.get_running_loop()
+        installed = []
+
+        def request_shutdown(sig_name: str) -> None:
+            loop.create_task(self.shutdown(f"signal: {sig_name}"))
+
+        for sig in _SHUTDOWN_SIGNALS:
             try:
-                loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
-            except NotImplementedError:
-                # Signal handlers not available on Windows
-                signal.signal(sig, lambda s, f: signal_handler(signal.Signals(s)))
+                loop.add_signal_handler(sig, request_shutdown, sig.name)
+                installed.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Windows, or not the main thread: no signal handling.
+                pass
 
-        self._shutdown_handlers_installed = True
+        def remove() -> None:
+            for sig in installed:
+                try:
+                    loop.remove_signal_handler(sig)
+                except Exception:
+                    pass
 
-    async def run(self) -> None:
+        return remove
+
+    async def run(self) -> int:
         """
-        Run the service until shutdown signal is received.
-
-        This method blocks until SIGINT or SIGTERM is received,
-        then performs graceful shutdown.
+        Block until a shutdown signal arrives, then shut down gracefully.
+        Returns the exit code (0 for a signal-initiated shutdown).
         """
         self._shutdown_event = asyncio.Event()
-        self._setup_signal_handlers()
-
+        remove_handlers = self._install_signal_handlers()
         Logger.info(f"Service {self.service_name} running, press Ctrl+C to stop")
-
-        # Wait for shutdown signal
-        await self._shutdown_event.wait()
-
-        # Perform cleanup
-        Logger.info(f"Cleaning up service {self.service_name}...")
-        await self.cleanup()
-        Logger.info(f"Service {self.service_name} stopped")
-
-    @staticmethod
-    def _register_schema(context: IContext, service: "RunnableService") -> None:
-        """
-        Register the service's .proto with the factory.
-
-        A missing .proto is legitimate — services that speak JSON have none —
-        and registers an empty schema. Everything else is a real failure and is
-        raised: the previous bare ``except Exception`` swallowed a broken proto,
-        an unreadable file and a factory error alike, leaving a service that
-        came up looking healthy with no schema behind it.
-        """
         try:
-            source = service.Proto
-        except MissingProtoError:
-            Logger.debug(
-                f"No .proto for {service.service_name}; registering an empty "
-                f"schema (JSON mode)"
-            )
-            source = ""
+            await self._shutdown_event.wait()
+        finally:
+            remove_handlers()
+        Logger.info(f"Service {self.service_name} stopped")
+        return self._exit_code
 
-        context.factory.parse(source, service.service_name)
+    def request_shutdown(self, reason: str = "requested") -> None:
+        """Ask a running service to shut down, from anywhere in the process."""
+        try:
+            asyncio.get_running_loop().create_task(self.shutdown(reason))
+        except RuntimeError:
+            pass
+
+    @classmethod
+    async def launch(
+        cls: Type[T],
+        context: IContext,
+        service_class: Optional[Type[T]] = None,
+        options: Optional[MessageServiceOptions] = None,
+        post_init: Optional[Callable[[T], Awaitable[None]]] = None,
+    ) -> T:
+        """
+        Instantiate and initialise a service, returning it without blocking.
+
+        A startup failure runs the shutdown sequence with exit code 1 and
+        re-raises, so a supervisor sees the process fail rather than succeed.
+        """
+        service_class = service_class or cls
+        service: Optional[T] = None
+        try:
+            service = service_class(context, options)
+            Logger.info(f"Starting service: {service.service_name}")
+            await service.init()
+            if post_init is not None:
+                result = post_init(service)
+                if asyncio.iscoroutine(result):
+                    await result
+            Logger.info(f"Service ready: {service.service_name}")
+            return service
+        except Exception as err:
+            Logger.error(f"Service startup failed: {err}")
+            if service is not None:
+                await service.shutdown("startup failed", exit_code=1)
+            else:
+                try:
+                    await context.connection.disconnect()
+                except Exception:
+                    pass
+            raise
 
     @classmethod
     async def start(
@@ -150,46 +193,21 @@ class RunnableService(MessageService):
         context: IContext,
         service_class: Optional[Type[T]] = None,
         options: Optional[MessageServiceOptions] = None,
-        post_init: Optional[Callable[[T], Any]] = None,
+        post_init: Optional[Callable[[T], Awaitable[None]]] = None,
     ) -> T:
         """
-        Bootstrap and start a service.
+        Bootstrap a service and run it until a shutdown signal arrives.
 
-        This is a convenience method for starting a service with
-        proper initialization and lifecycle management.
+        The one call a service's ``main()`` needs::
 
-        Args:
-            context: The context to use for messaging
-            service_class: The service class to instantiate (defaults to cls)
-            options: Optional service configuration
-            post_init: Optional callback to run after initialization
-
-        Returns:
-            The started service instance
-
-        Example:
             async def main():
                 ctx = Context()
-                await ctx.init("amqp://localhost")
-                await CalculatorService.start(ctx, CalculatorService)
+                await ctx.init("amqp://localhost", ["./proto"])
+                await CalculatorService.start(ctx)
+
+        Returns the service once it has shut down. Use ``launch()`` to get
+        the running service back without blocking.
         """
-        svc_class = service_class or cls
-        service = svc_class(context, options)
-
-        cls._register_schema(context, service)
-
-        # Initialize the service
-        await service.init()
-
-        # Run post-init callback if provided
-        if post_init:
-            result = post_init(service)
-            if asyncio.iscoroutine(result):
-                await result
-
-        Logger.info(f"Service {service.service_name} started")
-
-        # Run the service (blocks until shutdown)
+        service = await cls.launch(context, service_class, options, post_init)
         await service.run()
-
         return service

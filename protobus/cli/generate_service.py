@@ -1,236 +1,146 @@
-"""Generate service stub from .proto file."""
+"""Generate a service stub from a .proto file."""
 
 import os
 import re
-import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from .config import CliConfig, load_config
+from ..message_factory import MessageFactory
+from .config import CliConfig, load_config, resolve_path
+
+
+class InvalidServiceNameError(Exception):
+    """A service name that could not be used safely in a file path."""
+
+    def __init__(self, name: str, reason: str) -> None:
+        super().__init__(f"invalid service name {name!r}: {reason}")
+
+
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def assert_safe_service_name(name: str) -> str:
+    """
+    Validate a service name before it is interpolated into a filesystem path.
+
+    The name arrives from argv and is joined onto the configured proto and
+    services directories, so anything containing a separator or a ``..``
+    segment writes outside them. Rather than sanitising — which invites
+    disagreement between what was asked for and what was written — reject
+    and say why. Returns the name unchanged.
+    """
+    if not isinstance(name, str) or not name:
+        raise InvalidServiceNameError(str(name), "must be a non-empty string")
+    if len(name) > 100:
+        raise InvalidServiceNameError(name, "must be 100 characters or fewer")
+    if not _SAFE_NAME.match(name):
+        raise InvalidServiceNameError(name, "may contain only letters, digits, underscore and hyphen")
+    return name
+
+
+def to_snake_case(name: str) -> str:
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+
+
+# 1.x private name, kept for callers that imported it.
+_to_snake_case = to_snake_case
 
 
 def generate_service(
     service_name: str,
     config: Optional[CliConfig] = None,
     output_dir: Optional[str] = None,
-) -> bool:
-    """
-    Generate a service stub class from a service name.
-
-    This command:
-    1. Finds the .proto file for the service
-    2. Extracts RPC method definitions
-    3. Generates a Python class extending RunnableService
-
-    Args:
-        service_name: Full service name (e.g., "calculator.MathService")
-        config: CLI configuration
-        output_dir: Override output directory from config
-
-    Returns:
-        True if generation succeeded, False otherwise
-    """
-    cfg = config or load_config()
-    services_dir = output_dir or cfg.services_dir
-
-    print(f"Generating service stub for {service_name}...")
-
-    # Parse service name to determine proto file
-    parts = service_name.split(".")
-    if len(parts) < 2:
-        print(f"Error: Invalid service name format. Expected 'package.ServiceName'")
-        return False
-
-    package = ".".join(parts[:-1])
-    class_name = parts[-1]
-    proto_file_name = f"{parts[0]}.proto"
-    proto_path = Path(cfg.proto_dir) / proto_file_name
-
-    # Extract methods from proto file if it exists
-    methods: list[dict] = []
-    if proto_path.exists():
-        methods = _extract_methods(proto_path, class_name)
-
-    # Generate the service file
-    output_path = Path(services_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Create filename from service name
-    file_name = _to_snake_case(class_name) + "_service.py"
-    service_file = output_path / file_name
-
-    if service_file.exists():
-        print(f"Warning: {service_file} already exists. Skipping.")
-        print("Delete the file first if you want to regenerate.")
-        return False
-
-    # Generate the service code
-    code = _generate_service_code(service_name, class_name, methods)
-
-    with open(service_file, "w") as f:
-        f.write(code)
-
-    print(f"Service stub generated at {service_file}")
-    return True
-
-
-def _extract_methods(proto_path: Path, service_name: str) -> list[dict]:
-    """Extract RPC methods from a proto file."""
-    methods = []
-
-    if not proto_path.exists():
-        return methods
-
-    with open(proto_path, "r") as f:
-        content = f.read()
-
-    # Find the service block
-    service_pattern = rf'service\s+{re.escape(service_name)}\s*\{{([^}}]*)\}}'
-    service_match = re.search(service_pattern, content, re.DOTALL)
-
-    if not service_match:
-        return methods
-
-    service_block = service_match.group(1)
-
-    # Extract RPC definitions
-    rpc_pattern = r'rpc\s+(\w+)\s*\(\s*(\w+)\s*\)\s*returns\s*\(\s*(\w+)\s*\)'
-    rpc_matches = re.findall(rpc_pattern, service_block)
-
-    for method_name, request_type, response_type in rpc_matches:
-        methods.append({
-            "name": method_name,
-            "request": request_type,
-            "response": response_type,
-        })
-
-    return methods
-
-
-def _to_snake_case(name: str) -> str:
-    """Convert CamelCase to snake_case."""
-    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
-
-
-def _to_method_name(name: str) -> str:
-    """Convert RPC method name to Python method name."""
-    # Convert first letter to lowercase for Python convention
-    if name[0].isupper():
-        return name[0].lower() + name[1:]
-    return name
-
-
-def _generate_service_code(
-    service_name: str,
-    class_name: str,
-    methods: list[dict],
+    cwd: Optional[str] = None,
 ) -> str:
-    """Generate the service class code."""
-    lines = [
-        '"""Auto-generated service stub for ' + service_name + '."""',
-        "",
-        "from typing import Any, Optional",
-        "",
-        "from protobus import RunnableService, Context, HandledError",
-        "",
-        "",
-        f"class {class_name}Service(RunnableService):",
-        f'    """',
-        f'    Service implementation for {service_name}.',
-        f'    ',
-        f'    TODO: Implement the RPC methods below.',
-        f'    """',
-        "",
-        "    @property",
-        "    def service_name(self) -> str:",
-        f'        return "{service_name}"',
-        "",
-    ]
+    """
+    Generate a stub for ``<service_name>.proto``: a RunnableService with one
+    ``async def`` per rpc (an async generator for a server-streaming one),
+    taken from the parsed schema rather than a regex over the text.
+    Returns the path written. Raises rather than exiting, so it can be
+    called from a script or a test.
+    """
+    assert_safe_service_name(service_name)
+    cwd = cwd or os.getcwd()
+    cfg = config or load_config(cwd)
+    proto_dir = resolve_path(cfg.proto_dir, cwd)
+    services_dir = resolve_path(output_dir or cfg.services_dir, cwd)
 
-    if methods:
-        for method in methods:
-            method_name = _to_method_name(method["name"])
-            lines.extend([
-                f"    async def {method_name}(",
-                "        self,",
-                "        data: dict,",
-                "        actor: str,",
-                "        correlation_id: str,",
-                "    ) -> dict:",
-                f'        """',
-                f'        Handle {method["name"]} RPC call.',
-                f'        ',
-                f'        Args:',
-                f'            data: Request data ({method["request"]})',
-                f'            actor: Actor identifier',
-                f'            correlation_id: Request correlation ID',
-                f'        ',
-                f'        Returns:',
-                f'            Response data ({method["response"]})',
-                f'        """',
-                '        # TODO: Implement this method',
-                f'        raise NotImplementedError("{method_name} not implemented")',
-                "",
-            ])
-    else:
-        lines.extend([
-            "    # TODO: Add your RPC methods here",
-            "    # Example:",
-            "    # async def my_method(",
-            "    #     self,",
-            "    #     data: dict,",
-            "    #     actor: str,",
-            "    #     correlation_id: str,",
-            "    # ) -> dict:",
-            "    #     return {\"result\": \"success\"}",
-            "",
-        ])
+    proto_file = os.path.join(proto_dir, f"{service_name}.proto")
+    if not os.path.exists(proto_file):
+        raise FileNotFoundError(f"Proto file not found: {proto_file}")
 
-    lines.extend([
-        "",
-        "# Convenience method to start the service",
-        "async def main() -> None:",
-        '    """Start the service."""',
-        "    import asyncio",
-        "",
-        "    ctx = Context()",
-        '    await ctx.init("amqp://guest:guest@localhost:5672/")',
-        "",
-        f"    await {class_name}Service.start(ctx, {class_name}Service)",
-        "",
-        "",
-        'if __name__ == "__main__":',
-        "    import asyncio",
-        "    asyncio.run(main())",
-        "",
-    ])
+    factory = MessageFactory()
+    factory.init([])
+    with open(proto_file, "r", encoding="utf-8") as fh:
+        factory.parse(fh.read(), service_name)
+    assert factory.root is not None
 
-    return "\n".join(lines)
+    fdp = next(iter(f for name, f in factory.root.files.items() if name.startswith("protobus/") and f.service), None)
+    if fdp is None or not fdp.service:
+        raise ValueError(f"Could not find a service definition in {proto_file}")
+    service_proto = fdp.service[0]
+    full_service_name = f"{fdp.package}.{service_proto.name}" if fdp.package else service_proto.name
+    descriptor = factory.root.lookup_service(full_service_name)
+
+    class_name = f"{service_name}Service"
+    methods: List[str] = []
+    for method in descriptor.methods:
+        req = method.input_type.name
+        res = method.output_type.name
+        if method.server_streaming:
+            methods.append(
+                f"    async def {method.name}(self, request: dict, actor: str, correlation_id: str, context: MessageHandlerContext):\n"
+                f"        \"\"\"{req} -> stream of {res}. Yield one dict per chunk; watch context.signal to stop early.\"\"\"\n"
+                f"        raise NotImplementedError(\"{method.name}\")\n"
+                f"        yield {{}}  # pragma: no cover\n"
+            )
+        else:
+            methods.append(
+                f"    async def {method.name}(self, request: dict, actor: str, correlation_id: str) -> dict:\n"
+                f"        \"\"\"{req} -> {res}.\"\"\"\n"
+                f"        raise NotImplementedError(\"{method.name}\")\n"
+            )
+
+    code = f'''"""
+{full_service_name} implementation.
+
+Generated by protobus CLI. Implement the methods below.
+"""
+
+import asyncio
+import os
+
+from protobus import Context, MessageHandlerContext, RunnableService
 
 
-def main() -> int:
-    """CLI entry point for generate service command."""
-    import argparse
+class {class_name}(RunnableService):
+    service_name = "{full_service_name}"
 
-    parser = argparse.ArgumentParser(
-        description="Generate a service stub from a service name"
+{chr(10).join(methods)}
+
+async def main() -> None:
+    context = Context()
+    await context.init(
+        os.environ.get("AMQP_URL", "amqp://guest:guest@localhost:5672/"),
+        [os.environ.get("PROTO_PATH", "{cfg.proto_dir}")],
     )
-    parser.add_argument(
-        "service_name",
-        help="Full service name (e.g., calculator.MathService)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        "-o",
-        help="Output directory for generated service",
-    )
-
-    args = parser.parse_args()
-
-    success = generate_service(args.service_name, output_dir=args.output_dir)
-    return 0 if success else 1
+    await {class_name}.start(context)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    asyncio.run(main())
+'''
+
+    service_sub_dir = Path(services_dir) / service_name.lower()
+    service_sub_dir.mkdir(parents=True, exist_ok=True)
+    output_file = service_sub_dir / f"{to_snake_case(service_name)}_service.py"
+    # Containment: the validated name cannot escape, but check the resolved
+    # path anyway so a misconfigured services_dir cannot either.
+    if Path(os.path.commonpath([Path(services_dir).resolve(), output_file.resolve()])) != Path(services_dir).resolve():
+        raise InvalidServiceNameError(service_name, "resolved outside the services directory")
+    if output_file.exists():
+        raise FileExistsError(f"Service file already exists: {output_file}. Remove it first if you want to regenerate.")
+    output_file.write_text(code, encoding="utf-8")
+    print(f"Service generated: {output_file}")
+    return str(output_file)

@@ -1,1025 +1,1304 @@
-"""Connection module for RabbitMQ/AMQP connections with automatic reconnection."""
+"""
+The AMQP connection: sockets, channels, reconnection, publishing with broker
+confirms, and the consume/settle ladder every listener runs on.
+
+Built directly on ``aiormq`` (the protocol library under aio-pika), whose
+channel API maps one-to-one onto the amqplib API the TypeScript port uses.
+Reconnection is this module's own, generation-numbered and coordinated with
+every component's restorer, rather than a client library's automatic one —
+two reconnection mechanisms fighting over one socket is how a previous
+version leaked channels and announced itself ready with no consumers.
+"""
 
 import asyncio
 import inspect
 import random
 import time
+import uuid
+import weakref
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Union
-
-import aio_pika
-from aio_pika import ExchangeType, Message
-from aio_pika.abc import (
-    AbstractChannel,
-    AbstractConnection,
-    AbstractExchange,
-    AbstractIncomingMessage,
-    AbstractQueue,
+from typing import (
+    Any,
+    AsyncIterable,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Union,
+    runtime_checkable,
 )
 
+import aiormq
+from aiormq.abc import DeliveredMessage
+from pamqp.commands import Basic
+
+from .cancellation import AbortController, AbortSignal
 from .config import Config
 from .errors import (
     AlreadyConnectedError,
-    DisconnectedError,
-    NotConnectedError,
+    ChannelClosedError,
+    NotReadyError,
+    PublishConfirmTimeoutError,
+    PublishNackedError,
     ReconnectionError,
+    TimeoutError,
     UnroutableError,
-    is_handled_error,
+    safe_error_summary,
 )
-from .logger import Logger
-from .priority import validate_message_priority
+from .events import EventEmitter
+from .logger import Logger, redact_url
 
-# Type aliases
-#
-# A handler receives the message body, correlation_id, and the incoming AMQP
-# headers — and, if it declares a fourth positional parameter, the routing key
-# the delivery arrived on. It returns one of:
-#   - bytes  → a single (unary) reply published to message.reply_to
-#   - None   → no reply (one-way event, or handler chose to suppress)
-#   - AsyncIterator[bytes] → a streaming reply. Each yielded chunk is
-#     published to message.reply_to with x-protobus-final=false; the last
-#     chunk is published with x-protobus-final=true. See docs/advanced/streaming.md.
-MessageHandler = Callable[
-    [bytes, str, Dict[str, Any]],
-    Awaitable[Any],
-]
+# ---------------------------------------------------------------------------
+# Public types
+# ---------------------------------------------------------------------------
 
+Channel = aiormq.abc.AbstractChannel
+"""An AMQP channel (aiormq). Opened with publisher confirms."""
 
-@dataclass
-class ConnectionOptions:
-    """Options for connection behavior."""
-
-    max_reconnect_attempts: int = 10
-    initial_reconnect_delay_ms: int = 1000
-    max_reconnect_delay_ms: int = 30000
-    reconnect_backoff_multiplier: float = 2.0
-    jitter_percent: float = 0.3
+MessageHandlerResult = Union[bytes, None, AsyncIterable[bytes]]
+"""
+What a MessageHandler may return:
+  - ``bytes``                 -> a single unary reply is published
+  - ``None``                  -> no reply (one-way event, or suppressed)
+  - ``AsyncIterable[bytes]``  -> streaming reply; each chunk is published with
+                                 x-protobus-final=false, the last with =true.
+"""
 
 
 @dataclass
-class RetryOptions:
-    """Options for message retry behavior."""
-
-    max_retries: int = 3
-    retry_delay_ms: int = 5000
-    message_ttl_ms: Optional[int] = None
-
-
-DEFAULT_RETRY_OPTIONS = RetryOptions()
-
-
-def _handler_accepts_routing_key(handler: Callable[..., Any]) -> bool:
+class MessageHandlerContext:
     """
-    Whether a message handler declares the optional 4th (routing key) argument.
+    Extra context handed to a message handler as its 4th argument.
 
-    Resolved once per consumer rather than per delivery. A handler taking
-    *args is assumed to accept it.
+    ``signal`` aborts when the processing timeout elapses or a streaming
+    caller cancels. ``message_id`` is stable across every redelivery and
+    every retry hop of the same logical message, which is what makes
+    deduplication possible. ``redelivered`` is the broker's flag.
     """
-    try:
-        params = list(inspect.signature(handler).parameters.values())
-    except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
-        return False
 
-    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params):
-        return True
-
-    positional = [
-        p
-        for p in params
-        if p.kind
-        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    return len(positional) >= 4
+    signal: AbortSignal
+    routing_key: str
+    message_id: Optional[str] = None
+    redelivered: bool = False
 
 
-def _is_unroutable(result: Any) -> bool:
+MessageHandler = Callable[..., Awaitable[MessageHandlerResult]]
+"""``async def handler(content: bytes, correlation_id: str, headers: dict,
+context: MessageHandlerContext)``. A handler declaring only three positional
+parameters is called without the context."""
+
+
+@dataclass
+class ConsumeOptions:
+    consumer_tag: str = ""
+    no_ack: bool = False
+    exclusive: bool = False
+    arguments: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ConsumeRetryOptions:
     """
-    Whether a publish result is the broker returning the message.
+    Retry ladder for a consumer.
 
-    aio-pika sends `mandatory` but reports the outcome in the RETURN VALUE, not
-    by raising: a routed publish resolves to a ``Basic.Ack`` frame, an
-    unroutable one to a ``DeliveredMessage`` wrapping ``Basic.Return``. Nothing
-    in this library ever looked, so every publish to a routing key with no
-    binding behind it was dropped in silence — which is what makes a service
-    with no consumers look like a timeout rather than an error.
-
-    Detected structurally rather than by importing aiormq/pamqp frame classes,
-    so a client upgrade cannot quietly turn this back into a silent drop.
+    ``retry_exchange_name`` is the topic exchange the retry queue is bound to
+    with ``#``. Publishing there (rather than straight to the queue) keeps the
+    message's routing key set to the original ``REQUEST.<service>.<method>``,
+    which is what makes the post-TTL DLX redelivery route back to the main
+    queue. Without it the first hop works and the redelivery silently drops.
     """
-    if result is None:
-        return False
-    delivery = getattr(result, "delivery", None)
-    candidate = delivery if delivery is not None else result
-    return type(candidate).__name__ == "Return"
+
+    max_retries: int
+    retry_queue_name: str
+    dlq_name: str
+    retry_exchange_name: Optional[str] = None
+    is_handled_error: Optional[Callable[[Any], bool]] = None
 
 
-async def publish_confirmed(
-    exchange: AbstractExchange,
-    message: Message,
-    routing_key: str,
-    mandatory: bool = True,
-) -> None:
-    """
-    Publish and raise if the broker could not route the message.
-
-    Requests are mandatory: a request nothing is bound to fails at once instead
-    of waiting out the caller's RPC timeout. Events are not — having no
-    subscribers is normal for an event. Parity with TS protobus 1e829ad.
-    """
-    result = await exchange.publish(message, routing_key=routing_key, mandatory=mandatory)
-    if mandatory and _is_unroutable(result):
-        raise UnroutableError(
-            f"No queue is bound for routing key {routing_key!r} on exchange "
-            f"{getattr(exchange, 'name', '?')!r}; the broker returned the message"
-        )
+@dataclass
+class ReconnectionOptions:
+    max_retries: int = 10  # 0 = infinite
+    initial_delay_ms: int = 1000
+    max_delay_ms: int = 30000
+    backoff_multiplier: float = 2.0
 
 
-def _redact_url(url: str) -> str:
-    """Hide the password in an AMQP URL before it reaches a log."""
-    try:
-        scheme, _, rest = url.partition("://")
-        if not rest or "@" not in rest:
-            return url
-        creds, _, host = rest.rpartition("@")
-        user, sep, _password = creds.partition(":")
-        return f"{scheme}://{user}{':***' if sep else ''}@{host}"
-    except Exception:  # pragma: no cover - never let logging break a connect
-        return "<amqp url>"
+DEFAULT_RECONNECTION_OPTIONS = ReconnectionOptions()
+
+Restorer = Callable[[int], Awaitable[None]]
+"""Restores one component's topology after the socket comes back. Receives
+the generation it is restoring, so a long restore can tell it was superseded."""
+
+#: Attribute a MessageService sets on an unhandled exception: the encoded
+#: error reply the connection layer publishes on terminal settlement paths.
+RESPONSE_BUFFER_ATTR = "protobus_response_buffer"
 
 
-def _with_heartbeat(url: str) -> str:
-    """
-    Ensure the connection negotiates a heartbeat rather than accepting the
-    broker's proposal.
-
-    Nothing set one, so the interval was whatever RabbitMQ proposed — 60
-    seconds — and a peer that vanishes without closing its socket is only
-    noticed after two missed intervals, around two minutes. For all of that
-    time the connection reports itself healthy and publishes go into a dead
-    socket with no reconnection scheduled. Parity with TS protobus 2fee268.
-
-    A heartbeat already in the URL is the caller being explicit and is left
-    alone, ``heartbeat=0`` included — that is how they are turned off. The rest
-    of the URL is preserved byte for byte: the vhost is routinely
-    percent-encoded and re-encoding it would connect to the wrong one.
-    """
-    seconds = Config.amqp_heartbeat_seconds()
-    if seconds <= 0:
-        return url
-
-    base, sep, query = url.partition("?")
-    if sep and any(
-        param.split("=", 1)[0].strip() == "heartbeat" for param in query.split("&")
-    ):
-        return url
-
-    joiner = "&" if sep and query else "?"
-    return f"{base}{sep if sep and query else ''}{query}{joiner}heartbeat={seconds}"
-
-
+@runtime_checkable
 class IConnection(Protocol):
-    """Interface for connection implementations."""
+    """
+    What listeners and dispatchers need from a connection. Structural, so a
+    test double satisfies it by shape. ``register_restorer``, ``when_ready``,
+    ``is_ready`` and ``cancel_stream`` are optional — a double without them
+    gets the uncoordinated fallbacks.
+    """
 
     @property
-    def is_connected(self) -> bool:
-        ...
+    def is_connected(self) -> bool: ...
 
     @property
-    def is_reconnecting(self) -> bool:
-        ...
+    def is_reconnecting(self) -> bool: ...
 
-    async def connect(self, url: str) -> None:
-        ...
+    def on(self, event: str, callback: Callable[..., Any]) -> None: ...
 
-    async def close(self) -> None:
-        ...
+    def off(self, event: str, callback: Callable[..., Any]) -> None: ...
 
-    async def open_channel(self) -> AbstractChannel:
-        ...
+    async def open_channel(self) -> Any: ...
 
-    async def ensure_exchange(
-        self,
-        channel: AbstractChannel,
-        name: str,
-        exchange_type: ExchangeType,
-    ) -> AbstractExchange:
-        ...
+    async def close_channel(self, channel: Any) -> Any: ...
 
-    async def ensure_queue(
-        self,
-        channel: AbstractChannel,
-        name: str,
-        arguments: Optional[Dict[str, Any]] = None,
-    ) -> AbstractQueue:
-        ...
+    async def declare_exchange(self, channel: Any, exchange: str, exchange_type: str, options: Dict[str, Any]) -> Any: ...
 
-    async def bind_queue(
-        self,
-        queue: AbstractQueue,
-        exchange: AbstractExchange,
-        routing_key: str,
-    ) -> None:
-        ...
+    async def declare_queue(self, channel: Any, queue_name: str, options: Dict[str, Any]) -> str: ...
+
+    async def bind_queue(self, channel: Any, queue: str, exchange: str, routing_key: str, args: Any) -> Any: ...
 
     async def consume(
         self,
-        channel: AbstractChannel,
-        queue: AbstractQueue,
-        handler: MessageHandler,
-        late_ack: bool = False,
-        max_concurrent: Optional[int] = None,
-        retry_options: Optional[RetryOptions] = None,
-    ) -> str:
-        ...
+        channel: Any,
+        queue_name: str,
+        message_handler: MessageHandler,
+        options: ConsumeOptions,
+        late_ack: bool,
+        retry_options: Optional[ConsumeRetryOptions] = None,
+        processing_timeout_ms: Optional[int] = None,
+    ) -> Any: ...
 
-    async def publish(
-        self,
-        channel: AbstractChannel,
-        exchange: AbstractExchange,
-        routing_key: str,
-        body: bytes,
-        properties: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        ...
+    async def cancel(self, channel: Any, consumer_tag: str) -> Any: ...
 
-    def on(self, event: str, callback: Callable[..., Any]) -> None:
-        ...
-
-    def off(self, event: str, callback: Callable[..., Any]) -> None:
-        ...
+    async def publish(self, channel: Any, exchange_name: str, routing_key: str, content: bytes, properties: Dict[str, Any]) -> Any: ...
 
 
-# A release runs on the recovery path, so it must be bounded: a cancel or close
-# that never resolves would mean the component never consumes again.
-RELEASE_TIMEOUT_S = 5.0
-
-
-async def release_amqp_resources(
-    channel: Optional[AbstractChannel] = None,
-    queue: Optional[AbstractQueue] = None,
-    consumer_tag: Optional[str] = None,
-) -> None:
+def attach_restorer(connection: Any, restore: Callable[..., Awaitable[None]], describe: str) -> Callable[[], None]:
     """
-    Best-effort, time-bounded release of AMQP objects. Never raises.
+    Wire a component's restoration to a connection, returning a detach function.
 
-    Used by every component that re-creates its channel on reconnection.
-    Failures are expected and uninteresting: the usual reason to release a
-    channel is that the connection carrying it has already gone away.
+    Prefers the coordinated path, where the connection holds back its
+    'reconnected' announcement until the restore has finished and treats a
+    failure as a failed reconnection attempt. Falls back to restoring on the
+    event for a connection that predates ``register_restorer`` — uncoordinated,
+    so a failure there can only be logged.
     """
-    if consumer_tag and queue is not None:
+    register = getattr(connection, "register_restorer", None)
+    if callable(register):
+        return register(restore)
+
+    async def on_reconnected(*_args: Any) -> None:
         try:
-            await asyncio.wait_for(queue.cancel(consumer_tag), RELEASE_TIMEOUT_S)
-        except Exception as e:
-            Logger.debug(f"Could not cancel consumer {consumer_tag}: {e}")
+            await _call_restorer(restore, 0)
+        except Exception as err:
+            Logger.error(f"{describe}: failed to re-initialize after reconnection: {err}")
 
-    if channel is not None:
-        try:
-            await asyncio.wait_for(channel.close(), RELEASE_TIMEOUT_S)
-        except Exception as e:
-            Logger.debug(f"Could not close channel: {e}")
+    connection.on("reconnected", on_reconnected)
 
+    def detach() -> None:
+        connection.off("reconnected", on_reconnected)
 
-# Fire-and-forget cleanup tasks are kept referenced here: asyncio only holds a
-# weak reference to a running task, so a task nobody references can be garbage
-# collected mid-await and silently abandon the cleanup.
-_pending_releases: "set[asyncio.Task[None]]" = set()
+    return detach
 
 
-def _spawn_release(coro: Any) -> None:
-    """Run a cleanup coroutine on the running loop, if there is one."""
+async def _call_restorer(restore: Callable[..., Awaitable[None]], generation: int) -> None:
+    """Call a restorer with the generation if it accepts one argument."""
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        coro.close()
-        return
-    task = loop.create_task(coro)
-    _pending_releases.add(task)
-    task.add_done_callback(_pending_releases.discard)
-
-
-async def _close_quietly(connection: Any) -> None:
-    """Close a connection we are done with, tolerating any failure."""
-    try:
-        await connection.close()
-    except Exception as e:
-        Logger.debug(f"Could not close connection: {e}")
-
-
-def detach_listener(
-    connection: Any, event: str, callback: Callable[..., Any]
-) -> None:
-    """
-    Unregister a handler, tolerating a connection that predates off().
-
-    off() is new in 1.4.1 and IConnection is a structural Protocol, so an
-    external implementation written against 1.4.0 will not have it. Failing to
-    detach leaks a handler; raising would break close() outright, which is
-    worse.
-    """
-    off = getattr(connection, "off", None)
-    if not callable(off):
-        Logger.debug(
-            f"Connection {type(connection).__name__} has no off(); "
-            f"cannot detach '{event}' handler"
+        params = inspect.signature(restore).parameters
+        accepts = any(
+            p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+            for p in params.values()
         )
-        return
+    except (TypeError, ValueError):
+        accepts = False
+    result = restore(generation) if accepts else restore()
+    if inspect.isawaitable(result):
+        await result
+
+
+def apply_heartbeat(url: str) -> str:
+    """
+    Put the configured heartbeat on a broker URL.
+
+    A heartbeat already in the URL is the caller being explicit and is left
+    alone, ``heartbeat=0`` included — that is how they are disabled.
+    Everything else about the URL is preserved byte for byte: the vhost is
+    routinely percent-encoded (``/%2f``) and re-encoding it would connect to
+    the wrong one.
+    """
+    if not isinstance(url, str) or "://" not in url:
+        return url
+    base, sep, query = url.partition("?")
+    if sep and any(param.split("=", 1)[0].strip() == "heartbeat" for param in query.split("&") if param):
+        return url
+    seconds = Config.heartbeat_seconds()
+    if sep and query:
+        return f"{base}?{query}&heartbeat={seconds}"
+    return f"{base}?heartbeat={seconds}"
+
+
+# ---------------------------------------------------------------------------
+# AMQP property handling
+# ---------------------------------------------------------------------------
+
+# AMQP properties a republish copies from the original delivery. Anything
+# not named here is dropped by the retry and DLQ hops, which build their
+# properties by hand. `delivery_mode` is re-expressed as persistent at every
+# site; `expiration` would race the retry queue's TTL or delete DLQ evidence;
+# `user_id` is validated by the broker against the *publishing* connection,
+# which need not be the original publisher's.
+CARRIED_PROPERTIES = ("content_type", "content_encoding", "priority", "timestamp", "message_type", "app_id")
+
+# Names a caller may use in a properties dict, mapped onto pamqp's.
+_PROPERTY_ALIASES = {
+    "contentType": "content_type",
+    "contentEncoding": "content_encoding",
+    "correlationId": "correlation_id",
+    "replyTo": "reply_to",
+    "messageId": "message_id",
+    "deliveryMode": "delivery_mode",
+    "appId": "app_id",
+    "userId": "user_id",
+    "type": "message_type",
+    "clusterId": "cluster_id",
+}
+
+_PROPERTY_FIELDS = (
+    "content_type", "content_encoding", "headers", "delivery_mode", "priority", "correlation_id",
+    "reply_to", "expiration", "message_id", "timestamp", "message_type", "user_id", "app_id", "cluster_id",
+)
+
+
+def carried_properties(properties: Basic.Properties) -> Dict[str, Any]:
+    """The subset of a delivery's properties a republish carries. Absent stays absent."""
+    carried: Dict[str, Any] = {}
+    for key in CARRIED_PROPERTIES:
+        value = getattr(properties, key, None)
+        if value is not None:
+            carried[key] = value
+    return carried
+
+
+def build_properties(properties: Optional[Dict[str, Any]]) -> Basic.Properties:
+    """Turn a properties dict into pamqp ``Basic.Properties``."""
+    props: Dict[str, Any] = {}
+    for key, value in (properties or {}).items():
+        key = _PROPERTY_ALIASES.get(key, key)
+        if key == "persistent":
+            if value:
+                props["delivery_mode"] = 2
+            continue
+        if key == "mandatory":
+            continue
+        if key not in _PROPERTY_FIELDS or value is None:
+            continue
+        props[key] = value
+    if "expiration" in props and not isinstance(props["expiration"], str):
+        # AMQP carries expiration as a string of milliseconds.
+        props["expiration"] = str(int(props["expiration"]))
+    if props.get("headers") is not None:
+        props["headers"] = sanitize_headers(props["headers"])
+    return Basic.Properties(**props)
+
+
+def sanitize_headers(headers: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce header values into what the AMQP field table can carry."""
+    clean: Dict[str, Any] = {}
+    for key, value in headers.items():
+        if value is None:
+            continue
+        if isinstance(value, (bool, int, float, str, bytes, list, dict)):
+            clean[str(key)] = value
+        else:
+            clean[str(key)] = str(value)
+    return clean
+
+
+def header_int(headers: Dict[str, Any], name: str, default: int = 0) -> int:
+    value = headers.get(name)
+    if value is None or isinstance(value, bool):
+        return default
     try:
-        off(event, callback)
-    except Exception as e:
-        Logger.debug(f"Could not detach '{event}' handler: {e}")
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", errors="ignore")
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
-def schedule_amqp_release(
-    channel: Optional[AbstractChannel] = None,
-    queue: Optional[AbstractQueue] = None,
-    consumer_tag: Optional[str] = None,
-) -> None:
+def header_str(headers: Dict[str, Any], name: str) -> Optional[str]:
+    value = headers.get(name)
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _handler_arity(handler: Callable[..., Any]) -> int:
+    """How many positional arguments a handler accepts; 4 for *args."""
+    try:
+        params = list(inspect.signature(handler).parameters.values())
+    except (TypeError, ValueError):
+        return 4
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params):
+        return 4
+    return len([p for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)])
+
+
+def _is_async_iterable(value: Any) -> bool:
+    return value is not None and not isinstance(value, (bytes, bytearray)) and hasattr(value, "__aiter__")
+
+
+# ---------------------------------------------------------------------------
+# Per-channel publish bookkeeping
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ChannelPublishState:
+    in_flight: int = 0
+    waiters: List["asyncio.Future[None]"] = field(default_factory=list)
+    # Futures of publishes awaiting a confirm, failed when the channel closes.
+    pending: Set["asyncio.Future[Any]"] = field(default_factory=set)
+
+
+@dataclass(eq=False)
+class _Delivery:
+    """This attempt's cancellation state, so cancel_stream() can reach it."""
+
+    controller: AbortController
+    cancelled: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Connection
+# ---------------------------------------------------------------------------
+
+
+class Connection(EventEmitter):
     """
-    Fire-and-forget ``release_amqp_resources``.
+    RabbitMQ connection with generation-numbered reconnection.
 
-    The 'disconnected' event is delivered synchronously, so state has to be
-    cleared without awaiting; the cleanup itself is scheduled on the running
-    loop. Without a running loop there is nothing to schedule and nothing to
-    leak.
-    """
-    if channel is None and consumer_tag is None:
-        return
-    _spawn_release(release_amqp_resources(channel, queue, consumer_tag))
-
-
-class Connection:
-    """
-    RabbitMQ connection manager with automatic reconnection and message handling.
-
-    Emits events:
-    - 'reconnecting': (attempt: int, max_attempts: int) - reconnection in progress
-    - 'reconnected': () - successfully reconnected
-    - 'disconnected': () - connection lost
-    - 'error': (error: Exception) - connection error
+    Events: 'reconnecting' ({attempt, delay}), 'reconnected', 'disconnected',
+    'error' (exception).
     """
 
-    def __init__(self, options: Optional[ConnectionOptions] = None):
-        self._options = options or ConnectionOptions()
-        self._connection: Optional[AbstractConnection] = None
-        self._url: Optional[str] = None
+    def __init__(self, options: Optional[ReconnectionOptions] = None) -> None:
+        super().__init__()
+        self._handle: Optional[aiormq.abc.AbstractConnection] = None
+        self._url: str = ""
+        self._reconnection_options: ReconnectionOptions = options or DEFAULT_RECONNECTION_OPTIONS
+        self._reconnect_attempts = 0
+        self._reconnect_timer: Optional[asyncio.TimerHandle] = None
+        self._reconnect_task: Optional["asyncio.Task[None]"] = None
+        self._manual_disconnect = False
+        # In-flight connect shared by concurrent callers; see _connect().
+        self._connect_task: Optional["asyncio.Task[Any]"] = None
+        # Bumped by every teardown. A connect completing with a stale
+        # generation is obsolete and closes itself rather than installing.
+        self._generation = 0
+
         self._is_connected = False
         self._is_reconnecting = False
-        self._is_closing = False
-        self._event_handlers: Dict[str, List[Callable[..., Any]]] = {}
-        # Handler tasks are referenced for the same reason cleanup tasks are:
-        # asyncio holds only a weak reference to a running task, and the whole
-        # reconnection fix depends on these running to completion.
-        self._pending_emissions: "set[asyncio.Task[Any]]" = set()
-        self._consumer_tags: Dict[str, asyncio.Task] = {}
-        self._reconnect_task: Optional[asyncio.Task] = None
+
+        self._restorers: List[Callable[..., Awaitable[None]]] = []
+        self._is_ready = False
+        self._ready_waiters: List["asyncio.Future[None]"] = []
+
+        self._active_deliveries: Dict[str, Set[_Delivery]] = {}
+        self._in_flight_deliveries = 0
+        self._running_handlers = 0
+        self._drain_waiters: List["asyncio.Future[None]"] = []
+        self._handler_tasks: Set["asyncio.Task[Any]"] = set()
+
+        self._publish_state: "weakref.WeakKeyDictionary[Any, _ChannelPublishState]" = weakref.WeakKeyDictionary()
+        self._publish_state_fallback: Dict[int, _ChannelPublishState] = {}
+        self._closing_callback: Optional[Callable[[Any], None]] = None
+
+    # -- state ----------------------------------------------------------------
 
     @property
     def is_connected(self) -> bool:
-        """Check if connected to RabbitMQ."""
         return self._is_connected
 
     @property
     def is_reconnecting(self) -> bool:
-        """Check if currently reconnecting."""
         return self._is_reconnecting
 
-    def on(self, event: str, callback: Callable[..., Any]) -> None:
-        """Register an event handler."""
-        if event not in self._event_handlers:
-            self._event_handlers[event] = []
-        self._event_handlers[event].append(callback)
+    @property
+    def is_ready(self) -> bool:
+        """True when the socket is up AND every restorer has finished."""
+        return self._is_ready
 
-    def off(self, event: str, callback: Callable[..., Any]) -> None:
+    @property
+    def handle(self) -> Optional[aiormq.abc.AbstractConnection]:
+        """The underlying aiormq connection, for tests and diagnostics."""
+        return self._handle
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    # -- restorers & readiness ------------------------------------------------
+
+    def register_restorer(self, restore: Callable[..., Awaitable[None]]) -> Callable[[], None]:
         """
-        Unregister a previously registered event handler.
+        Register topology to restore on reconnection.
 
-        Without this, every listener and dispatcher ever attached to the
-        connection stayed subscribed to 'reconnected'/'disconnected' for the
-        lifetime of the process and kept re-opening AMQP resources long after
-        it had been discarded. Unknown handlers are ignored.
+        Restorers run in registration order and the connection reports itself
+        reconnected only once they have all resolved. One that raises makes
+        the whole generation unusable, which is treated as a failed
+        reconnection attempt.
+
+        Returns a function that unregisters the restorer again.
         """
-        handlers = self._event_handlers.get(event)
-        if not handlers:
-            return
-        try:
-            handlers.remove(callback)
-        except ValueError:
-            return
-        if not handlers:
-            del self._event_handlers[event]
+        self._restorers.append(restore)
 
-    # TS parity: `protobus` (Node) exposes this as removeListener().
-    remove_listener = off
-
-    def _emit(self, event: str, *args: Any) -> None:
-        """Emit an event to all registered handlers."""
-        # Copy: a handler is allowed to unsubscribe itself (or another) during
-        # emission now that off() exists, which would shift the live list.
-        handlers = list(self._event_handlers.get(event, []))
-        for handler in handlers:
+        def detach() -> None:
             try:
-                result = handler(*args)
-                if asyncio.iscoroutine(result):
-                    task = asyncio.create_task(result)
-                    self._pending_emissions.add(task)
-                    task.add_done_callback(self._pending_emissions.discard)
-            except Exception as e:
-                Logger.error(f"Error in event handler for {event}: {e}")
+                self._restorers.remove(restore)
+            except ValueError:
+                pass
 
-    async def connect(self, url: str) -> None:
+        return detach
+
+    async def when_ready(self, timeout_ms: Optional[int] = None) -> None:
         """
-        Connect to RabbitMQ.
+        Wait until the connection is carrying traffic again.
 
-        Args:
-            url: AMQP connection URL
-
-        Raises:
-            AlreadyConnectedError: If already connected
+        Resolves at once when already ready. Raises NotReadyError if the
+        connection is closed or abandons reconnection while waiting, or if
+        the wait exceeds ``timeout_ms``.
         """
-        if self._is_connected:
-            raise AlreadyConnectedError("Already connected to RabbitMQ")
+        if self._is_ready:
+            return
+        if self._manual_disconnect:
+            raise NotReadyError("the connection has been closed")
+        limit = Config.connection_ready_timeout_ms() if timeout_ms is None else timeout_ms
 
-        self._url = _with_heartbeat(url)
-        Logger.info(f"Connecting to bus: {_redact_url(self._url)}")
-
+        waiter: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self._ready_waiters.append(waiter)
         try:
-            self._connection = await aio_pika.connect_robust(
-                self._url,
-                reconnect_interval=self._options.initial_reconnect_delay_ms / 1000,
-            )
-            self._is_connected = True
+            await asyncio.wait_for(asyncio.shield(waiter), limit / 1000)
+        except asyncio.TimeoutError:
+            raise NotReadyError(f"the connection did not become ready within {limit}ms") from None
+        finally:
+            try:
+                self._ready_waiters.remove(waiter)
+            except ValueError:
+                pass
+            if not waiter.done():
+                waiter.cancel()
 
-            # Set up connection close callback
-            self._connection.close_callbacks.add(self._on_connection_closed)
+    def _mark_ready(self) -> None:
+        self._is_ready = True
+        waiting, self._ready_waiters = self._ready_waiters, []
+        for w in waiting:
+            if not w.done():
+                w.set_result(None)
 
-            Logger.info("Connected to RabbitMQ")
-        except Exception as e:
-            Logger.error(f"Failed to connect: {e}")
+    def _mark_not_ready(self) -> None:
+        # Waiters stay parked: a reconnection is what they are waiting through.
+        self._is_ready = False
+
+    def _abandon_ready(self, err: Exception) -> None:
+        self._is_ready = False
+        waiting, self._ready_waiters = self._ready_waiters, []
+        for w in waiting:
+            if not w.done():
+                w.set_exception(err)
+
+    async def _run_restorers(self, generation: int) -> None:
+        """Put every component's topology back, in registration order. Sequential:
+        one component's restore declares the exchange another binds to."""
+        for restore in list(self._restorers):
+            if generation != self._generation:
+                raise ReconnectionError("connection was torn down while restoring")
+            await _call_restorer(restore, generation)
+        if generation != self._generation:
+            raise ReconnectionError("connection was torn down while restoring")
+
+    async def _discard_generation(self) -> None:
+        """Discard a generation that connected but could not be restored."""
+        self._generation += 1
+        self._mark_not_ready()
+        self._is_connected = False
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        self._detach_close_callback(handle)
+        try:
+            await handle.close()
+        except Exception as err:
+            Logger.debug(f"failed closing an unrestorable connection: {err}")
+
+    # -- stream cancellation --------------------------------------------------
+
+    def cancel_stream(self, correlation_id: str) -> bool:
+        """
+        Stop producing a streaming reply the caller has abandoned.
+
+        Aborts the handler's signal and stops publishing anything the
+        generator yields from here on. Cooperative: a generator that ignores
+        its signal keeps running, but its output is no longer sent anywhere.
+        Returns True if a matching in-flight delivery was found.
+        """
+        entries = self._active_deliveries.get(correlation_id)
+        if not entries:
+            return False
+        # The same message can legitimately be in flight more than once — a
+        # redelivery overlapping its predecessor — and all of them stop.
+        for entry in list(entries):
+            entry.cancelled = True
+            entry.controller.abort("cancelled by the caller")
+        Logger.debug(f"stream {correlation_id} cancelled by the caller")
+        return True
+
+    # -- in-flight accounting -------------------------------------------------
+
+    @property
+    def in_flight_deliveries(self) -> int:
+        """How many messages are currently being handled."""
+        return max(self._in_flight_deliveries, self._running_handlers)
+
+    async def drain_in_flight(self, timeout_ms: int) -> bool:
+        """
+        Wait for in-flight handlers to finish, up to ``timeout_ms``. Returns
+        True if everything drained, False if the deadline passed with work
+        still running — information for the caller, not an error.
+        """
+        if self.in_flight_deliveries == 0:
+            return True
+        waiter: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self._drain_waiters.append(waiter)
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), timeout_ms / 1000)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            try:
+                self._drain_waiters.remove(waiter)
+            except ValueError:
+                pass
+
+    def _delivery_started(self) -> None:
+        self._in_flight_deliveries += 1
+
+    def _delivery_finished(self) -> None:
+        self._in_flight_deliveries = max(0, self._in_flight_deliveries - 1)
+        self._maybe_drained()
+
+    def _handler_started(self) -> None:
+        self._running_handlers += 1
+
+    def _handler_finished(self) -> None:
+        self._running_handlers = max(0, self._running_handlers - 1)
+        self._maybe_drained()
+
+    def _maybe_drained(self) -> None:
+        if self.in_flight_deliveries > 0:
+            return
+        waiters, self._drain_waiters = self._drain_waiters, []
+        for w in waiters:
+            if not w.done():
+                w.set_result(None)
+
+    # -- connect / disconnect -------------------------------------------------
+
+    async def connect(self, url: str, reconnection_options: Optional[ReconnectionOptions] = None) -> Any:
+        if self.is_connected:
+            raise AlreadyConnectedError("already connected")
+        self._url = url
+        if reconnection_options is not None:
+            self._reconnection_options = reconnection_options
+        self._manual_disconnect = False
+
+        handle = await self._connect()
+        # Nothing to restore on a first connect — components initialise
+        # themselves against it — so the socket coming up is readiness.
+        self._is_reconnecting = False
+        self._mark_ready()
+        return handle
+
+    async def _connect(self) -> Any:
+        """Single-flight connect: concurrent callers share one attempt."""
+        if self._connect_task is not None and not self._connect_task.done():
+            return await asyncio.shield(self._connect_task)
+        self._connect_task = asyncio.get_running_loop().create_task(self._do_connect())
+        try:
+            return await asyncio.shield(self._connect_task)
+        finally:
+            if self._connect_task is not None and self._connect_task.done():
+                self._connect_task = None
+
+    async def _do_connect(self) -> Any:
+        Logger.info(f"connecting to bus - {redact_url(self._url)}")
+        generation = self._generation
+        try:
+            handle = await aiormq.connect(apply_heartbeat(self._url))
+        except Exception as err:
+            Logger.error(f"failed to connect: {err}")
+            self._is_connected = False
             raise
 
-    def _on_connection_closed(
-        self, connection: AbstractConnection, exception: Optional[BaseException]
-    ) -> None:
-        """Handle connection closed event."""
-        if self._is_closing:
+        if generation != self._generation or self._manual_disconnect:
+            # Torn down while this attempt was in flight. Clearing the
+            # reconnect timer cannot stop an attempt that has already fired.
+            Logger.info("discarding a connection that completed after disconnect")
+            try:
+                await handle.close()
+            except Exception as err:
+                Logger.debug(f"failed closing a superseded connection: {err}")
+            raise ReconnectionError("connection was torn down while connecting")
+
+        self._handle = handle
+        self._is_connected = True
+        self._reconnect_attempts = 0
+        # _is_reconnecting is deliberately NOT cleared here: on the reconnect
+        # path a socket is only half the job, restoration still has to run.
+        # Whoever set the flag clears it — connect(), or the reconnect task.
+        self._attach_close_callback(handle)
+        Logger.info("connected to message bus")
+        return handle
+
+    def _attach_close_callback(self, handle: Any) -> None:
+        def on_closed(future: "asyncio.Future[Any]") -> None:
+            self._on_handle_closed(handle, future)
+
+        setattr(handle, "_protobus_on_closed", on_closed)
+        handle.closing.add_done_callback(on_closed)
+
+    def _detach_close_callback(self, handle: Any) -> None:
+        cb = getattr(handle, "_protobus_on_closed", None)
+        if cb is not None:
+            try:
+                handle.closing.remove_done_callback(cb)
+            except Exception:
+                pass
+
+    def _on_handle_closed(self, handle: Any, future: "asyncio.Future[Any]") -> None:
+        if handle is not self._handle:
             return
-
-        # Only the connection we are currently using drives our state. A
-        # superseded connection must never be able to reset it or start
-        # another reconnect loop.
-        if connection is not self._connection:
-            Logger.debug("Ignoring close callback from a superseded connection")
+        if self._manual_disconnect:
+            Logger.info("connection closed (manual disconnect)")
             return
-
-        self._is_connected = False
-        Logger.warn("Connection to RabbitMQ lost")
-        self._emit("disconnected")
-
-        if self._is_closing or self._is_reconnecting:
-            return
-        if self._reconnect_task and not self._reconnect_task.done():
-            # A reconnect loop is already running; a second one would open a
-            # second connection and leak the first.
-            return
-        self._reconnect_task = asyncio.create_task(self._reconnect())
-
-    def _release_connection(self, connection: Optional[AbstractConnection]) -> None:
-        """
-        Detach from a connection we are done with and close it.
-
-        Detaching happens synchronously — that is what stops a superseded
-        connection from resurrecting itself (aio-pika's robust connections
-        re-establish on their own, bringing their channels and consumers back
-        with them) and from driving another reconnect. The close itself is
-        fire-and-forget so a hung close cannot stall reconnection.
-        """
-        if connection is None:
-            return
-
+        exc: Any = None
         try:
-            connection.close_callbacks.remove(self._on_connection_closed)
-        except Exception as e:
-            Logger.debug(f"Could not detach close callback: {e}")
+            exc = future.exception() if not future.cancelled() else None
+        except Exception:
+            exc = None
+        if exc is not None:
+            Logger.error(f"connection error: {exc}")
+            self.emit("error", exc)
+        Logger.warn("connection closed unexpectedly")
+        self._is_connected = False
+        self._mark_not_ready()
+        # Retire this generation: a restoration in flight against it is now
+        # working on a dead socket and its next generation check aborts it.
+        self._generation += 1
+        self.emit("disconnected")
+        self._schedule_reconnect()
 
-        _spawn_release(_close_quietly(connection))
-
-    async def _reconnect(self) -> None:
-        """Attempt to reconnect with exponential backoff."""
-        if not self._url or self._is_closing:
+    def _schedule_reconnect(self) -> None:
+        if self._manual_disconnect or self._is_reconnecting:
             return
-        if self._is_reconnecting:
+        opts = self._reconnection_options
+        if opts.max_retries > 0 and self._reconnect_attempts >= opts.max_retries:
+            error = ReconnectionError(f"max reconnection attempts ({opts.max_retries}) exceeded")
+            Logger.error(str(error))
+            self._abandon_ready(NotReadyError(str(error)))
+            self.emit("error", error)
             return
 
         self._is_reconnecting = True
-        delay = self._options.initial_reconnect_delay_ms
+        self._reconnect_attempts += 1
 
-        # Let go of the dead connection before opening its replacement.
-        self._release_connection(self._connection)
-        self._connection = None
+        base_delay = min(opts.initial_delay_ms * (opts.backoff_multiplier ** (self._reconnect_attempts - 1)), opts.max_delay_ms)
+        delay = int(base_delay + random.random() * 0.3 * base_delay)
+        Logger.info(f"scheduling reconnection attempt {self._reconnect_attempts} in {delay}ms")
+        self.emit("reconnecting", {"attempt": self._reconnect_attempts, "delay": delay})
 
-        # max_reconnect_attempts is an ESCALATION threshold, not a give-up
-        # point. Closing the superseded connection removed aio-pika's
-        # accidental self-healing, so giving up here would leave the process
-        # permanently mute after any outage longer than the budget — which for
-        # the default options is under three minutes.
-        attempt = 0
-        escalated = False
+        loop = asyncio.get_running_loop()
+
+        def fire() -> None:
+            self._reconnect_timer = None
+            self._reconnect_task = loop.create_task(self._reconnect_attempt())
+
+        self._reconnect_timer = loop.call_later(delay / 1000, fire)
+
+    async def _reconnect_attempt(self) -> None:
+        # Read the counter before connecting: a successful connect resets it.
+        attempt = self._reconnect_attempts
         try:
-            while not self._is_closing:
-                attempt += 1
-                self._emit(
-                    "reconnecting", attempt, self._options.max_reconnect_attempts
-                )
-                Logger.info(
-                    f"Reconnection attempt {attempt}"
-                    f"/{self._options.max_reconnect_attempts}"
-                )
-
-                connection = None
-                try:
-                    connection = await aio_pika.connect_robust(self._url)
-                    # Attach before publishing the new state: a connection we
-                    # cannot observe closing is worse than no connection.
-                    connection.close_callbacks.add(self._on_connection_closed)
-                    self._connection = connection
-                    self._is_connected = True
-                    Logger.info("Reconnected to RabbitMQ")
-                    self._emit("reconnected")
-                    return
-                except Exception as e:
-                    Logger.warn(f"Reconnection attempt {attempt} failed: {e}")
-                    if connection is not None and connection is not self._connection:
-                        # Opened, then failed to wire up. Do not abandon it.
-                        _spawn_release(_close_quietly(connection))
-
-                if attempt >= self._options.max_reconnect_attempts and not escalated:
-                    escalated = True
-                    error = ReconnectionError(
-                        f"Failed to reconnect after {attempt} attempts; "
-                        f"still retrying"
-                    )
-                    Logger.error(str(error))
-                    self._emit("error", error)
-
-                # Add jitter to prevent thundering herd
-                jitter = random.uniform(
-                    -self._options.jitter_percent, self._options.jitter_percent
-                )
-                actual_delay = delay * (1 + jitter)
-                await asyncio.sleep(actual_delay / 1000)
-                delay = min(
-                    delay * self._options.reconnect_backoff_multiplier,
-                    self._options.max_reconnect_delay_ms,
-                )
-        finally:
+            await self._connect()
+            # Restoration is part of reconnecting, not something that happens
+            # afterwards: until every listener has its channel, queue and
+            # consumer back, the socket is up but the application cannot use it.
+            await self._run_restorers(self._generation)
             self._is_reconnecting = False
+            self._mark_ready()
+            Logger.info(f"reconnection successful after {attempt} attempts")
+            self.emit("reconnected")
+        except asyncio.CancelledError:
+            self._is_reconnecting = False
+            raise
+        except Exception as err:
+            if self._manual_disconnect:
+                self._is_reconnecting = False
+                return
+            Logger.error(f"reconnection attempt {attempt} failed: {err}")
+            # A generation that connected but could not be restored is worse
+            # than no connection: it looks healthy and serves nothing.
+            await self._discard_generation()
+            self._reconnect_attempts = attempt
+            self._is_reconnecting = False
+            self._schedule_reconnect()
 
-    async def close(self) -> None:
-        """Close the connection."""
-        self._is_closing = True
-
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
+    async def disconnect(self) -> None:
+        self._manual_disconnect = True
+        # Invalidate any connect already past its timer.
+        self._generation += 1
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.cancel()
+            self._reconnect_timer = None
+        task, self._reconnect_task = self._reconnect_task, None
+        if task is not None and not task.done():
+            task.cancel()
             try:
-                await self._reconnect_task
-            except asyncio.CancelledError:
+                await task
+            except (asyncio.CancelledError, Exception):
                 pass
-
-        if self._connection:
-            await self._connection.close()
-            self._connection = None
-
-        self._is_connected = False
         self._is_reconnecting = False
-        Logger.info("Connection closed")
+        self._abandon_ready(NotReadyError("the connection has been closed"))
 
-    async def open_channel(self) -> AbstractChannel:
-        """
-        Open a new channel.
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            self._detach_close_callback(handle)
+            try:
+                await handle.close()
+            except Exception as err:
+                Logger.debug(f"error closing connection: {err}")
+        self._is_connected = False
 
-        Returns:
-            A new AMQP channel
+    # 1.x name.
+    close = disconnect
 
-        Raises:
-            NotConnectedError: If not connected
-        """
-        if not self._connection or not self._is_connected:
-            raise NotConnectedError("Not connected to RabbitMQ")
+    # -- channels -------------------------------------------------------------
 
-        return await self._connection.channel()
+    async def open_channel(self) -> Channel:
+        """Open a CONFIRM channel. A plain channel gives the publisher no way
+        to learn whether RabbitMQ accepted a message."""
+        if self._handle is None:
+            raise NotReadyError("not connected")
+        return await self._handle.channel(publisher_confirms=True, on_return_raises=False)
 
-    async def ensure_exchange(
-        self,
-        channel: AbstractChannel,
-        name: str,
-        exchange_type: ExchangeType = ExchangeType.TOPIC,
-    ) -> AbstractExchange:
-        """
-        Ensure an exchange exists.
+    async def close_channel(self, channel: Channel) -> None:
+        await channel.close()
 
-        Args:
-            channel: The channel to use
-            name: Exchange name
-            exchange_type: Type of exchange
+    async def set_prefetch(self, channel: Channel, count: int) -> None:
+        await channel.basic_qos(prefetch_count=count)
 
-        Returns:
-            The exchange object
-        """
-        return await channel.declare_exchange(
-            name, exchange_type, durable=True, auto_delete=False
+    async def declare_exchange(self, channel: Channel, exchange: str, exchange_type: str, options: Optional[Dict[str, Any]] = None) -> Any:
+        options = options or {}
+        return await channel.exchange_declare(
+            exchange=exchange,
+            exchange_type=exchange_type,
+            durable=options.get("durable", True),
+            auto_delete=options.get("auto_delete", options.get("autoDelete", False)),
+            internal=options.get("internal", False),
+            arguments=options.get("arguments") or None,
         )
 
-    async def ensure_queue(
-        self,
-        channel: AbstractChannel,
-        name: str,
-        arguments: Optional[Dict[str, Any]] = None,
-    ) -> AbstractQueue:
-        """
-        Ensure a queue exists.
+    async def declare_queue(self, channel: Channel, queue_name: str, options: Optional[Dict[str, Any]] = None) -> str:
+        options = options or {}
+        result = await channel.queue_declare(
+            queue=queue_name or "",
+            durable=options.get("durable", False),
+            exclusive=options.get("exclusive", False),
+            auto_delete=options.get("auto_delete", options.get("autoDelete", False)),
+            arguments=options.get("arguments") or None,
+        )
+        return result.queue
 
-        Args:
-            channel: The channel to use
-            name: Queue name (empty string for exclusive anonymous queue)
-            arguments: Additional queue arguments
+    async def bind_queue(self, channel: Channel, queue: str, exchange: str, routing_key: str, args: Optional[Dict[str, Any]] = None) -> Any:
+        return await channel.queue_bind(queue=queue, exchange=exchange, routing_key=routing_key, arguments=args or None)
 
-        Returns:
-            The queue object
-        """
-        if name:
-            return await channel.declare_queue(
-                name, durable=True, auto_delete=False, arguments=arguments
-            )
-        else:
-            # Anonymous exclusive queue
-            return await channel.declare_queue(
-                "", exclusive=True, auto_delete=True, arguments=arguments
-            )
+    async def unbind_queue(self, channel: Channel, queue: str, exchange: str, routing_key: str, args: Optional[Dict[str, Any]] = None) -> Any:
+        return await channel.queue_unbind(queue=queue, exchange=exchange, routing_key=routing_key, arguments=args or None)
 
-    async def bind_queue(
-        self,
-        queue: AbstractQueue,
-        exchange: AbstractExchange,
-        routing_key: str,
-    ) -> None:
-        """
-        Bind a queue to an exchange.
+    async def delete_queue(self, channel: Channel, queue_name: str) -> Any:
+        return await channel.queue_delete(queue=queue_name)
 
-        Args:
-            queue: The queue to bind
-            exchange: The exchange to bind to
-            routing_key: Routing key pattern
-        """
-        await queue.bind(exchange, routing_key)
+    async def purge_queue(self, channel: Channel, queue_name: str) -> Any:
+        return await channel.queue_purge(queue=queue_name)
+
+    async def ack(self, channel: Channel, message: DeliveredMessage, up_to: bool = False) -> Any:
+        return await channel.basic_ack(message.delivery.delivery_tag, multiple=up_to)
+
+    async def reject(self, channel: Channel, message: DeliveredMessage, requeue: bool = False) -> Any:
+        return await channel.basic_reject(message.delivery.delivery_tag, requeue=requeue)
+
+    async def cancel(self, channel: Channel, consumer_tag: str) -> Any:
+        return await channel.basic_cancel(consumer_tag)
+
+    # -- consume ----------------------------------------------------------------
 
     async def consume(
         self,
-        channel: AbstractChannel,
-        queue: AbstractQueue,
-        handler: MessageHandler,
+        channel: Channel,
+        queue_name: str,
+        message_handler: MessageHandler,
+        options: Optional[ConsumeOptions] = None,
         late_ack: bool = False,
-        max_concurrent: Optional[int] = None,
-        retry_options: Optional[RetryOptions] = None,
+        retry_options: Optional[ConsumeRetryOptions] = None,
+        processing_timeout_ms: Optional[int] = None,
     ) -> str:
         """
-        Start consuming messages from a queue.
+        Start consuming ``queue_name`` on ``channel``.
 
-        Args:
-            channel: The channel to use
-            queue: The queue to consume from
-            handler: Message handler function
-            late_ack: Whether to use late acknowledgment
-            max_concurrent: Maximum concurrent messages (prefetch count)
-            retry_options: Options for message retry behavior
-
-        Returns:
-            Consumer tag
+        Every delivery runs the handler against the processing timeout, then
+        settles: publishes the reply (unary or streaming), then acks. On a
+        handler failure it climbs the retry ladder — park on the retry
+        exchange, dead-letter after the last hop, answer the caller with the
+        encoded error — or, for a handled error, answers and rejects without
+        requeue. Everything that can raise runs before the ack, so a failed
+        settlement leaves the message for redelivery rather than losing it.
         """
-        if max_concurrent:
-            await channel.set_qos(prefetch_count=max_concurrent)
+        options = options or ConsumeOptions()
+        arity = _handler_arity(message_handler)
+        connection = self
 
-        retry_opts = retry_options or DEFAULT_RETRY_OPTIONS
-        queue_name = queue.name
+        async def on_message(msg: DeliveredMessage) -> None:
+            properties = msg.header.properties
+            delivery = msg.delivery
+            reply_to = properties.reply_to
+            correlation_id = properties.correlation_id or ""
+            headers: Dict[str, Any] = dict(properties.headers or {})
+            retry_count = header_int(headers, "x-retry-count", 0)
+            routing_key = getattr(delivery, "routing_key", "") or ""
+            original_routing_key = header_str(headers, "x-original-routing-key") or routing_key
+            redelivered = bool(getattr(delivery, "redelivered", False))
 
-        # The routing key is what RabbitMQ's topic permissions are granted
-        # against, and dispatch has to be able to check the message body
-        # against it. Handlers written before this took three arguments, and
-        # BaseListener.init() accepts caller-supplied ones, so the extra
-        # argument is passed only to handlers that declare it.
-        wants_routing_key = _handler_accepts_routing_key(handler)
+            Logger.debug(
+                f"incoming message on {queue_name}: {routing_key} ({correlation_id})"
+                f"{f' (retry {retry_count})' if retry_count > 0 else ''}"
+            )
 
-        async def process_message(message: AbstractIncomingMessage) -> None:
+            if not options.no_ack and not late_ack:
+                # Early ackers never reject and immediately ack.
+                await connection.ack(channel, msg)
+
+            limit = processing_timeout_ms if processing_timeout_ms is not None else Config.message_processing_timeout()
+            controller = AbortController()
+            delivery_entry = _Delivery(controller=controller)
+            group = connection._active_deliveries.setdefault(correlation_id, set())
+            group.add(delivery_entry)
+
+            context = MessageHandlerContext(
+                signal=controller.signal,
+                routing_key=routing_key,
+                message_id=properties.message_id,
+                redelivered=redelivered,
+            )
+
+            handler_task: Optional["asyncio.Task[Any]"] = None
             try:
-                async with message.process(ignore_processed=True):
-                    correlation_id = message.correlation_id or ""
-                    incoming_headers = dict(message.headers or {})
+                # Tracked around the race rather than around the await, so a
+                # handler that outlives its own timeout is still counted as
+                # running until it actually returns.
+                connection._handler_started()
+                try:
+                    if arity >= 4:
+                        awaitable = message_handler(msg.body, correlation_id, headers, context)
+                    else:
+                        awaitable = message_handler(msg.body, correlation_id, headers)
+                    if not inspect.isawaitable(awaitable):
+                        # A non-async handler already returned its result.
+                        fut: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+                        fut.set_result(awaitable)
+                        awaitable = fut
+                    handler_task = asyncio.ensure_future(awaitable)
+                except BaseException:
+                    connection._handler_finished()
+                    raise
+                connection._handler_tasks.add(handler_task)
+                handler_task.add_done_callback(lambda t: (connection._handler_tasks.discard(t), connection._handler_finished()))
 
+                done, _pending = await asyncio.wait({handler_task}, timeout=limit / 1000)
+                if not done:
+                    controller.abort("processing timeout")
+                    # The handler is cancelled rather than merely abandoned: a
+                    # coroutine stops at its next await, which is the closest
+                    # Python gets to interrupting it. A handler that swallows
+                    # the cancellation runs on, still counted as running.
+                    handler_task.cancel()
+                    raise TimeoutError(f"message {correlation_id} exceeded the {limit}ms processing timeout")
+                result = handler_task.result()
+
+                # The reply is published before the request is settled, so the
+                # worst case is a redelivered request (at-least-once) rather
+                # than a settled request whose reply was never sent.
+                if reply_to:
+                    if _is_async_iterable(result):
+                        await connection._publish_stream_reply(
+                            channel, reply_to, correlation_id, result, lambda: delivery_entry.cancelled
+                        )
+                    elif isinstance(result, (bytes, bytearray)):
+                        await connection.publish(
+                            channel, Config.callbacks_exchange_name(), reply_to, bytes(result),
+                            {"content_type": "application/octet-stream", "correlation_id": correlation_id},
+                        )
+                elif _is_async_iterable(result):
+                    # Nothing to reply to; release whatever the generator holds.
+                    await _aclose(result)
+                if not options.no_ack and late_ack:
+                    await connection.ack(channel, msg)
+
+            except asyncio.CancelledError:
+                raise
+            except BaseException as err:
+                if delivery_entry.cancelled:
+                    # A cancelled delivery is a normal outcome: the caller
+                    # asked to stop. Settle it so it is neither retried nor
+                    # dead-lettered.
+                    Logger.debug(f"message {correlation_id} ended because its stream was cancelled")
+                    if not options.no_ack and late_ack:
+                        await connection.ack(channel, msg)
+                    return
+                Logger.error(f"unhandled error consuming bus message - {err!r}")
+
+                error_reply: Optional[bytes] = getattr(err, RESPONSE_BUFFER_ATTR, None)
+
+                async def publish_error_reply() -> None:
+                    # Best effort, deliberately: every terminal path answers
+                    # the caller and THEN settles. A reply publish that fails
+                    # must not take the settlement with it — the caller has a
+                    # timeout, while the DLQ is the only durable record.
+                    if not reply_to or error_reply is None:
+                        return
                     try:
-                        if wants_routing_key:
-                            result = await handler(
-                                message.body,
-                                correlation_id,
-                                incoming_headers,
-                                message.routing_key,
-                            )
-                        else:
-                            result = await handler(
-                                message.body, correlation_id, incoming_headers
-                            )
+                        await connection.publish(
+                            channel, Config.callbacks_exchange_name(), reply_to, error_reply,
+                            {"content_type": "application/octet-stream", "correlation_id": correlation_id},
+                        )
+                    except Exception as reply_err:
+                        Logger.error(
+                            f"failed to publish the error reply for {correlation_id} to {reply_to}: "
+                            f"{reply_err}. The caller will time out; settling the message anyway so it "
+                            "reaches the DLQ."
+                        )
 
-                        # Streaming reply: handler returned an async iterator.
-                        # Each yielded chunk is published to reply_to with the
-                        # standard streaming headers; the last gets x-protobus-final=true.
-                        if hasattr(result, "__aiter__") and not isinstance(
-                            result, (bytes, bytearray)
-                        ):
-                            await self._publish_stream_reply(
-                                channel, message, result
-                            )
-                        # Unary RPC reply
-                        elif message.reply_to and result is not None:
-                            await channel.default_exchange.publish(
-                                Message(
-                                    body=result,
-                                    correlation_id=message.correlation_id,
-                                ),
-                                routing_key=message.reply_to,
-                            )
+                carried = carried_properties(properties)
 
-                        if late_ack:
-                            await message.ack()
+                if not options.no_ack and late_ack:
+                    is_handled = bool(retry_options.is_handled_error(err)) if retry_options and retry_options.is_handled_error else False
 
-                    except Exception as e:
-                        import traceback
-                        Logger.error(f"Handler error: {type(e).__name__}: {e}")
-                        Logger.error(f"Traceback: {traceback.format_exc()}")
-
-                        if is_handled_error(e):
-                            # Don't retry handled errors
-                            Logger.debug(f"Handled error, not retrying: {e}")
-                            if late_ack:
-                                await message.ack()
-                            return
-
-                        # Check retry count
-                        headers = message.headers or {}
-                        try:
-                            retry_count = int(headers.get("x-retry-count", 0) or 0)
-                        except (TypeError, ValueError):
-                            retry_count = 0
-
-                        # The handoff must be confirmed BEFORE the delivery is
-                        # acked. Acking first — or acking regardless, as this
-                        # did — destroys the message when the handoff fails.
-                        try:
-                            if retry_count < retry_opts.max_retries:
-                                await self._retry_message(
-                                    channel,
-                                    message,
-                                    retry_count,
-                                    e,
-                                    retry_opts,
-                                    queue_name,
-                                )
+                    if retry_options and not is_handled and retry_options.max_retries > 0:
+                        if retry_count < retry_options.max_retries:
+                            # Park the message on the retry queue for delayed
+                            # redelivery. The caller stays parked: no reply here.
+                            new_retry_count = retry_count + 1
+                            Logger.warn(f"retrying message {correlation_id} (attempt {new_retry_count}/{retry_options.max_retries})")
+                            retry_headers = {
+                                **headers,
+                                "x-retry-count": new_retry_count,
+                                "x-original-routing-key": original_routing_key,
+                                "x-first-failure-time": headers.get("x-first-failure-time") or now_ms(),
+                                "x-last-error": safe_error_summary(err),
+                            }
+                            retry_props = {
+                                "persistent": True,
+                                "correlation_id": correlation_id,
+                                # Carried through so the retried copy is
+                                # recognisable as the same logical message.
+                                "message_id": properties.message_id,
+                                "reply_to": reply_to,
+                                "headers": retry_headers,
+                                **carried,
+                            }
+                            if retry_options.retry_exchange_name:
+                                await connection.publish(channel, retry_options.retry_exchange_name, original_routing_key, msg.body, retry_props)
                             else:
-                                await self._send_to_dlq(channel, message, e)
-                        except Exception as handoff_error:
-                            Logger.error(
-                                f"Retry/DLQ handoff failed for a message on "
-                                f"{queue_name}: {handoff_error}. Requeuing "
-                                f"rather than dropping it."
+                                # Legacy: works for the first hop; the DLX redelivery drops.
+                                await connection.publish_to_queue(channel, retry_options.retry_queue_name, msg.body, retry_props)
+                            await connection.ack(channel, msg)
+                        else:
+                            Logger.error(f"message {correlation_id} exceeded max retries ({retry_options.max_retries}), sending to DLQ")
+                            await publish_error_reply()
+                            dlq_headers = {
+                                **headers,
+                                "x-retry-count": retry_count,
+                                "x-original-routing-key": original_routing_key,
+                                "x-original-queue": queue_name,
+                                "x-first-failure-time": headers.get("x-first-failure-time") or now_ms(),
+                                "x-dlq-time": now_ms(),
+                                "x-last-error": safe_error_summary(err),
+                            }
+                            await connection.publish_to_queue(
+                                channel, retry_options.dlq_name, msg.body,
+                                {"persistent": True, "correlation_id": correlation_id, "message_id": properties.message_id, "headers": dlq_headers, **carried},
                             )
-                            if late_ack:
-                                await message.nack(requeue=True)
-                            return
+                            await connection.ack(channel, msg)
+                    else:
+                        if is_handled:
+                            Logger.warn(f"handled error for message {correlation_id}, not retrying: {err}")
+                        await publish_error_reply()
+                        Logger.warn(f"rejecting message {correlation_id}")
+                        await connection.reject(channel, msg, False)
+                else:
+                    # Early-ack (or no-ack) consumer: retry and DLQ are
+                    # impossible, but the caller must still be told.
+                    await publish_error_reply()
+            finally:
+                group = connection._active_deliveries.get(correlation_id)
+                if group is not None:
+                    group.discard(delivery_entry)
+                    if not group:
+                        connection._active_deliveries.pop(correlation_id, None)
 
-                        if late_ack:
-                            await message.ack()
+        async def consumer_callback(msg: DeliveredMessage) -> None:
+            # Counted for the whole settle so a graceful shutdown waits for the
+            # reply/retry/DLQ publish, not just the handler body. A failure to
+            # settle is swallowed: every path that can raise runs before the
+            # ack, so the message stays unacknowledged and is redelivered.
+            connection._delivery_started()
+            try:
+                await on_message(msg)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as err:
+                Logger.error(
+                    f"failed to settle message on {queue_name}: {err}. Leaving it unacknowledged for redelivery."
+                )
+            finally:
+                connection._delivery_finished()
 
-            except Exception as e:
-                Logger.error(f"Error processing message: {e}")
+        result = await channel.basic_consume(
+            queue_name,
+            consumer_callback,
+            no_ack=options.no_ack,
+            exclusive=options.exclusive,
+            consumer_tag=options.consumer_tag or None,
+            arguments=options.arguments or None,
+        )
+        return result.consumer_tag
 
-        consumer_tag = await queue.consume(process_message, no_ack=not late_ack)
-        return consumer_tag
+    # -- publish ----------------------------------------------------------------
+
+    def _publish_state_for(self, channel: Any) -> _ChannelPublishState:
+        try:
+            state = self._publish_state.get(channel)
+            if state is None:
+                state = _ChannelPublishState()
+                self._publish_state[channel] = state
+                self._watch_channel_close(channel, state)
+            return state
+        except TypeError:
+            state = self._publish_state_fallback.get(id(channel))
+            if state is None:
+                state = _ChannelPublishState()
+                self._publish_state_fallback[id(channel)] = state
+                self._watch_channel_close(channel, state)
+            return state
+
+    def _watch_channel_close(self, channel: Any, state: _ChannelPublishState) -> None:
+        closing = getattr(channel, "closing", None)
+        if closing is None or not hasattr(closing, "add_done_callback"):
+            return
+
+        def fail_all(_future: Any) -> None:
+            # A channel closing with confirms outstanding leaves those
+            # messages in an UNKNOWN state, which the caller must be told.
+            pending, state.pending = list(state.pending), set()
+            for fut in pending:
+                if not fut.done():
+                    # A cancelled confirm task is reported to its publisher
+                    # as ChannelClosedError by _confirmed_publish.
+                    fut.cancel()
+            # Release anyone parked on the in-flight bound.
+            waiters, state.waiters = state.waiters, []
+            for w in waiters:
+                if not w.done():
+                    w.set_result(None)
+
+        closing.add_done_callback(fail_all)
+
+    async def publish(self, channel: Channel, exchange_name: str, routing_key: str, content: bytes, properties: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Publish and return only once RabbitMQ has confirmed the message.
+
+        A normal return means the broker positively confirmed the publication
+        and, when ``mandatory`` asked for routing to be enforced, that it was
+        routed. Everything else is a typed exception — see PublishError and
+        subclasses. PublishConfirmTimeoutError and ChannelClosedError mean the
+        outcome is UNKNOWN, not failed: retrying either can duplicate the
+        message, which is why every publish carries a stable ``message_id``.
+        """
+        await self._confirmed_publish(
+            channel, properties or {}, content,
+            lambda props, mandatory: channel.basic_publish(content, exchange=exchange_name, routing_key=routing_key, properties=props, mandatory=mandatory),
+            f"{exchange_name or '(default)'} -> {routing_key}",
+        )
+
+    async def publish_to_queue(self, channel: Channel, queue_name: str, content: bytes, properties: Optional[Dict[str, Any]] = None) -> None:
+        """Publish straight to a queue (via the default exchange) with the same
+        confirm guarantee as publish(). Used by the retry and DLQ paths."""
+        await self._confirmed_publish(
+            channel, properties or {}, content,
+            lambda props, mandatory: channel.basic_publish(content, exchange="", routing_key=queue_name, properties=props, mandatory=mandatory),
+            f"queue {queue_name}",
+        )
+
+    async def _confirmed_publish(
+        self,
+        channel: Channel,
+        properties: Dict[str, Any],
+        content: bytes,
+        send: Callable[[Basic.Properties, bool], Awaitable[Any]],
+        describe: str,
+    ) -> None:
+        state = self._publish_state_for(channel)
+        # A caller-supplied message_id survives retries, which is what lets a
+        # consumer recognise a duplicate after an ambiguous outcome.
+        message_id = properties.get("message_id") or properties.get("messageId") or str(uuid.uuid4())
+        mandatory = bool(properties.get("mandatory", False))
+        props = build_properties({**properties, "message_id": message_id})
+
+        # Bound unconfirmed work before touching the channel at all.
+        while state.in_flight >= Config.max_outstanding_confirms():
+            waiter: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+            state.waiters.append(waiter)
+            try:
+                await waiter
+            finally:
+                try:
+                    state.waiters.remove(waiter)
+                except ValueError:
+                    pass
+        state.in_flight += 1
+
+        timeout_ms = Config.publish_confirm_timeout_ms()
+        loop = asyncio.get_running_loop()
+        confirm: "asyncio.Task[Any]" = loop.create_task(send(props, mandatory))
+        state.pending.add(confirm)
+        try:
+            try:
+                done, _ = await asyncio.wait({confirm}, timeout=timeout_ms / 1000)
+            except asyncio.CancelledError:
+                confirm.cancel()
+                raise
+            if not done:
+                confirm.cancel()
+                raise PublishConfirmTimeoutError(f"no broker confirm for {describe} within {timeout_ms}ms", message_id)
+            if confirm.cancelled():
+                raise ChannelClosedError(f"{describe} was unconfirmed when the channel closed", message_id)
+            exc = confirm.exception()
+            if exc is not None:
+                raise _classify_publish_failure(exc, describe, message_id)
+            result = confirm.result()
+            if isinstance(result, DeliveredMessage) or isinstance(getattr(result, "delivery", None), Basic.Return):
+                # Confirmed, but returned first: it reached no queue.
+                raise UnroutableError(f"{describe} was confirmed but returned as unroutable", message_id)
+            if isinstance(result, Basic.Nack):
+                raise PublishNackedError(f"broker nacked {describe}", message_id)
+        finally:
+            state.pending.discard(confirm)
+            state.in_flight -= 1
+            while state.waiters:
+                nxt = state.waiters.pop(0)
+                if not nxt.done():
+                    nxt.set_result(None)
+                    break
 
     async def _publish_stream_reply(
         self,
-        channel: AbstractChannel,
-        message: AbstractIncomingMessage,
-        chunks: Any,
+        channel: Channel,
+        reply_to: str,
+        correlation_id: str,
+        chunks: AsyncIterable[bytes],
+        is_cancelled: Callable[[], bool] = lambda: False,
     ) -> None:
         """
-        Publish a streaming reply on a single AMQP reply queue.
-
-        Consumes the async iterator `chunks` (each yielding already-encoded
-        response bytes), publishing each chunk to ``message.reply_to`` with the
-        same ``correlation_id`` as the incoming request. All chunks but the
-        last carry ``x-protobus-final=false``; the last carries ``x-protobus-final=true``.
-
-        If the iterator yields no chunks at all, publishes a single empty
-        terminal message so the client knows the stream ended.
-
-        See ``docs/advanced/streaming.md`` for the protocol details.
+        Publish a streaming reply: every chunk carries the same correlation
+        id; all but the last carry ``x-protobus-final=false``, the last
+        ``true``. An empty stream publishes a single empty terminal message.
+        Look-ahead-by-one avoids an extra terminal in the common case.
         """
-        if not message.reply_to:
-            # Nothing to reply to; drain the iterator to clean up.
-            try:
-                async for _ in chunks:
-                    pass
-            except Exception:
-                pass
-            return
 
-        async def _publish_one(body: bytes, seq: int, final: bool) -> None:
-            await channel.default_exchange.publish(
-                Message(
-                    body=body,
-                    correlation_id=message.correlation_id,
-                    headers={
-                        Config.HEADER_FINAL: bool(final),
-                        Config.HEADER_SEQ: int(seq),
-                    },
-                ),
-                routing_key=message.reply_to,
+        async def publish_one(body: bytes, seq: int, final: bool) -> None:
+            await self.publish(
+                channel, Config.callbacks_exchange_name(), reply_to, body,
+                {
+                    "content_type": "application/octet-stream",
+                    "correlation_id": correlation_id,
+                    "headers": {Config.HEADER_FINAL: final, Config.HEADER_SEQ: seq},
+                },
             )
 
-        # Look-ahead by one chunk so we can mark the last as final without
-        # an extra empty terminal message.
         seq = 0
         buffered: Optional[bytes] = None
+        iterator = chunks.__aiter__()
+        try:
+            while True:
+                try:
+                    chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                # A caller that cancelled is not listening: stop sending and
+                # stop pulling, closing the generator so a cooperative producer
+                # releases whatever it holds open.
+                if is_cancelled():
+                    Logger.debug(f"stream {correlation_id} cancelled after {seq} chunk(s); not publishing further")
+                    return
+                if buffered is not None:
+                    await publish_one(buffered, seq, False)
+                    seq += 1
+                buffered = bytes(chunk)
+        finally:
+            await _aclose(iterator)
 
-        async for chunk in chunks:
-            if buffered is not None:
-                await _publish_one(buffered, seq=seq, final=False)
-                seq += 1
-            buffered = chunk
-
+        if is_cancelled():
+            return
         if buffered is not None:
-            await _publish_one(buffered, seq=seq, final=True)
+            await publish_one(buffered, seq, True)
         else:
-            # Empty stream — single terminal so the client iterator can end.
-            await _publish_one(b"", seq=0, final=True)
+            await publish_one(b"", 0, True)
 
-    async def _retry_message(
-        self,
-        channel: AbstractChannel,
-        message: AbstractIncomingMessage,
-        retry_count: int,
-        error: Exception,
-        retry_opts: RetryOptions,
-        queue_name: str,
-    ) -> None:
-        """Send a message to the retry queue."""
-        headers = dict(message.headers or {})
-        headers["x-retry-count"] = retry_count + 1
-        headers["x-first-failure-time"] = headers.get(
-            "x-first-failure-time", int(time.time() * 1000)
-        )
-        headers["x-last-error"] = str(error)
 
-        Logger.debug(
-            f"Retrying message (attempt {retry_count + 1}/{retry_opts.max_retries})"
-        )
+def _classify_publish_failure(exc: BaseException, describe: str, message_id: str) -> Exception:
+    if isinstance(exc, (PublishNackedError, UnroutableError, ChannelClosedError, PublishConfirmTimeoutError)):
+        return exc
+    frame = getattr(exc, "frame", None)
+    if isinstance(exc, aiormq.exceptions.DeliveryError) and isinstance(frame, Basic.Nack):
+        return PublishNackedError(f"broker nacked {describe}: {exc}", message_id)
+    if isinstance(exc, aiormq.exceptions.DeliveryError) and (isinstance(frame, Basic.Return) or isinstance(getattr(exc, "message", None), DeliveredMessage)):
+        return UnroutableError(f"{describe} was confirmed but returned as unroutable", message_id)
+    text = str(exc) or type(exc).__name__
+    if isinstance(exc, (aiormq.exceptions.ChannelInvalidStateError, aiormq.exceptions.ConnectionClosed, aiormq.exceptions.ChannelClosed, ConnectionError)) or "closed" in text.lower():
+        return ChannelClosedError(f"{describe} was unconfirmed when the channel closed: {text}", message_id)
+    return PublishNackedError(f"publish of {describe} failed: {text}", message_id)
 
-        # The retry queue is named after the CONSUMER's queue and is bound to
-        # nothing, but this published to the topic bus exchange with the key
-        # "<delivery routing key>.retry" — four segments against a three
-        # segment binding. Verified against a real broker: the broker returns
-        # it as unroutable, aio-pika reports that in the return value rather
-        # than by raising, and the message was then acked. Every message that
-        # exhausted a handler was silently destroyed on its first retry.
-        #
-        # Publish to the retry queue by name through the default exchange, the
-        # technique _send_to_dlq already used correctly.
-        retry_queue_name = f"{queue_name}.retry" if queue_name else None
-        if not retry_queue_name:
-            Logger.error(
-                "Cannot retry: the consumer's queue name is unknown, so the "
-                "retry queue cannot be addressed"
-            )
-            raise UnroutableError("No retry queue for this consumer")
 
-        # Sanitize headers: ensure numeric values are ints (aio-pika strict typing)
-        sanitized_headers = {}
-        for k, v in headers.items():
-            if isinstance(v, str) and v.isdigit():
-                sanitized_headers[k] = int(v)
-            else:
-                sanitized_headers[k] = v
-
-        await publish_confirmed(
-            channel.default_exchange,
-            Message(
-                body=message.body,
-                headers=sanitized_headers,
-                correlation_id=message.correlation_id,
-                reply_to=message.reply_to,
-                # SECONDS, as a number. aio-pika's encode_expiration is a
-                # singledispatch registered for int, float, timedelta and
-                # datetime — and NOT for str, so the previous
-                # `str(retry_delay_ms)` raised ValueError at publish time on
-                # every aio-pika >= 9. The bare `except` around this block then
-                # logged it and the delivery was acked regardless, so every
-                # message that hit a non-handled handler error was destroyed
-                # rather than retried, on every install.
-                expiration=retry_opts.retry_delay_ms / 1000,
-                # Carry the priority across the retry.
-                #
-                # The broker preserves priority when IT dead-letters a
-                # message, but this path does not rely on that — it
-                # re-publishes, so anything not copied here is lost. Drop it
-                # and a control message that fails once comes back as priority
-                # 0 and queues behind the entire bulk backlog: precisely the
-                # problem priority exists to solve, and only visible after
-                # something has already gone wrong.
-                #
-                # Still true after the routing correction above — the exchange
-                # this goes to changed, the re-publish did not.
-                priority=message.priority,
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            ),
-            retry_queue_name,
-        )
-
-    async def _send_to_dlq(
-        self,
-        channel: AbstractChannel,
-        message: AbstractIncomingMessage,
-        error: Exception,
-    ) -> None:
-        """Send a message to the dead letter queue."""
-        headers = dict(message.headers or {})
-        headers["x-death-reason"] = str(error)
-        headers["x-death-time"] = int(time.time() * 1000)
-
-        dlq_name = f"{message.routing_key}.DLQ"
-        Logger.warn(f"Message exhausted retries, sending to DLQ: {dlq_name}")
-
-        # No `except` here: the caller requeues if the handoff fails. Swallowing
-        # it meant the delivery was acked immediately afterwards and the message
-        # was destroyed rather than dead-lettered.
-        await channel.declare_queue(dlq_name, durable=True)
-        await publish_confirmed(
-            channel.default_exchange,
-            Message(
-                body=message.body,
-                headers=headers,
-                correlation_id=message.correlation_id,
-                # The DLQ is a plain queue, so this buys no ordering. It is
-                # copied because a DLQ exists to preserve what the message
-                # WAS, and whether a dead message was control or bulk traffic
-                # is part of that.
-                priority=message.priority,
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            ),
-            dlq_name,
-        )
-
-    async def publish(
-        self,
-        channel: AbstractChannel,
-        exchange: AbstractExchange,
-        routing_key: str,
-        body: bytes,
-        properties: Optional[Dict[str, Any]] = None,
-        mandatory: bool = True,
-    ) -> None:
-        """
-        Publish a message to an exchange.
-
-        Args:
-            channel: The channel to use
-            exchange: The exchange to publish to
-            routing_key: Message routing key
-            body: Message body
-            properties: Additional message properties. May include an
-                optional ``priority`` (0..255); omit it and nothing about the
-                published message changes.
-            mandatory: Fail if nothing is bound for the routing key. True for
-                requests; pass False for events, where having no subscribers
-                is normal.
-
-        Raises:
-            UnroutableError: If mandatory and the broker returned the message.
-            InvalidPriorityError: If ``priority`` is present but out of range.
-        """
-        if not self._is_connected:
-            raise NotConnectedError("Not connected to RabbitMQ")
-
-        props = properties or {}
-        # Validated before the Message is built, not after: aio-pika applies
-        # int() to whatever it is given, so 1.5 would become 1 with no error
-        # anywhere, and 256 would blow up later as a raw struct.error from the
-        # encoder. Both become one InvalidPriorityError here.
-        priority = validate_message_priority(props.get("priority"))
-
-        message = Message(
-            body=body,
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            correlation_id=props.get("correlation_id"),
-            reply_to=props.get("reply_to"),
-            headers=props.get("headers"),
-            priority=priority,
-        )
-
-        await publish_confirmed(exchange, message, routing_key, mandatory=mandatory)
+async def _aclose(iterator: Any) -> None:
+    aclose = getattr(iterator, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as err:
+        Logger.debug(f"error closing stream iterator: {err}")

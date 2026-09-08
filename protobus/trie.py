@@ -132,3 +132,8 @@ class Trie:
             List of values from matching patterns
         """
         return self._root.match_topic(topic)
+
+
+# TS parity aliases: the TypeScript Trie exposes add() and match().
+Trie.add = Trie.add_match  # type: ignore[attr-defined]
+Trie.match = Trie.match_topic  # type: ignore[attr-defined]
