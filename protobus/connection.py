@@ -529,7 +529,11 @@ class Connection(EventEmitter):
             if generation != self._generation:
                 raise ReconnectionError("connection was torn down while restoring")
             await _call_restorer(restore, generation)
-        if generation != self._generation:
+        # A socket that died during the last restorer has its close callback
+        # queued but not yet run; let it run before deciding this generation
+        # is healthy, and look at the socket itself as well.
+        await asyncio.sleep(0)
+        if generation != self._generation or self._handle is None or self._handle.closing.done():
             raise ReconnectionError("connection was torn down while restoring")
 
     async def _discard_generation(self) -> None:
@@ -1194,7 +1198,7 @@ class Connection(EventEmitter):
 
         timeout_ms = Config.publish_confirm_timeout_ms()
         loop = asyncio.get_running_loop()
-        confirm: "asyncio.Task[Any]" = loop.create_task(send(props, mandatory))
+        confirm: "asyncio.Future[Any]" = asyncio.ensure_future(send(props, mandatory), loop=loop)
         state.pending.add(confirm)
         try:
             try:

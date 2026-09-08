@@ -20,7 +20,7 @@ from google.protobuf.descriptor import Descriptor, EnumDescriptor, FieldDescript
 
 from ..custom_types import get_custom_type
 from ..logger import Logger
-from ..message_factory import MessageFactory, Root, _custom_type_of, _is_map
+from ..message_factory import MessageFactory, Root, _custom_type_of, _is_map, _is_repeated
 from .config import CliConfig, load_config, resolve_path
 
 _SCALARS: Dict[int, str] = {
@@ -83,7 +83,7 @@ class _Emitter:
             value_type = self.field_type(value_field, package, inner)
             pending.extend(inner)
             return f"Dict[{key_type}, {value_type}]"
-        if field.label == FieldDescriptor.LABEL_REPEATED:
+        if _is_repeated(field):
             return f"List[{base}]"
         if field.type == FieldDescriptor.TYPE_MESSAGE:
             return f"Optional[{base}]"

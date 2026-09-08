@@ -64,12 +64,15 @@ class Context:
         amqp_connection_string: str,
         proto_locations: Optional[Union[str, List[str]]] = None,
         options: Optional[ContextOptions] = None,
+        *,
+        proto_dirs: Optional[Union[str, List[str]]] = None,
     ) -> None:
         """
         Load the schema from ``proto_locations`` (directories or files,
         searched recursively), connect, and open the publishing channels.
+        ``proto_dirs`` is the 1.x keyword for the same argument.
         """
-        self._message_factory.init(proto_locations or [])
+        self._message_factory.init(proto_locations or proto_dirs or [])
         await self._connection.connect(amqp_connection_string, options.reconnection if options else None)
         await self._message_dispatcher.init()
         await self._event_dispatcher.init()

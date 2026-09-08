@@ -44,7 +44,13 @@ from .connection import (
 from .cancellation import AbortController, AbortSignal
 
 # Dispatchers
-from .message_dispatcher import CallOptions, StreamOptions, StreamingReply
+from .message_dispatcher import CallOptions, MessageDispatcher, StreamOptions, StreamingReply
+from .event_dispatcher import EventDispatcher
+from .message_listener import MessageListener
+from .callback_listener import CallbackListener
+from .cancel_listener import CancelListener
+from .base_listener import BaseListener
+from .trie import Trie
 
 # Factory
 from .message_factory import (
@@ -162,8 +168,9 @@ __all__ = [
     "Connection", "ConsumeOptions", "ConsumeRetryOptions", "IConnection", "MessageHandler",
     "MessageHandlerContext", "MessageHandlerResult", "ReconnectionOptions", "Restorer",
     "apply_heartbeat", "attach_restorer", "AbortController", "AbortSignal",
-    # Dispatchers
-    "CallOptions", "StreamOptions", "StreamingReply",
+    # Dispatchers and listeners
+    "CallOptions", "StreamOptions", "StreamingReply", "MessageDispatcher", "EventDispatcher",
+    "MessageListener", "CallbackListener", "CancelListener", "BaseListener", "Trie",
     # Factory
     "MessageFactory", "Root", "RequestContainer", "ResponseContainer", "ResponseResult",
     "ResponseError", "EventContainer", "UnknownTypeError", "ProtoParseError", "parse_proto",

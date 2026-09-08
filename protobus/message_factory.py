@@ -312,10 +312,17 @@ def _custom_type_of(field: FieldDescriptor) -> Optional[CustomType]:
     return get_custom_type(mt.name)
 
 
+def _is_repeated(field: FieldDescriptor) -> bool:
+    is_repeated = getattr(field, "is_repeated", None)
+    if is_repeated is not None:
+        return bool(is_repeated)
+    return field.label == FieldDescriptor.LABEL_REPEATED  # protobuf < 6
+
+
 def _is_map(field: FieldDescriptor) -> bool:
     return (
         field.type == FieldDescriptor.TYPE_MESSAGE
-        and field.label == FieldDescriptor.LABEL_REPEATED
+        and _is_repeated(field)
         and field.message_type is not None
         and field.message_type.GetOptions().map_entry
     )
@@ -430,7 +437,7 @@ def _fill_message(message: Message, obj: Any, root: Root) -> Message:
                     target[k] = _coerce_scalar(value_field, v)
             continue
 
-        if field.label == FieldDescriptor.LABEL_REPEATED:
+        if _is_repeated(field):
             if isinstance(value, (str, bytes, dict)) or not isinstance(value, Iterable):
                 raise TypeError(f"field '{field.name}' expects a list, got {type(value).__name__}")
             target = getattr(message, field.name)
@@ -498,7 +505,7 @@ def _to_python(message: Message, custom_decode: bool = True) -> Dict[str, Any]:
             out[field.name] = converted
             continue
 
-        if field.label == FieldDescriptor.LABEL_REPEATED:
+        if _is_repeated(field):
             source = getattr(message, field.name)
             if custom is not None:
                 out[field.name] = [custom.decode(item.value) for item in source]
