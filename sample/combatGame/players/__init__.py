@@ -1,17 +1,10 @@
-"""Player strategy implementations."""
+"""Six targeting strategies, one per player."""
 
-from .vindicator import Vindicator
 from .bully_hunter import BullyHunter
-from .giant_slayer import GiantSlayer
 from .equalizer import Equalizer
-from .wildcard import Wildcard
+from .giant_slayer import GiantSlayer
 from .terminator import Terminator
+from .vindicator import Vindicator
+from .wildcard import Wildcard
 
-__all__ = [
-    "Vindicator",
-    "BullyHunter",
-    "GiantSlayer",
-    "Equalizer",
-    "Wildcard",
-    "Terminator",
-]
+__all__ = ["Vindicator", "BullyHunter", "GiantSlayer", "Equalizer", "Wildcard", "Terminator"]

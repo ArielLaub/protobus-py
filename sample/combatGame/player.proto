@@ -1,11 +1,10 @@
 syntax = "proto3";
-
-package combat;
+package Combat;
 
 // Events
 message PlayerJoined {
     string playerId = 1;
-    string name = 2;
+    string playerName = 2;
     int32 health = 3;
 }
 
@@ -13,13 +12,12 @@ message PlayerShot {
     string shooterId = 1;
     string targetId = 2;
     bool hit = 3;
-    int32 damage = 4;
-    int32 targetHealth = 5;
+    int32 targetHealth = 4;
 }
 
 message PlayerDied {
     string playerId = 1;
-    string killerId = 2;
+    string killedBy = 2;
 }
 
 message TurnComplete {
@@ -33,7 +31,7 @@ message GameOver {
 }
 
 message GameStarted {
-    repeated string turnOrder = 1;
+    repeated string playerOrder = 1;
 }
 
 // RPC Messages
@@ -43,31 +41,30 @@ message ShootRequest {
 
 message ShootResponse {
     bool hit = 1;
-    int32 damage = 2;
-    int32 remainingHealth = 3;
+    int32 remainingHealth = 2;
 }
 
 message InitiateGameRequest {
-    repeated string turnOrder = 1;
+    repeated string playerOrder = 1;
+    int32 myIndex = 2;
 }
 
 message InitiateGameResponse {
     bool success = 1;
 }
 
-message GetStatusRequest {
-}
+message GetStatusRequest {}
 
 message GetStatusResponse {
     string playerId = 1;
-    string name = 2;
+    string playerName = 2;
     int32 health = 3;
     bool alive = 4;
 }
 
-// Player Service - each player implements this
-service PlayerService {
-    rpc shoot(ShootRequest) returns (ShootResponse);
-    rpc initiateGame(InitiateGameRequest) returns (InitiateGameResponse);
-    rpc getStatus(GetStatusRequest) returns (GetStatusResponse);
+// Each player service implements this
+service Player {
+    rpc shoot(ShootRequest) returns(ShootResponse);
+    rpc initiateGame(InitiateGameRequest) returns(InitiateGameResponse);
+    rpc getStatus(GetStatusRequest) returns(GetStatusResponse);
 }

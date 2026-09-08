@@ -5,8 +5,13 @@ on:
     types: [published]
 
 jobs:
+  test:
+    name: Test before publishing
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: Build and publish to PyPI
+    needs: test
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
