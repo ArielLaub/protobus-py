@@ -157,14 +157,21 @@ class RunnableService(MessageService):
         service_class: Optional[Type[T]] = None,
         options: Optional[MessageServiceOptions] = None,
         post_init: Optional[Callable[[T], Awaitable[None]]] = None,
+        **option_kwargs: Any,
     ) -> T:
         """
         Instantiate and initialise a service, returning it without blocking.
 
-        A startup failure runs the shutdown sequence with exit code 1 and
-        re-raises, so a supervisor sees the process fail rather than succeed.
+        Options are passed as a MessageServiceOptions or as keywords
+        (``max_concurrent=4``). A startup failure runs the shutdown sequence
+        with exit code 1 and re-raises, so a supervisor sees the process fail
+        rather than succeed.
         """
         service_class = service_class or cls
+        if options is None and option_kwargs:
+            options = MessageServiceOptions(**option_kwargs)
+        elif option_kwargs:
+            raise TypeError("pass either options or keyword options, not both")
         service: Optional[T] = None
         try:
             service = service_class(context, options)
@@ -194,6 +201,7 @@ class RunnableService(MessageService):
         service_class: Optional[Type[T]] = None,
         options: Optional[MessageServiceOptions] = None,
         post_init: Optional[Callable[[T], Awaitable[None]]] = None,
+        **option_kwargs: Any,
     ) -> T:
         """
         Bootstrap a service and run it until a shutdown signal arrives.
@@ -208,6 +216,6 @@ class RunnableService(MessageService):
         Returns the service once it has shut down. Use ``launch()`` to get
         the running service back without blocking.
         """
-        service = await cls.launch(context, service_class, options, post_init)
+        service = await cls.launch(context, service_class, options, post_init, **option_kwargs)
         await service.run()
         return service

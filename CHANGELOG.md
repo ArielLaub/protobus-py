@@ -4,6 +4,172 @@ All notable changes to **protobus-py** are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — 2026-09-08
+
+A ground-up rewrite of the core, bringing the Python port to behavioural parity
+with [protobus](https://github.com/ArielLaub/protobus) 2.4 (TypeScript). It
+responds to an external audit of 1.5.0 that found the two ports diverging in
+every reliability guarantee that matters: acknowledgement, persistence, retries,
+schema loading, event interoperability, shutdown and stream cancellation.
+Every finding is closed below, and the parity is now asserted by a test suite
+ported from the TypeScript one — 480 unit tests, an integration suite against a
+live broker, and a cross-language suite run in **both** directions.
+
+A major, because the wire and the API both change. The migration guide is
+[`docs/migration.md`](docs/migration.md).
+
+### Changed — the transport
+
+- **`aiormq` replaces `aio-pika`.** aio-pika's robust connection ran its own
+  reconnection underneath ours; the two fought over one socket, which is how
+  1.4.x leaked channels and announced itself ready with no consumers.
+  Reconnection is now the library's own: generation-numbered, single-flight,
+  and coordinated with every component's *restorer*, so `reconnected` fires
+  only once every queue, binding and consumer is back. `Connection.when_ready()`
+  parks a publisher through an outage; `is_ready` says whether traffic flows.
+- **Publishes are confirmed.** `Connection.publish()` returns only once the
+  broker has confirmed the message, and every other outcome is typed:
+  `PublishNackedError`, `UnroutableError` (a request nothing is bound to fails
+  in milliseconds, not after the RPC timeout), and the two *ambiguous*
+  outcomes `PublishConfirmTimeoutError` and `ChannelClosedError`. Outstanding
+  confirms are bounded per channel (`MAX_OUTSTANDING_CONFIRMS`).
+- **Requests and events are persistent** (`delivery_mode=2`) on every
+  high-level path. 1.5 published them transient onto durable queues.
+- **Every message carries a stable `message_id`**, preserved unchanged across
+  every retry hop and DLQ copy and exposed to handlers, so a consumer can
+  deduplicate after an ambiguous publish. `CallOptions(message_id=...)` lets a
+  caller choose it; blank ids are refused.
+- A publish whose channel dies underneath it *because the connection dropped*
+  is repeated once on the restored channel under the same `message_id`, with
+  the reply slot re-armed and the reply queue re-read.
+
+### Changed — consuming
+
+- **Late ack with a bounded prefetch is the default.** 1.5 auto-acked unless
+  `max_concurrent` was set, so a worker dying mid-request lost the message.
+  `MessageServiceOptions(late_ack=False)` is the explicit at-most-once mode.
+- **The retry ladder matches the TypeScript port.** An unhandled handler
+  error goes to `<Service>.Retry` **through `<Service>.Retry.Exchange`**, so
+  the original `REQUEST.<Service>.<method>` routing key survives the TTL /
+  DLX round-trip and a mixed-language pair of workers agree on what a retried
+  delivery looks like. After `max_retries` hops the message lands on
+  `<Service>.DLQ` — the queue the listener declares, not one named after the
+  routing key — with `x-retry-count`, `x-original-routing-key`,
+  `x-original-queue`, `x-first-failure-time`, `x-dlq-time` and a
+  non-disclosing `x-last-error`. Retry options actually reach the consumer;
+  in 1.5 they were computed and dropped.
+- The caller is **answered** on every terminal path: the pre-encoded error
+  reply is published before the DLQ handoff, and a reply that fails to
+  publish never prevents the message being settled. A `HandledError` is
+  answered immediately and never retried.
+- **The processing timeout is enforced** (`MESSAGE_PROCESSING_TIMEOUT`,
+  `processing_timeout_ms`): the handler is cancelled, its `context.signal`
+  aborts, and the delivery climbs the retry ladder. Unlike the TypeScript
+  port, the caller is told (`PROCESSING_TIMEOUT`) rather than left to its own
+  deadline.
+- **Graceful shutdown** does what the docs promised: `stop_consuming()`,
+  `drain_in_flight(budget)` (`SHUTDOWN_DRAIN_TIMEOUT_MS`), `cleanup()`,
+  disconnect. A drain counts handlers still running after their timeout, not
+  just settled deliveries. A shutdown that lands while the broker is away is
+  not undone by the reconnection.
+- Every service method receives a fourth argument when it declares one:
+  `MessageHandlerContext(signal, routing_key, message_id, redelivered)`.
+
+### Changed — schema and wire
+
+- **No `protoc`.** `.proto` files are parsed at runtime by the library
+  (`protobus.proto_parser`) into protobuf's own `DescriptorPool`, as the
+  TypeScript port does with protobufjs. `MessageFactory.parse()` registers a
+  schema; `init(paths)` loads directories recursively, in dependency order,
+  and reports a missing import or a syntax error instead of falling back.
+- **JSON mode is gone.** A service without a schema is a `MissingProto` at
+  `init()`, not a service that quietly speaks a different format.
+- **Events are typed on the wire** and interoperate with TypeScript. 1.5
+  put JSON in the event payload both ways.
+- **Decoded values are native Python and complete.** Proto3 scalar defaults
+  are materialised (`{'a': 0}` no longer decodes as `{}`), 64-bit integers
+  are `int` (not decimal strings), `bytes` are `bytes`, enums are their value
+  names, an unset message field is `None`, a `oneof` / proto3 `optional`
+  field is present only when set.
+- **Custom types are selected by the field's declared type**, not by its
+  name: `timestamp created_at = 1;` is a timestamp, `string timestamp = 2;` is
+  a string. The wrapper message is the one protobufjs generates, so
+  `bigint` (unsigned 256-bit, `int`) and `timestamp` (milliseconds,
+  timezone-aware UTC `datetime`) are byte-compatible with the TypeScript port,
+  in maps and nested messages included. Re-registration is idempotent; a
+  conflicting `wire_type` is `CustomTypeConflictError`.
+- The proxy no longer guesses that a response with a `data` key is a legacy
+  wrapper. `{'data': 'payload', 'label': 'keep'}` is returned as it is.
+- **Instance names.** `Combat.Player.player6` serves the contract
+  `Combat.Player`, resolved by trimming; `ServiceProxy` routes to the instance
+  and names the contract in the envelope, and a request is dispatched only if
+  its body method agrees with the routing key the broker delivered on.
+
+### Changed — API
+
+- `Context.init(url, proto_locations, options)`; `Context.close()`.
+  `MessageFactory.init()` is synchronous.
+- Event handlers take `(event, type, topic)`; two- and one-argument handlers
+  are still called with what they declare.
+- `MessageServiceOptions(max_concurrent, retry, late_ack, processing_timeout_ms,
+  max_priority, event_retry)`; keyword options are accepted directly
+  (`MyService(context, max_concurrent=4)`).
+- `RunnableService.start()` runs until shutdown as before; `launch()` returns
+  the running service without blocking; `shutdown()` is public.
+- `ServiceProxy` raises `RemoteError(message, code, method)` for a remote
+  error and re-raises delivery errors with their identity intact. Streaming
+  methods return an iterator that is also an async context manager;
+  **closing it is what cancels the server-side producer**.
+- `Config.rpc_call_timeout_ms()` defaults to 600 000 ms, as in the TypeScript
+  port (1.5 had shortened it to 30 s).
+- New: `Log` (structured records with a fixed safe field set),
+  `set_log_level` / `LogLevel` (debug is off by default), `redact_url`,
+  `set_diagnostics_serializer`, `EventRetryOptions`, `CancelListener`,
+  `AbortController` / `AbortSignal`, `StreamOptions(signal=...)`,
+  `Connection.drain_in_flight()`, `Connection.cancel_stream()`,
+  `ProtoParseError`, `RetryQueueMismatchError`, `InternalServiceError`,
+  `PROTOBUS_EXPOSE_INTERNAL_ERRORS`.
+
+### Added
+
+- **Stream cancellation reaches the producer.** Closing a streaming call —
+  `async with`, `aclose()`, or an `AbortSignal` in `StreamOptions` — publishes
+  a cancel notice on `proto.bus.cancel`; the service's `context.signal`
+  aborts and its generator is closed. Streams are bounded by chunks, bytes
+  per call and bytes across all calls; a duplicate chunk is dropped and a gap
+  is `StreamSequenceError`.
+- **Opt-in event retry** (`MessageServiceOptions(event_retry=...)`): a
+  failing event handler climbs `<Service>.Events.Retry` and dead-letters to
+  `<Service>.Events.DLQ`, redelivered only to the subscriber that failed.
+- **`protobus generate`** emits `TypedDict`s, `Literal` enums and a
+  `Protocol` per service whose signatures are exactly what `ServiceProxy`
+  installs; **`protobus generate:service`** builds its stub from the parsed
+  schema and refuses names that would escape the output directory.
+- The `tokenStream` sample: an LLM-shaped token stream with three ways of
+  stopping it, and a server-side count proving the producer stopped.
+- CI: unit tests on Python 3.10–3.13, the integration suite against
+  RabbitMQ, the combat sample, the cross-language suite, and a
+  build-and-install smoke test — all gating the publish workflow.
+- A `LICENSE` file; the README referenced one that was not there.
+
+### Removed
+
+- JSON payload mode and the `protoc` fallback.
+- `PublishMessageError` as a distinct type (kept as an alias of
+  `PublishError`, so an existing `except` still compiles).
+- The 1.x `ServiceCluster.use()` parsing of `service.Proto` (services register
+  their own schema at `init()`).
+
+### Documentation
+
+The documentation is rewritten around the 2.0 behaviour and mirrors the
+TypeScript port's structure: guides, concepts, reference and operations. It
+no longer claims identical functionality or guaranteed delivery; the
+[delivery guarantees](docs/concepts/delivery-guarantees.md) page says what
+is guaranteed, what is at-least-once, and what is best effort.
+
+---
+
 ## [1.5.0] — 2026-09-01
 
 Two independent bodies of work land in this release: **opt-in message

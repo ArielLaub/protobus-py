@@ -710,6 +710,15 @@ class Connection(EventEmitter):
             exc = future.exception() if not future.cancelled() else None
         except Exception:
             exc = None
+        if isinstance(exc, asyncio.CancelledError) or future.cancelled():
+            # The event loop is being torn down (an `asyncio.run()` ending
+            # with the connection still open): not a broker failure, and
+            # nothing to reconnect to.
+            Logger.debug("connection closed by event loop shutdown")
+            self._is_connected = False
+            self._mark_not_ready()
+            self._generation += 1
+            return
         if exc is not None:
             Logger.error(f"connection error: {exc}")
             self.emit("error", exc)

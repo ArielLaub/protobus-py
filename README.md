@@ -1,196 +1,344 @@
-# Protobus Python
+# ProtoBus for Python
 
-A lightweight, scalable microservices message bus for Python. Leverages RabbitMQ for message routing and load balancing, combined with Protocol Buffers for efficient, type-safe serialization.
+**RabbitMQ-native microservices for Python, with Protocol Buffers on the wire.**
 
-> **Note:** This is the official Python port of [Protobus](https://github.com/ArielLaub/protobus), originally written in TypeScript. The API and architecture are designed to be as close to the original as possible.
+[![PyPI](https://img.shields.io/pypi/v/protobus.svg?logo=pypi)](https://pypi.org/project/protobus/)
+[![python](https://img.shields.io/badge/python-%E2%89%A53.10-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![RabbitMQ](https://img.shields.io/badge/RabbitMQ-%E2%89%A53.8-FF6600?logo=rabbitmq&logoColor=white)](https://www.rabbitmq.com)
+[![CI](https://github.com/ArielLaub/protobus-py/actions/workflows/ci.yml/badge.svg)](https://github.com/ArielLaub/protobus-py/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## Why Protobus?
+Define a service in a `.proto` file, implement it as a class, and call it from
+anywhere on the bus as if it were local. ProtoBus turns each service into **one
+durable RabbitMQ queue with N processes competing for it** — so load balancing,
+failover, backpressure, retries and dead-lettering are the broker's, not
+Python's.
 
-Unlike transport-agnostic frameworks that abstract away the message broker, Protobus **embraces RabbitMQ's native capabilities** directly. We leverage topic exchanges, routing keys, competing consumers, dead-letter queues, and message persistence - rather than re-implementing routing logic at the application level.
+This is the Python port of [protobus](https://github.com/ArielLaub/protobus)
+(TypeScript). The two are **wire-compatible and behaviourally aligned**: a
+Python service serves TypeScript callers and vice versa, streaming, events,
+custom types and error codes included. Every release runs a cross-language
+suite in both directions against a live broker to keep it that way.
 
-### RabbitMQ-Native Approach
+---
 
-**Message Routing**: By delegating routing to RabbitMQ's Erlang runtime instead of your Python process, Protobus eliminates the double-processing that transport-agnostic frameworks impose. The broker handles competing consumers, topic-based routing, and dead-letter queues natively.
-
-**Binary Serialization**: Protocol Buffers provide 3-10x smaller payloads than JSON, with compile-time type safety and built-in backward compatibility. No more runtime schema guessing or JSON parsing overhead.
-
-### Polyglot Advantage
-
-Since Protobus uses standard Protobuf schemas and AMQP protocol, implementing clients in other languages is straightforward. Currently available in **TypeScript/Node.js** and **Python**, with Java, Go, or Rust implementations requiring minimal effort.
-
-## Features
-
-- **RPC Communication**: Request-response pattern over message queues
-- **Server Streaming**: `rpc foo (Req) returns (stream Chunk)` — multi-chunk responses with `async for` ergonomics. See [streaming docs](docs/advanced/streaming.md).
-- **Event System**: Publish-subscribe with topic-based routing and wildcards
-- **Auto-Reconnection**: Exponential backoff with jitter for resilient connections
-- **Message Retry**: Automatic retry with dead-letter queue (DLQ) support
-- **Message Priority**: Opt-in priority queues so control traffic jumps a bulk backlog on the same queue. See [priority docs](docs/advanced/message-priority.md) — enabling it on an existing queue needs a one-time operator migration.
-- **Custom Types**: Extensible type system (BigInt, Timestamp built-in)
-- **Async/Await**: Built on asyncio and aio-pika for modern Python
-- **CLI Tools**: Generate types and service stubs from .proto files
-- **Lifecycle Management**: RunnableService with graceful shutdown handling
-
-## Requirements
-
-- Python 3.10 or higher
-- RabbitMQ 3.8 or higher
-
-## Installation
+## Install
 
 ```bash
 pip install protobus
 ```
 
-Or install from source:
+You also need a RabbitMQ 3.8+ broker:
 
 ```bash
-git clone https://github.com/ArielLaub/protobus-py.git
-cd protobus-py
-pip install -e .
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management-alpine
 ```
 
-## Quick Start
+No `protoc` is needed: `.proto` files are parsed at runtime.
 
-### 1. Start RabbitMQ
+---
 
-```bash
-docker-compose up -d
+## Quick start
+
+Four steps to a working RPC.
+
+### 1. Describe the service
+
+```protobuf
+// proto/Calculator.proto
+syntax = "proto3";
+package Calculator;
+
+message AddRequest {
+    int32 a = 1;
+    int32 b = 2;
+}
+
+message AddResponse {
+    int32 result = 1;
+}
+
+service Math {
+    rpc add(Calculator.AddRequest) returns(Calculator.AddResponse);
+}
 ```
 
-### 2. Create a Service
+Package plus service name is the service's name on the bus: `Calculator.Math`.
+
+### 2. Implement it
 
 ```python
-from protobus import RunnableService, Context
+# calculator_service.py
+from protobus import RunnableService
+
 
 class CalculatorService(RunnableService):
-    @property
-    def service_name(self) -> str:
-        return "calculator.MathService"
+    service_name = "Calculator.Math"
 
-    async def add(self, data: dict, actor: str, correlation_id: str) -> dict:
-        return {"result": data["a"] + data["b"]}
-
-    async def multiply(self, data: dict, actor: str, correlation_id: str) -> dict:
-        return {"result": data["a"] * data["b"]}
+    async def add(self, request: dict, actor: str, correlation_id: str) -> dict:
+        return {"result": request["a"] + request["b"]}
 ```
 
-### 3. Run the Service
+### 3. Run it
 
 ```python
-import asyncio
+# server.py
+import asyncio, os
 from protobus import Context
+from calculator_service import CalculatorService
+
 
 async def main():
-    ctx = Context()
-    await ctx.init("amqp://guest:guest@localhost:5672/")
+    context = Context()
+    await context.init(os.environ.get("AMQP_URL", "amqp://localhost"), ["./proto"])
+    await CalculatorService.start(context)   # blocks until SIGINT/SIGTERM
 
-    # Start with lifecycle management (handles SIGINT/SIGTERM)
-    await CalculatorService.start(ctx, CalculatorService)
 
 asyncio.run(main())
 ```
 
-### 4. Create a Client
+`RunnableService.start` installs signal handlers and, on shutdown, stops
+taking new work, drains in-flight messages, runs your `cleanup()` hook and
+disconnects — in that order.
+
+### 4. Call it
 
 ```python
-import asyncio
+# client.py
+import asyncio, os
 from protobus import Context, ServiceProxy
 
+
 async def main():
-    ctx = Context()
-    await ctx.init("amqp://guest:guest@localhost:5672/")
+    context = Context()
+    await context.init(os.environ.get("AMQP_URL", "amqp://localhost"), ["./proto"])
 
-    # Create proxy for the calculator service
-    calc = ServiceProxy(ctx, "calculator.MathService")
-    await calc.init()
+    calculator = ServiceProxy(context, "Calculator.Math")
+    await calculator.init()
 
-    # Make RPC calls
-    result = await calc.add({"a": 5, "b": 3})
-    print(f"5 + 3 = {result['result']}")  # Output: 5 + 3 = 8
+    response = await calculator.add({"a": 5, "b": 3})
+    print(f"5 + 3 = {response['result']}")
 
-    result = await calc.multiply({"a": 4, "b": 7})
-    print(f"4 * 7 = {result['result']}")  # Output: 4 * 7 = 28
+    await context.close()
 
-    await ctx.close()
 
 asyncio.run(main())
 ```
 
-## CLI Tools
-
-Protobus includes CLI tools for code generation:
-
-```bash
-# Generate Python types from .proto files
-protobus generate
-
-# Generate a service stub
-protobus generate:service calculator.MathService
-
-# Show project setup instructions
-protobus init
+```
+$ python client.py
+5 + 3 = 8
 ```
 
-Configure in `pyproject.toml`:
+Full walkthrough, including events and the project layout:
+**[Getting Started](docs/guide/getting-started.md)**.
+
+---
+
+## Why ProtoBus
+
+### RabbitMQ only, on purpose
+
+ProtoBus is built for one broker, so the things a broker is good at stay in the
+broker instead of being reimplemented above it:
+
+| Concern | Where it lives |
+|---|---|
+| Load balancing | competing consumers on one queue |
+| Routing | topic exchange bindings (`REQUEST.<Service>.*`) |
+| Redelivery on consumer loss | late ack — an unacked delivery returns to the queue |
+| Retry delay | the retry queue's `x-message-ttl`, drained by DLX |
+| Persistence | durable queues, persistent messages |
+| Dead letters | a real `<Service>.DLQ` |
+| Priority | native queue priorities |
+
+A request goes publisher → exchange → queue → consumer. Nothing tracks live
+instances, so nothing holds a stale one, and a consumer that dies mid-request
+leaves its delivery unacked for the next consumer to take.
+
+The cost of this is written down rather than glossed over — read
+[Delivery Guarantees](docs/concepts/delivery-guarantees.md) before you rely on
+any of it. If you may need to swap RabbitMQ for another broker, use a
+transport-agnostic framework instead; that is a real feature and protobus does
+not have it.
+
+### Protocol Buffers, not JSON
+
+- **Smaller on the wire** — binary rather than text.
+- **Contract-first** — a `.proto` file is the interface between teams, and
+  generated typing (`protobus generate`) tells you when the two drift apart.
+- **Versioning by field number** — adding a field does not break an old peer.
+
+### Two runtime dependencies
+
+[`aiormq`](https://github.com/mosquito/aiormq) for AMQP and
+[`protobuf`](https://pypi.org/project/protobuf/) for the wire. The messaging
+behaviour that would be hardest to reimplement — queueing, consumer
+distribution, retry delays, dead-lettering — is RabbitMQ's.
+
+---
+
+## Streaming, cancellation, events, priority
+
+```python
+# A server-streaming rpc (`returns (stream Token)`) is an async generator.
+async def generate(self, request, actor, correlation_id, context):
+    for i, word in enumerate(words):
+        if context.signal.aborted:      # the caller stopped listening
+            return
+        yield {"index": i, "text": word}
+
+# The client consumes it with `async for`; closing the stream tells the
+# server to stop producing.
+async with assistant.generate({"prompt": "..."}) as stream:
+    async for token in stream:
+        print(token["text"], end="")
+        if enough:
+            break
+```
+
+Events are published to a topic exchange and matched with `*` and `#`
+wildcards; an opt-in retry ladder gives event handlers the same retry/DLQ
+treatment requests get. Priority queues let a control message overtake a bulk
+backlog. See [Streaming](docs/guide/streaming.md),
+[Events](docs/guide/events.md) and [Priority](docs/guide/priority.md).
+
+---
+
+## Custom types
+
+Protobuf's scalars do not cover everything. Register a custom type and it becomes
+usable as a field type in your schemas, encoded and decoded transparently:
+
+```python
+from protobus import Context, CustomType
+
+UuidType = CustomType(
+    name="uuid",            # how it is written in the .proto
+    wire_type="string",     # how it travels
+    encode=lambda value: str(value),
+    decode=lambda data: data,
+    py_type="str",          # what generated typing calls it
+)
+
+context = Context()
+# Register before init(): init() parses your .proto files, and a schema
+# using `uuid` cannot be parsed until the type exists.
+context.factory.register_type(UuidType)
+await context.init("amqp://localhost", ["./proto"])
+```
+
+```protobuf
+syntax = "proto3";
+package Accounts;
+
+message Account {
+    uuid id = 1;
+}
+```
+
+`BigIntType` (an unsigned 256-bit integer, decoded to `int`) and
+`TimestampType` (milliseconds since the epoch, decoded to a timezone-aware
+`datetime`) ship with the library and are already registered. They are the
+same wire format the TypeScript port uses.
+**[Custom Types](docs/reference/custom-types.md)**.
+
+---
+
+## CLI
+
+```bash
+protobus generate               # .proto -> Python typing (TypedDict / Protocol)
+protobus generate:service Name  # a runnable service stub from Name.proto
+protobus init                   # print project setup instructions
+```
+
+Configured from `pyproject.toml`:
 
 ```toml
 [tool.protobus]
-protoDir = "./proto"
-typesOutput = "./types/proto.py"
-servicesDir = "./services"
+proto_dir = "./proto"
+types_output = "./types/proto.py"
+services_dir = "./services"
 ```
+
+All three keys are optional; the defaults above are what the CLI uses.
+**[CLI reference](docs/reference/cli.md)**.
+
+---
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md) - Installation and first service
-- [Architecture](docs/architecture.md) - System design and components
-- [Configuration](docs/configuration.md) - Environment variables and options
-- [Message Flow](docs/message-flow.md) - How messages move through the system
-- [CLI Tools](docs/cli.md) - Code generation commands
-- [Troubleshooting](docs/troubleshooting.md) - Common issues and solutions
+Full index: **[docs/](docs/README.md)**
 
-### API Reference
+| Start | |
+|---|---|
+| [Getting Started](docs/guide/getting-started.md) | zero to a working RPC, plus events |
+| [Schema Design](docs/guide/schema.md) | writing the `.proto` that is your contract |
+| [Events](docs/guide/events.md) | publish/subscribe and wildcard topics |
+| [Error Handling](docs/guide/error-handling.md) | retriable vs terminal, the retry ladder, the DLQ |
+| [Testing](docs/guide/testing.md) | unit, integration and end-to-end |
 
-- [Context](docs/api/context.md) - Connection management
-- [MessageService](docs/api/message-service.md) - Building services
-- [RunnableService](docs/api/runnable-service.md) - Services with lifecycle management
-- [ServiceProxy](docs/api/service-proxy.md) - Calling services
-- [ServiceCluster](docs/api/service-cluster.md) - Managing multiple services
-- [Events](docs/api/events.md) - Publish-subscribe patterns
+| Understand it | |
+|---|---|
+| [Architecture](docs/concepts/architecture.md) | what a service creates in the broker, and why |
+| [Message Flow](docs/concepts/message-flow.md) | the wire format and the round trip |
+| [Delivery Guarantees](docs/concepts/delivery-guarantees.md) | acks, confirms, duplicates, the parked caller |
 
-### Advanced Topics
+| Look it up | |
+|---|---|
+| [Configuration](docs/reference/configuration.md) | every environment variable and its default |
+| [API reference](docs/reference/api) | Context, MessageService, RunnableService, ServiceProxy |
+| [Errors](docs/reference/errors.md) | every exported error class and when it is raised |
+| [Custom Types](docs/reference/custom-types.md) | extending the type system |
 
-- [Streaming RPC](docs/advanced/streaming.md) - Server-streaming responses
-- [Error Handling](docs/advanced/error-handling.md) - Retries and DLQ
-- [Message Priority](docs/advanced/message-priority.md) - Priority queues, and the migration an existing queue needs
-- [Custom Logger](docs/advanced/custom-logger.md) - Logging integration
-- [Custom Types](docs/advanced/custom-types.md) - Extending the type system
+| Run it | |
+|---|---|
+| [Troubleshooting](docs/operations/troubleshooting.md) | symptom, cause, fix |
+| [Security](docs/operations/security.md) | what `actor` does and does not prove |
+| [Logging](docs/operations/logging.md) | levels, structured records, your own sink |
+| [Queue Migration](docs/operations/queue-migration.md) | changing settings on live queues |
+| [Known Issues](docs/operations/known-issues.md) | current limitations |
+| [Migration Guide](docs/migration.md) | upgrading from 1.x to 2.0 |
 
-## Sample Application
+---
 
-The `sample/combatGame` directory contains a complete example - a turn-based battle royale game with 6 AI players demonstrating:
-
-- Multiple services communicating via RPC
-- Event-based game state synchronization
-- Different player strategies
-
-Run it:
+## See a real system in a minute
 
 ```bash
-python sample/combatGame/game_runner.py
+git clone https://github.com/ArielLaub/protobus-py && cd protobus-py
+python -m venv venv && venv/bin/pip install -e ".[dev]"
+docker compose up -d
+PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh
 ```
 
-## Cross-Language Compatibility
+Six services fight a battle royale over the bus — RPC, published events and
+graceful shutdown in one run — and the script asserts exactly one player
+survived. The source is [`sample/combatGame`](sample/combatGame). A second
+sample, [`sample/tokenStream`](sample/tokenStream), streams tokens like an LLM
+and shows cancellation actually stopping the producer.
 
-This library is fully wire-compatible with the original [TypeScript Protobus](https://github.com/ArielLaub/protobus). Services written in Python and TypeScript can communicate seamlessly on the same message bus, thanks to Protocol Buffers' language-agnostic serialization format.
+---
 
-## Original Project
+## Requirements
 
-This is the Python port of [Protobus](https://github.com/ArielLaub/protobus) (TypeScript). The original project provides identical functionality for Node.js/TypeScript environments.
+- Python 3.10+ (CI runs 3.10 – 3.13)
+- RabbitMQ 3.8+
+
+## Development
+
+```bash
+python -m pytest tests/unit                 # unit suite, no broker needed
+docker compose up -d
+python -m pytest tests/integration          # against RabbitMQ (management API at :15672 for the recovery tests)
+PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh
+```
+
+The cross-language suite (`tests/integration/test_cross_language.py`) expects
+the TypeScript checkout built beside this repo, or `PROTOBUS_TS` pointing at
+it; the mirror test in that repo drives a Python server from a TypeScript
+client.
 
 ## License
 
-MIT License - Copyright (c) Remarkable Games Ltd.
-
-See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).

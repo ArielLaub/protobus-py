@@ -49,6 +49,10 @@ jobs:
         env:
           AMQP_URL: amqp://guest:guest@localhost:5672/
         run: PYTHON=python scripts/run-combat-sample.sh
+      - name: Getting Started tutorial, as written
+        env:
+          AMQP_URL: amqp://guest:guest@localhost:5672/
+        run: PYTHON=python scripts/check-getting-started.sh
 
   cross-language:
     name: Wire compatibility with TypeScript protobus
