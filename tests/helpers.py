@@ -9,7 +9,7 @@ from a listener's or dispatcher's point of view.
 """
 
 import asyncio
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from aiormq.abc import DeliveredMessage
 from pamqp.commands import Basic
@@ -228,6 +228,8 @@ class FakeConnection(EventEmitter):
         self.publish_hook: Optional[Callable[..., Awaitable[Any]]] = None
         self.cancelled_streams: List[str] = []
         self.in_flight_deliveries = 0
+        # Every topology operation in order, for tests that care about order.
+        self.operations: List[Tuple[str, Any]] = []
         if not coordinated:
             # An IConnection predating register_restorer/when_ready: the
             # library checks for a callable, so None reads as absent.
@@ -270,14 +272,17 @@ class FakeConnection(EventEmitter):
 
     async def declare_exchange(self, channel: Any, exchange: str, exchange_type: str, options: Any = None) -> None:
         self.declared_exchanges.append({"exchange": exchange, "type": exchange_type, "options": options or {}})
+        self.operations.append((f"declare_exchange:{exchange}", options))
 
     async def declare_queue(self, channel: Any, queue_name: str, options: Any = None) -> str:
         name = queue_name or f"amq.gen-{len(self.declared_queues) + 1}"
         self.declared_queues.append({"queue": name, "options": options or {}})
+        self.operations.append((f"declare_queue:{name}", options))
         return name
 
     async def bind_queue(self, channel: Any, queue: str, exchange: str, routing_key: str, args: Any = None) -> None:
         self.bindings.append({"queue": queue, "exchange": exchange, "routing_key": routing_key})
+        self.operations.append((f"bind:{queue}:{exchange}:{routing_key}", None))
 
     async def unbind_queue(self, *a: Any, **kw: Any) -> None:
         pass
@@ -286,6 +291,7 @@ class FakeConnection(EventEmitter):
         pass
 
     async def consume(self, channel: Any, queue_name: str, message_handler: Any, options: ConsumeOptions, late_ack: bool, retry_options: Any = None, processing_timeout_ms: Any = None) -> str:
+        self.operations.append(("consume", queue_name))
         self.consumes.append({
             "channel": channel, "queue": queue_name, "handler": message_handler, "options": options,
             "late_ack": late_ack, "retry_options": retry_options, "processing_timeout_ms": processing_timeout_ms,

@@ -1,11 +1,12 @@
 """Base listener: a channel, an exchange, a queue, its bindings and a consumer,
 with restoration after reconnection."""
 
+import asyncio
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from .config import Config
-from .connection import ConsumeOptions, ConsumeRetryOptions, IConnection, MessageHandler, attach_restorer
+from .connection import EXCHANGE_OPTIONS, ConsumeOptions, ConsumeRetryOptions, IConnection, MessageHandler, attach_restorer
 from .errors import (
     AlreadyStartedError,
     ConnectionError,
@@ -139,21 +140,85 @@ class BaseListener(EventEmitter):
 
     async def _restore(self, _generation: int = 0) -> None:
         """
-        Put this listener's channel, queue, bindings and consumer back. A
-        failure propagates to the connection, which treats the whole
-        generation as unusable and retries.
+        Put this listener's channel, queue, bindings, auxiliary topology and
+        consumer back. A failure propagates to the connection, which treats
+        the whole generation as unusable and retries.
         """
         if not self._is_initialized:
             return
         Logger.info(f"{type(self).__name__}: reconnected, re-initializing...")
+        await self._rebuild()
+        Logger.info(f"{type(self).__name__}: successfully re-initialized after reconnection")
+        self.emit("reconnected")
+
+    async def _rebuild(self) -> None:
+        """Channel, queue, bindings, retry topology, consumer — in that order,
+        so nothing consumes before it has somewhere to fail to."""
         await self._reinitialize()
         for routing_key in self._bindings:
             await self._connection.bind_queue(self._channel, self._queue_name, self._exchange_name, routing_key, {})
             Logger.debug(f"{type(self).__name__}: re-bound {routing_key}")
+        await self._restore_topology()
         if self._was_started:
             await self._start_consuming()
-        Logger.info(f"{type(self).__name__}: successfully re-initialized after reconnection")
-        self.emit("reconnected")
+
+    async def _restore_topology(self) -> None:
+        """
+        Re-declare whatever this listener needs beyond its own queue — the
+        retry and dead-letter objects, for a listener that has them. Durable
+        objects normally survive a disconnection, but not a replaced broker,
+        a recreated vhost or an operator's deletion, and a listener that
+        consumes without them settles its failures into nothing.
+        """
+
+    # -- channel-level recovery ----------------------------------------------
+
+    def _watch_channel(self, channel: Any) -> None:
+        """
+        Recover from losing only the channel while the socket stays up.
+
+        A 404 on a retry exchange or a 406 on a declare closes the channel
+        the listener consumes on — and with it the consumer, silently. The
+        connection's restoration only runs for a lost socket, so a listener
+        watches its own channel and rebuilds itself on the live connection.
+        """
+        closing = getattr(channel, "closing", None)
+        if closing is None or not hasattr(closing, "add_done_callback"):
+            return
+
+        def on_closed(_future: Any) -> None:
+            if self._channel is not channel:
+                return  # replaced deliberately: a restore, or close()
+            if not self._was_started or not self._connection.is_connected or self._connection.is_reconnecting:
+                return  # the connection's own recovery, or a stop, owns this
+            self._channel = None
+            self._consumer_tag = ""
+            try:
+                asyncio.get_running_loop().create_task(self._recover_channel())
+            except RuntimeError:
+                pass
+
+        closing.add_done_callback(on_closed)
+
+    async def _recover_channel(self, attempts: int = 5) -> None:
+        name = type(self).__name__
+        Logger.warn(f"{name}: channel for {self._configured_queue_name or 'anonymous queue'} closed while the connection is up; rebuilding")
+        delay = 0.5
+        for attempt in range(1, attempts + 1):
+            if not self._was_started or not self._connection.is_connected or self._connection.is_reconnecting:
+                return
+            try:
+                await self._rebuild()
+                Logger.info(f"{name}: channel rebuilt; consuming again from {self._queue_name}")
+                self.emit("reconnected")
+                return
+            except Exception as error:
+                Logger.error(f"{name}: rebuilding the channel failed (attempt {attempt}/{attempts}): {error!r}")
+                self._channel = None
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10)
+        Logger.error(f"{name}: giving up rebuilding the channel for {self._configured_queue_name}; the listener is not consuming")
+        self.emit("error", RuntimeError(f"{name}: channel could not be rebuilt"))
 
     # 1.x name.
     restore = _restore
@@ -161,11 +226,12 @@ class BaseListener(EventEmitter):
     async def _reinitialize(self) -> None:
         """Re-create channel, exchange and queue without changing configuration."""
         self._channel = await self._connection.open_channel()
+        self._watch_channel(self._channel)
         if self._late_ack:
             await self._apply_prefetch()
         await self._connection.declare_exchange(
             self._channel, self._exchange_name, self._exchange_type,
-            {"auto_delete": False, "durable": True, "internal": False, "arguments": {}},
+            dict(EXCHANGE_OPTIONS),
         )
         queue_name_to_use = "" if self._is_anonymous else self._configured_queue_name
         self._queue_name = await self._connection.declare_queue(
@@ -217,11 +283,12 @@ class BaseListener(EventEmitter):
         self._configured_queue_name = queue_name or ""
 
         self._channel = await self._connection.open_channel()
+        self._watch_channel(self._channel)
         if self._late_ack:
             await self._apply_prefetch()
         await self._connection.declare_exchange(
             self._channel, self._exchange_name, self._exchange_type,
-            {"auto_delete": False, "durable": True, "internal": False, "arguments": {}},
+            dict(EXCHANGE_OPTIONS),
         )
         self._queue_name = await self._connection.declare_queue(
             self._channel, queue_name or "",

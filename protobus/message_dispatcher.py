@@ -3,6 +3,7 @@ streaming — back to the waiting caller."""
 
 import asyncio
 import uuid
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Deque, Dict, Optional
@@ -10,7 +11,7 @@ from typing import Any, AsyncIterator, Callable, Deque, Dict, Optional
 from .callback_listener import CallbackListener
 from .cancellation import AbortSignal
 from .config import Config
-from .connection import IConnection, attach_restorer
+from .connection import EXCHANGE_OPTIONS, IConnection, attach_restorer
 from .errors import (
     ChannelClosedError,
     DisconnectedError,
@@ -130,7 +131,7 @@ class _StreamEntry:
     """A pending streaming RPC: replies arriving as multiple messages with
     the same correlation id, buffered until the consumer pulls them."""
 
-    __slots__ = ("chunks", "buffered_bytes", "last_seq", "waiter", "ended", "error", "touch")
+    __slots__ = ("chunks", "buffered_bytes", "last_seq", "waiter", "ended", "error", "touch", "on_failure")
 
     def __init__(self) -> None:
         self.chunks: Deque[bytes] = deque()
@@ -140,6 +141,10 @@ class _StreamEntry:
         self.ended = False
         self.error: Optional[BaseException] = None
         self.touch: Optional[Callable[[], None]] = None
+        # Called the moment the dispatcher gives up on the stream (a lost
+        # chunk, a buffer bound): the producer is told to stop right then,
+        # not whenever the consumer next pulls.
+        self.on_failure: Optional[Callable[[], None]] = None
 
     def wake(self, error: Optional[BaseException] = None) -> None:
         waiter, self.waiter = self.waiter, None
@@ -216,13 +221,25 @@ class MessageDispatcher:
         if not self._is_initialized:
             return
         Logger.info("MessageDispatcher: reconnected, re-initializing channel")
-        self._channel = await self._connection.open_channel()
+        await self._open()
         Logger.info("MessageDispatcher: successfully re-initialized after reconnection")
+
+    async def _open(self) -> None:
+        """
+        Open the publishing channel and declare what it publishes to: the bus
+        exchange for requests and the cancel exchange for stream cancellation
+        notices. A caller that starts before any service has declared them
+        would otherwise lose its channel to a NOT_FOUND on first publish.
+        """
+        channel = await self._connection.open_channel()
+        await self._connection.declare_exchange(channel, Config.bus_exchange_name(), "topic", dict(EXCHANGE_OPTIONS))
+        await self._connection.declare_exchange(channel, Config.cancel_exchange_name(), "fanout", dict(EXCHANGE_OPTIONS))
+        self._channel = channel
 
     async def init(self) -> None:
         if self._is_initialized:
             return
-        self._channel = await self._connection.open_channel()
+        await self._open()
         await self._callback_listener.init(self._on_result)
         await self._callback_listener.start()
         self._is_initialized = True
@@ -261,12 +278,9 @@ class MessageDispatcher:
                 stream.wake()
                 return
             if seq > expected:
-                stream.error = StreamSequenceError(
+                self._fail_stream(stream, StreamSequenceError(
                     f"stream {correlation_id} lost at least one chunk: got seq={seq}, expected {expected}"
-                )
-                stream.ended = True
-                self._drop_buffer(stream)
-                stream.wake()
+                ))
                 return
             stream.last_seq = seq
 
@@ -278,15 +292,12 @@ class MessageDispatcher:
             would_be_bytes = stream.buffered_bytes + len(body)
             would_be_total = self._total_buffered_bytes + len(body)
             if len(stream.chunks) + 1 > max_chunks or would_be_bytes > max_bytes or would_be_total > max_total:
-                stream.error = StreamBackpressureError(
+                self._fail_stream(stream, StreamBackpressureError(
                     f"stream {correlation_id} exceeded a buffer limit "
                     f"({len(stream.chunks) + 1} chunks / {would_be_bytes} bytes for this call, "
                     f"{would_be_total} bytes across all calls; limits are {max_chunks} chunks / "
                     f"{max_bytes} bytes / {max_total} bytes total) — the consumer is not keeping up with the producer"
-                )
-                stream.ended = True
-                self._drop_buffer(stream)
-                stream.wake()
+                ))
                 return
             stream.chunks.append(body)
             stream.buffered_bytes = would_be_bytes
@@ -296,6 +307,30 @@ class MessageDispatcher:
         if is_final:
             stream.ended = True
         stream.wake()
+
+    def _fail_stream(self, stream: _StreamEntry, error: BaseException) -> None:
+        """
+        Give up on a stream the dispatcher can no longer deliver correctly.
+
+        The error stays on the entry so the consumer's next pull raises it;
+        everything else — the buffer, the pending slot, and the producer on
+        the other side — is released immediately, because the consumer may
+        not pull again for a long time, or ever.
+        """
+        stream.error = error
+        stream.ended = True
+        self._drop_buffer(stream)
+        if stream.on_failure is not None:
+            stream.on_failure()
+        stream.wake()
+
+    @staticmethod
+    def _forget_stream(dispatcher: "MessageDispatcher", correlation_id: str, stream: _StreamEntry) -> None:
+        """Release a stream whose reply object was dropped without being
+        closed or exhausted, so its buffer and slot do not outlive it."""
+        if dispatcher._pending_streams.get(correlation_id) is stream:
+            dispatcher._pending_streams.pop(correlation_id, None)
+            dispatcher._drop_buffer(stream)
 
     def _drop_buffer(self, stream: _StreamEntry) -> None:
         stream.chunks.clear()
@@ -372,8 +407,10 @@ class MessageDispatcher:
             options.priority = priority
         prio = validate_message_priority(options.priority)
         caller_message_id = validate_message_id(options.message_id)
-        await self._await_publishable()
         rpc = rpc is not False
+        if not rpc:
+            # Fire-and-forget has no deadline: readiness is simply waited for.
+            await self._await_publishable()
 
         correlation_id = str(uuid.uuid4())
         properties: Dict[str, Any] = {
@@ -399,55 +436,106 @@ class MessageDispatcher:
         loop = asyncio.get_running_loop()
         properties = self._with_identity(properties)
         deadline = loop.time() + limit / 1000
+
+        def remaining() -> float:
+            return deadline - loop.time()
+
+        def timed_out(published: Optional[bool]) -> RpcTimeoutError:
+            how_far = {False: "the request was never published", True: "the request was confirmed but no reply came"}.get(
+                published, "the broker confirm was still outstanding, so the request may or may not have been delivered"  # type: ignore[arg-type]
+            )
+            return RpcTimeoutError(
+                f"no reply for {routing_key} (correlationId {correlation_id}) within {limit}ms: {how_far}", published,
+            )
+
+        # Readiness counts against the deadline: a caller parked on a
+        # reconnection is told at its own deadline, not the connection's.
+        try:
+            await asyncio.wait_for(self._await_publishable(), timeout=max(0.0, remaining()))
+        except asyncio.TimeoutError:
+            raise timed_out(False) from None
+
         republished = False
-
         while True:
-            remaining_ms = max(1, int((deadline - loop.time()) * 1000))
+            if remaining() <= 0:
+                # After a lost channel the first copy's fate is unknown.
+                raise timed_out(None if republished else False)
             future: "asyncio.Future[bytes]" = loop.create_future()
-
-            # Arm the reply callback BEFORE publishing: a fast service can reply
+            # Arm the reply slot BEFORE publishing: a fast service can reply
             # while the confirm is still in flight.
-            def on_timeout(future: "asyncio.Future[bytes]" = future) -> None:
-                entry = self._callbacks.get(correlation_id)
-                if entry is not None and entry.future is future:
-                    self._callbacks.pop(correlation_id, None)
-                    if not future.done():
-                        future.set_exception(RpcTimeoutError(
-                            f"no reply for {routing_key} (correlationId {correlation_id}) within {limit}ms"
-                        ))
-
-            timer = loop.call_later(remaining_ms / 1000, on_timeout)
-            self._callbacks[correlation_id] = _CallbackEntry(future, timer)
-
+            self._callbacks[correlation_id] = _CallbackEntry(future, None)
+            publish: "asyncio.Future[None]" = asyncio.ensure_future(self._connection.publish(
+                self._channel, Config.bus_exchange_name(), routing_key, content, self._reply_to(properties),
+            ))
             try:
+                await asyncio.wait({publish, future}, timeout=max(0.0, remaining()), return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                # The caller gave up. Nothing owns the publish any more; it is
+                # cancelled in turn, which _confirmed_publish handles.
+                publish.cancel()
+                self._release_callback(correlation_id, future)
+                raise
+
+            if future.done() and not future.cancelled() and future.exception() is None:
+                # Replied, possibly before the confirm. The publish finishes
+                # on its own; its outcome no longer matters to this call.
+                self._detach_publish(publish, correlation_id)
+                self._release_callback(correlation_id, future)
+                return future.result()
+
+            if future.done() and not publish.done():
+                # The reply slot was failed by a disconnection while the
+                # publish is still settling. Its outcome decides what this
+                # is: a channel lost mid-send is republished once below, a
+                # confirmed send makes it a genuine DisconnectedError.
                 try:
-                    await self._connection.publish(
-                        self._channel, Config.bus_exchange_name(), routing_key, content, self._reply_to(properties),
-                    )
-                except ChannelClosedError:
-                    # The socket died underneath the publish. When that is a
-                    # disconnection (rather than a channel-level failure on a
-                    # live connection), the request is repeated once on the
-                    # restored channel under the same message id — see
-                    # _publish_on_the_bus — with the reply slot re-armed, since
-                    # the disconnect will have failed the one armed above.
-                    if republished or (self._connection.is_connected and not self._connection.is_reconnecting):
-                        raise
-                    republished = True
-                    self._release_callback(correlation_id, timer)
-                    Logger.debug(f"request {correlation_id} lost its channel to a disconnection; republishing once after recovery")
-                    await self._await_publishable()
-                    continue
-                except BaseException:
-                    # The request never made it, so no reply is coming. Release
-                    # the slot now and surface the publish failure — it wins over
-                    # a deadline that may have expired meanwhile.
-                    self._release_callback(correlation_id, timer)
+                    await asyncio.wait({publish}, timeout=max(0.0, remaining()))
+                except asyncio.CancelledError:
+                    publish.cancel()
+                    self._release_callback(correlation_id, future)
                     raise
-                return await future
-            finally:
-                # Cancellation-safe: whatever ended the wait, the slot is freed.
-                self._release_callback(correlation_id, timer)
+
+            if publish.done():
+                error = publish.exception()
+                if error is None:
+                    # Confirmed. Wait out the rest of the deadline for the reply
+                    # (a slot already failed by a disconnection raises at once).
+                    try:
+                        replied, _ = await asyncio.wait({future}, timeout=max(0.0, remaining()))
+                    except asyncio.CancelledError:
+                        self._release_callback(correlation_id, future)
+                        raise
+                    self._release_callback(correlation_id, future)
+                    if not replied:
+                        raise timed_out(True)
+                    return future.result()  # raises DisconnectedError etc. when the socket dropped
+                self._release_callback(correlation_id, future)
+                if isinstance(error, ChannelClosedError) and not republished and not (
+                    self._connection.is_connected and not self._connection.is_reconnecting
+                ):
+                    # The socket died underneath the publish. The request is
+                    # repeated once on the restored channel under the same
+                    # message id — the outcome of the first copy is unknown,
+                    # and a consumer that did receive it can recognise the
+                    # second — if the deadline still allows it.
+                    republished = True
+                    Logger.debug(f"request {correlation_id} lost its channel to a disconnection; republishing once after recovery")
+                    try:
+                        await asyncio.wait_for(self._await_publishable(), timeout=max(0.0, remaining()))
+                    except asyncio.TimeoutError:
+                        raise timed_out(None) from None
+                    continue
+                # A publish failure wins over the deadline: "the request never
+                # left" is the more specific answer.
+                raise error
+
+            # Deadline, with the confirm still outstanding: the broker may or
+            # may not hold the request. It is not republished, and the
+            # publish is left to settle on its own rather than cancelled
+            # mid-send.
+            self._detach_publish(publish, correlation_id)
+            self._release_callback(correlation_id, future)
+            raise timed_out(None)
 
     @staticmethod
     def _with_identity(properties: Dict[str, Any]) -> Dict[str, Any]:
@@ -458,13 +546,40 @@ class MessageDispatcher:
             return properties
         return {**properties, "message_id": str(uuid.uuid4())}
 
-    def _release_callback(self, correlation_id: str, timer: asyncio.TimerHandle) -> None:
-        timer.cancel()
+    def _release_callback(self, correlation_id: str, future: "asyncio.Future[bytes]") -> None:
+        """
+        Free a reply slot on any exit, and make sure the local future can
+        never report an unretrieved exception: a disconnection fails it
+        whether or not anyone is still waiting on it.
+        """
         entry = self._callbacks.get(correlation_id)
-        if entry is not None and entry.timer is timer:
+        if entry is not None and entry.future is future:
             self._callbacks.pop(correlation_id, None)
-            if not entry.future.done():
-                entry.future.cancel()
+            if entry.timer is not None:
+                entry.timer.cancel()
+        if future.done():
+            if not future.cancelled():
+                future.exception()
+        else:
+            future.cancel()
+
+    @staticmethod
+    def _detach_publish(publish: "asyncio.Future[None]", correlation_id: str) -> None:
+        """Let a publish nobody waits for any more run to completion, and
+        consume its outcome so the loop never reports it as unretrieved."""
+        if publish.done():
+            if not publish.cancelled():
+                publish.exception()
+            return
+
+        def consume(task: "asyncio.Future[None]") -> None:
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                Logger.debug(f"request {correlation_id}: publish settled after the call ended: {error!r}")
+
+        publish.add_done_callback(consume)
 
     def publish_streaming(
         self,
@@ -510,10 +625,17 @@ class StreamingReply:
         self._released = False
         self._signal = options.signal
         self._publish_task: Optional["asyncio.Task[None]"] = None
+        # Where the request is on its way to the broker. "unsent" can still
+        # be withdrawn; "sending" is ambiguous; "sent" was confirmed.
+        self._publish_state = "unsent"
         self._loop = asyncio.get_running_loop()
 
         dispatcher._pending_streams[self._id] = self._stream
         self._stream.touch = self._arm_idle
+        self._stream.on_failure = lambda: self._cancel(notify_only=True)
+        # A reply dropped without being closed or exhausted must not keep its
+        # buffer and slot alive in the dispatcher.
+        weakref.finalize(self, MessageDispatcher._forget_stream, dispatcher, self._id, self._stream)
 
         aborted_before_start = self._signal is not None and self._signal.aborted
         if self._signal is not None and not aborted_before_start:
@@ -540,6 +662,12 @@ class StreamingReply:
             when_ready = getattr(self._dispatcher._connection, "when_ready", None)
             if callable(when_ready):
                 await when_ready()
+            if self._cancelled:
+                # Closed while waiting for the connection: the request never
+                # existed at the server, so there is nothing to send and
+                # nothing to cancel.
+                return
+            self._publish_state = "sending"
             await self._dispatcher._publish_on_the_bus(
                 routing_key, content,
                 {
@@ -550,11 +678,16 @@ class StreamingReply:
                     "message_id": str(uuid.uuid4()),
                 },
             )
+            self._publish_state = "sent"
         except asyncio.CancelledError:
             raise
         except BaseException as err:
+            self._publish_state = "failed"
             self._stream.error = err
             self._stream.ended = True
+            # Nothing is coming: release now rather than on the next pull,
+            # which may never happen. The error stays for the consumer.
+            self._release_call()
             self._stream.wake(err)
 
     # -- idle deadline --------------------------------------------------------
@@ -617,6 +750,26 @@ class StreamingReply:
             self._stream.wake()
 
         Logger.debug(f"cancelling stream {self._id}")
+        task = self._publish_task
+        if task is not None and not task.done():
+            if self._publish_state == "unsent":
+                # Still parked on readiness: withdraw it. Nothing reached the
+                # server, so there is nothing to tell the server about.
+                task.cancel()
+                return
+            # Mid-send. The notice must not overtake the request it cancels,
+            # so it goes out once the send has settled.
+            task.add_done_callback(lambda _t: self._notify())
+            return
+        self._notify()
+
+    def _notify(self) -> None:
+        """Tell the producer to stop, if a request may have reached it."""
+        if self._publish_state == "unsent":
+            return
+        if self._publish_state == "failed" and not isinstance(self._stream.error, ChannelClosedError):
+            # A definite publish failure: the server never saw the request.
+            return
         dispatcher = self._dispatcher
         channel = dispatcher._channel
         if channel is None:
@@ -644,14 +797,21 @@ class StreamingReply:
         return self
 
     async def __anext__(self) -> bytes:
-        # Wait for the publish to settle once before consuming.
+        try:
+            return await self._next()
+        except asyncio.CancelledError:
+            # The consuming task is going away, so nobody will read what the
+            # producer sends next: stop it, as closing the stream would,
+            # rather than letting it run to completion for nothing.
+            self._cancel()
+            raise
+
+    async def _next(self) -> bytes:
+        # Wait for the publish to settle once before consuming. Its outcome
+        # is already on the entry (an error, or nothing); a publish that was
+        # withdrawn by cancellation must not surface here as CancelledError.
         if self._publish_task is not None:
-            try:
-                await asyncio.shield(self._publish_task)
-            except asyncio.CancelledError:
-                raise
-            except BaseException:
-                pass
+            await asyncio.wait({self._publish_task})
             self._publish_task = None
 
         stream = self._stream
@@ -676,10 +836,6 @@ class StreamingReply:
             except asyncio.CancelledError:
                 if stream.waiter is waiter:
                     stream.waiter = None
-                # The consuming task is going away, so nobody will read what
-                # the producer sends next: stop it, as closing the stream
-                # would, rather than letting it run to completion for nothing.
-                self._cancel()
                 raise
             except BaseException:
                 # The error is on the entry; the loop above raises it.

@@ -22,7 +22,7 @@ from protobus import (
 )
 from protobus.logger import DefaultLogger
 
-from ..helpers import FakeHandle, tick
+from ..helpers import FakeConnection, FakeHandle, tick
 
 FAST = ReconnectionOptions(max_retries=5, initial_delay_ms=1, max_delay_ms=5)
 
@@ -513,3 +513,76 @@ class TestConnectionLifecycle:
         await settle()
         assert events == ["disconnected", ("reconnecting", 1), "reconnected"]
         await conn.disconnect()
+
+
+class TestALostChannelOnALiveConnectionIsRebuilt:
+    """A 404 on a retry exchange or a 406 on a declare closes the channel a
+    listener consumes on, and its consumer with it, while the socket stays
+    up. The connection's restoration never runs for that; the listener has
+    to notice and rebuild itself."""
+
+    async def listener(self):
+        from protobus import MessageListener, RetryOptions
+
+        conn = FakeConnection()
+        listener = MessageListener(conn, True, 1, RetryOptions(max_retries=0), None, None)
+
+        async def handler(*_a):
+            pass
+
+        await listener.init(handler, "Svc")
+        await listener.subscribe("REQUEST.Svc.*")
+        await listener.start()
+        return conn, listener
+
+    async def test_the_listener_consumes_again_on_a_fresh_channel(self):
+        conn, listener = await self.listener()
+        first = listener.channel
+        assert len(conn.consumes) == 1
+        await first.close()  # the broker closed it: a channel-level error
+        await tick(3)
+        assert listener.channel is not None and listener.channel is not first
+        assert len(conn.consumes) == 2
+        assert conn.consumes[-1]["channel"] is listener.channel
+        assert [b["routing_key"] for b in conn.bindings][-1] == "REQUEST.Svc.*"
+
+    async def test_not_while_the_connection_itself_is_being_restored(self):
+        conn, listener = await self.listener()
+        first = listener.channel
+        conn.is_connected = False
+        conn.is_reconnecting = True
+        await first.close()
+        await tick(3)
+        # The connection's own restoration owns this case.
+        assert len(conn.consumes) == 1
+
+    async def test_not_after_the_listener_stopped(self):
+        conn, listener = await self.listener()
+        first = listener.channel
+        await listener.stop_consuming()
+        await first.close()
+        await tick(3)
+        assert len(conn.consumes) == 1
+
+    async def test_keeps_trying_while_the_rebuild_fails(self, monkeypatch):
+        conn, listener = await self.listener()
+        first = listener.channel
+        attempts = []
+        real = conn.declare_queue
+
+        async def flaky(channel, name, options=None):
+            attempts.append(name)
+            if len(attempts) < 3:
+                raise RuntimeError("PRECONDITION_FAILED")
+            return await real(channel, name, options)
+
+        conn.declare_queue = flaky
+        monkeypatch.setattr(asyncio, "sleep", lambda _s: real_sleep(0))
+        await first.close()
+        for _ in range(30):
+            await real_sleep(0)
+        assert len(conn.consumes) == 2
+        assert len(attempts) == 3
+
+
+real_sleep = asyncio.sleep

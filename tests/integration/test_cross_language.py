@@ -67,7 +67,9 @@ package Wallet{SUFFIX};
 message Balance {{ bigint amount = 1; timestamp as_of = 2; int64 big = 3; repeated string tags = 4; map<string, int32> counts = 5; }}
 message Query {{ string account = 1; int32 zero = 2; }}
 message Ping {{ string id = 1; bigint n = 2; }}
-service Api {{ rpc balance (Query) returns (Balance); }}"""
+message Produced {{ int32 yielded = 1; bool stopped_early = 2; bool finished = 3; }}
+message Nothing {{}}
+service Api {{ rpc balance (Query) returns (Balance); rpc produced (Nothing) returns (Produced); }}"""
 
 
 class TestPythonClientToTypeScriptServer:
@@ -96,7 +98,10 @@ class TestPythonClientToTypeScriptServer:
         assert "deliberate failure" in info.value.message
 
     async def test_cancellation_reaches_the_typescript_producer(self, stack):
-        _, counter = stack
+        context, counter = stack
+        context.factory.parse(WALLET_PROTO, f"Wallet{SUFFIX}.Api")
+        wallet = ServiceProxy(context, f"Wallet{SUFFIX}.Api")
+        await wallet.init()
         received = []
         async with counter.tick({"count": 500, "delay_ms": 10}) as stream:
             async for c in stream:
@@ -104,6 +109,15 @@ class TestPythonClientToTypeScriptServer:
                 if len(received) == 3:
                     break
         assert len(received) == 3
+        # The assertion that matters is on the OTHER side: the TypeScript
+        # generator saw its signal abort and returned, well short of 500.
+        for _ in range(50):
+            produced = await wallet.produced({})
+            if produced["stopped_early"]:
+                break
+            await asyncio.sleep(0.1)
+        assert produced["stopped_early"] is True and produced["finished"] is False
+        assert produced["yielded"] < 500
 
     async def test_custom_types_defaults_and_maps_cross_the_wire(self, stack):
         context, _ = stack

@@ -338,9 +338,9 @@ will now only arrive as a timeout.
 |---|---|---|---|
 | Caller → `proto.bus` → service queue | protobus | yes, and `mandatory` for RPC | the caller sees `PublishNackedError` / `UnroutableError` (definite) or `PublishConfirmTimeoutError` / `ChannelClosedError` (ambiguous) |
 | Service queue → handler | RabbitMQ | acked late | a dead replica's delivery is redelivered |
-| Failed delivery → `<Service>.Retry.Exchange` | protobus | yes — the original is acked only after the confirm | the original stays unacked and is redelivered |
+| Failed delivery → `<Service>.Retry.Exchange` | protobus | yes, and `mandatory` — the original is acked only after the confirm | the original is returned to the queue after a short pause and redelivered; if the failed publish was ambiguous (a confirm timeout) the retry copy may exist too, so it may run twice under the same `message_id` |
 | `<Service>.Retry` → `proto.bus` on TTL expiry | **RabbitMQ** | **no** | **silent loss; the caller sees only an RPC timeout** |
-| Exhausted retries → `<Service>.DLQ` | protobus | yes — a fresh publish, not a dead-lettering | the original stays unacked and is redelivered |
+| Exhausted retries → `<Service>.DLQ` | protobus | yes, and `mandatory` — a fresh publish, not a dead-lettering | as above: returned to the queue and redelivered |
 | Reply → caller's callback queue | protobus | yes | the caller sees an RPC timeout |
 
 Only one row is unconfirmed, and it is reached only by a message that has

@@ -73,6 +73,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ArielLaub/protobus
+          # The TypeScript revision this release is verified against: 2.4.0.
+          # Pinned so a change on the other side cannot silently alter what
+          # "wire-compatible" was tested to mean. Bump deliberately.
+          ref: ba7a9bd1694159bd6c4caf749f6551fc493a482e
           path: protobus
       - uses: actions/setup-python@v5
         with:

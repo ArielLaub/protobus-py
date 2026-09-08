@@ -160,6 +160,66 @@ A major, because the wire and the API both change. The migration guide is
   exported span several packages, so two packages each declaring `Service`
   and `Request` no longer collapse onto the same classes.
 
+### Fixed in the release candidate
+
+Findings from the pre-release review of `0f3ad45`, each with a regression
+test; the reviewer's probe script now reports the fixed behaviour on every
+item.
+
+- **A publisher no longer depends on a subscriber having started first.**
+  The message and event dispatchers declare `proto.bus`, `proto.bus.events`
+  and `proto.bus.cancel` on their own channel, with the one set of options
+  every listener uses, at init and on restoration. Publishing an event on an
+  empty vhost — the case that failed in CI — confirms; a request to a
+  service nobody runs is `UnroutableError`, not a closed channel.
+- **A cooperatively cancelled delivery is settled.** A producer that raises
+  through `signal.throw_if_aborted()` after the caller cancelled is
+  acknowledged as cancelled work, not left unacknowledged holding the
+  worker's prefetch. Cancellation of the consumer task itself still
+  propagates.
+- **Stream lifecycle.** A stream closed before its request went out is
+  withdrawn — nothing is published, no notice is sent; a stream closed
+  mid-send holds its notice until the send settles, so it cannot overtake the
+  request. A consumer task cancelled while the request is still publishing
+  cleans up like one cancelled while waiting for a chunk. A buffer bound or
+  a sequence gap stops the producer and releases the slot immediately, not on
+  the consumer's next pull; the error is still what that pull raises. A
+  publish failure releases the slot without a pull. A reply object dropped
+  without being closed is released by a finalizer.
+- **The encoding wrapper closes the handler's iterator** in a `finally`, so
+  an upstream resource — an HTTP stream to a model provider — is released
+  when the stream is cancelled, not when the generator is collected.
+- **The RPC deadline bounds the whole call**: readiness, the broker confirm
+  and the reply. A stalled confirm no longer extends a 5 ms budget to the
+  30 s confirm timeout; nothing is republished after the deadline; the reply
+  slot is released and its future's exception retrieved on every exit, so a
+  late nack never surfaces as "Future exception was never retrieved".
+  `RpcTimeoutError.published` reports how far the call got (`False` never
+  left, `True` confirmed, `None` ambiguous).
+- **A failed settlement no longer occupies the worker.** When the retry or
+  DLQ publish fails, the original is returned to the queue after a one-second
+  pause rather than left unacknowledged on an open channel. The retry and
+  DLQ copies are published `mandatory`, so a missing destination fails the
+  settlement instead of confirming into nothing. A channel the broker closes
+  on a live connection (a 404 on a deleted retry exchange) is rebuilt by its
+  listener — queue, bindings, retry topology, consumer — and the
+  connection's restoration re-declares retry/DLQ objects and bindings
+  before consuming resumes. Both verified against a live broker on a fresh
+  vhost.
+- **Validation errors never carry the value.** `FieldTypeError` and
+  `FieldValueError` name the field and the value's type; the codec's or
+  protobuf's own text, which may quote the value, is chained on
+  `__cause__` for the caller's process only. Every sink at every level is
+  covered by a test with synthetic secrets in every field kind.
+- **`protobus generate` handles legal protobuf names Python cannot.** A
+  keyword field (`from`) uses the functional `TypedDict` form, keeping the
+  wire key; a keyword message or enum name gets a trailing underscore; two
+  protobuf names that would flatten onto one Python name, and an rpc named
+  by a keyword, fail with `GenerationError` before any output is written.
+- CI pins the TypeScript checkout to the 2.4.0 release commit, and the
+  cross-language cancellation test asserts on the TypeScript producer's own
+  counter that it stopped.
+
 ### Removed
 
 - JSON payload mode and the `protoc` fallback.

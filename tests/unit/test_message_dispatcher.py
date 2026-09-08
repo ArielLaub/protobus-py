@@ -126,15 +126,84 @@ class TestAReplyDeadlineThatExpiresWhileTheConfirmIsInFlight:
             await call
         assert len(d.pending_callbacks) == 0
 
-    async def test_reports_the_publish_failure_not_the_deadline_when_both_happen(self):
+    async def test_the_deadline_bounds_the_confirm_wait_and_a_late_nack_is_consumed(self):
+        # The RPC budget is the caller's whole budget: a stalled confirm does
+        # not extend it to the 30s publish-confirm timeout. The outcome is
+        # reported as ambiguous, and the confirm that lands afterwards is
+        # retrieved rather than left as an unhandled future exception.
         conn = SlowConfirmConnection()
         d, _ = await dispatcher(conn)
         call = asyncio.ensure_future(d.publish(b"x", "REQUEST.A.B.c", True, 20))
         await asyncio.sleep(0.05)
+        assert call.done()
+        with pytest.raises(RpcTimeoutError) as info:
+            await call
+        assert info.value.published is None
+        assert len(d.pending_callbacks) == 0
+        unhandled = []
+        asyncio.get_running_loop().set_exception_handler(lambda _l, ctx: unhandled.append(ctx))
+        conn.fail_confirm(RuntimeError("NACK"))
+        await tick(3)
+        import gc
+        gc.collect()
+        await tick(2)
+        assert unhandled == []
+
+    async def test_reports_the_publish_failure_not_the_deadline_when_it_lands_first(self):
+        conn = SlowConfirmConnection()
+        d, _ = await dispatcher(conn)
+        call = asyncio.ensure_future(d.publish(b"x", "REQUEST.A.B.c", True, 200))
+        await asyncio.sleep(0.02)
         conn.fail_confirm(RuntimeError("NACK"))
         with pytest.raises(RuntimeError, match="NACK"):
             await call
         assert len(d.pending_callbacks) == 0
+
+    async def test_no_republish_after_the_deadline_expires_during_recovery(self):
+        from protobus import ChannelClosedError
+
+        conn = FakeConnection()
+        d, _ = await dispatcher(conn)
+        ready = asyncio.Event()
+
+        async def lost_channel(*_a, **_k):
+            conn.is_connected, conn.is_reconnecting = False, True
+            raise ChannelClosedError("socket died under the publish", "m1")
+
+        async def when_ready(timeout_ms=None):
+            if conn.is_reconnecting:
+                await ready.wait()
+
+        conn.publish_hook = lost_channel
+        conn.when_ready = when_ready
+        with pytest.raises(RpcTimeoutError) as info:
+            await d.publish(b"x", "REQUEST.A.B.c", True, 30)
+        assert info.value.published is None  # the first copy's fate is unknown
+        assert len(conn.publishes) == 1
+        conn.publish_hook = None
+        ready.set()
+        await tick(3)
+        assert len(conn.publishes) == 1  # not republished after the budget
+
+    async def test_readiness_counts_against_the_deadline(self):
+        conn = FakeConnection()
+        d, _ = await dispatcher(conn)
+        conn.is_reconnecting = True
+        conn.is_connected = False
+        ready = asyncio.Event()
+
+        async def when_ready(timeout_ms=None):
+            await ready.wait()
+
+        conn.when_ready = when_ready
+        with pytest.raises(RpcTimeoutError) as info:
+            await d.publish(b"x", "REQUEST.A.B.c", True, 20)
+        assert info.value.published is False
+        assert conn.publishes == []
+        ready.set()
+        await tick(2)
+        # Nothing is published after the deadline either.
+        assert conn.publishes == []
 
     async def test_surfaces_a_disconnect_that_lands_while_the_confirm_is_pending(self):
         conn = SlowConfirmConnection()

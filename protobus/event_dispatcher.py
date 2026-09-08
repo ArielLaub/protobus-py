@@ -4,7 +4,7 @@ import uuid
 from typing import Any, Optional
 
 from .config import Config
-from .connection import IConnection, attach_restorer
+from .connection import EXCHANGE_OPTIONS, IConnection, attach_restorer
 from .errors import ChannelClosedError, InvalidMessageError, NotConnectedError
 from .logger import Logger
 from .message_factory import MessageFactory
@@ -38,13 +38,25 @@ class EventDispatcher:
         if not self._is_initialized:
             return
         Logger.info("EventDispatcher: reconnected, re-initializing channel")
-        self._channel = await self._connection.open_channel()
+        await self._open()
         Logger.info("EventDispatcher: successfully re-initialized after reconnection")
+
+    async def _open(self) -> None:
+        """
+        Open the publishing channel and declare the events exchange on it.
+
+        A publisher must not depend on a subscriber having started first: an
+        event with no subscribers is a normal outcome, but an event published
+        to an exchange nobody has declared is a channel-closing NOT_FOUND.
+        """
+        channel = await self._connection.open_channel()
+        await self._connection.declare_exchange(channel, Config.events_exchange_name(), "topic", dict(EXCHANGE_OPTIONS))
+        self._channel = channel
 
     async def init(self) -> None:
         if self._is_initialized:
             return
-        self._channel = await self._connection.open_channel()
+        await self._open()
         self._is_initialized = True
 
     async def publish(self, event_type: str, content: Any, topic: Optional[str] = None) -> None:

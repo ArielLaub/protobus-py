@@ -65,6 +65,31 @@ class TestQueueDeclarationIsUnchangedUnlessMaxPriorityIsAskedFor:
             await listener._reinitialize()
             assert args_for(conn, "Svc") == expected
 
+    async def test_the_retry_ladder_is_declared_again_on_restoration(self):
+        conn = FakeConnection()
+        listener = MessageListener(conn, True, 1, RetryOptions(max_retries=2, retry_delay_ms=250), None, None)
+        await listener.init(noop, "Svc")
+        await listener.subscribe("REQUEST.Svc.*")
+        await listener.start()
+        conn.declared_queues.clear()
+        conn.declared_exchanges.clear()
+        conn.bindings.clear()
+        conn.operations.clear()
+        await conn.reconnect_now()
+        assert {q["queue"] for q in conn.declared_queues} == {"Svc", "Svc.DLQ", "Svc.Retry"}
+        assert "Svc.Retry.Exchange" in {e["exchange"] for e in conn.declared_exchanges}
+        assert {"queue": "Svc.Retry", "exchange": "Svc.Retry.Exchange", "routing_key": "#"} in conn.bindings
+        order = [k for k, _ in conn.operations]
+        assert order.index("declare_queue:Svc.Retry") < order.index("consume")
+
+    async def test_a_listener_that_never_subscribed_restores_no_ladder(self):
+        conn = FakeConnection()
+        listener = MessageListener(conn, True, 1, RetryOptions(max_retries=2, retry_delay_ms=250), None, None)
+        await listener.init(noop, "Svc")
+        conn.declared_queues.clear()
+        await conn.reconnect_now()
+        assert [q["queue"] for q in conn.declared_queues] == ["Svc"]
+
     async def test_leaves_the_retry_queue_and_dlq_arguments_untouched(self):
         conn = FakeConnection()
         listener = MessageListener(conn, True, 1, RetryOptions(3, 5000), None, 2)

@@ -25,7 +25,7 @@ Every row is verified against the class in [`protobus/errors.py`](../../protobus
 | `InternalServiceError` | `INTERNAL_ERROR` | the error boundary, replacing an unhandled exception | the *original* error was retried to exhaustion first | join the `correlationId` in the message to the service's own log |
 | `TimeoutError` (protobus's) | `PROCESSING_TIMEOUT` | the connection layer, when a handler outruns `MESSAGE_PROCESSING_TIMEOUT` | yes — it climbs the ladder | the handler is slower than its budget |
 | `RemoteError` | whatever the service sent | `ServiceProxy`, in the **caller**, for any error a service answered with | no | switch on `.code` |
-| `RpcTimeoutError` | `RPC_TIMEOUT` | `MessageDispatcher`, in the **caller** | no | nothing consumed the request, or the handler is slower than the budget |
+| `RpcTimeoutError` | `RPC_TIMEOUT` | `MessageDispatcher`, in the **caller** | no | read `.published`: `False` never left, `True` confirmed but unanswered, `None` ambiguous |
 | `DisconnectedError` | — | `MessageDispatcher`, when the socket drops mid-call | no | the outcome is unknown; reissue only if the call is idempotent |
 | `NotReadyError` | `NOT_READY` | `Connection.when_ready()` | no | nothing was published — safe to retry |
 | `ReconnectionError` | — | `Connection`, on giving up or being torn down mid-restore | no | the connection is finished; build a new one or exit |
@@ -37,7 +37,8 @@ Every row is verified against the class in [`protobus/errors.py`](../../protobus
 | `StreamBackpressureError` | — | the dispatcher, when a stream's buffer bound is exceeded | no | consume faster, or raise the bound |
 | `StreamSequenceError` | — | the dispatcher, on a gap in `x-protobus-seq` | no | a chunk was lost; the partial stream is deliberately not yielded |
 | `StreamClosedError` | — | **nothing raises it; kept for parity with the TypeScript export** | — | see [Streaming errors](#streaming-errors) |
-| `InvalidRequestError` | — | `ServiceProxy`, when the request dict does not fit the request message | no | fix the request; `__cause__` names the field |
+| `InvalidRequestError` | — | `ServiceProxy`, when the request dict does not fit the request message | no | fix the request; `__cause__` is a `FieldTypeError` / `FieldValueError` naming the field |
+| `FieldTypeError` / `FieldValueError` | — | the message factory, for a value that does not fit its field | no | the message names the field and the value's **type**, never the value; the codec's own text is on `__cause__` |
 | `InvalidMessageError` | — | `Context.publish_event`, when the event does not fit its message | no | same |
 | `InvalidMessageIdError` | — | `MessageDispatcher`, on a blank or over-long `CallOptions.message_id` | no | pass a non-empty id of at most 255 bytes, or none at all |
 | `CustomTypeConflictError` | — | `register_custom_type`, on a name re-registered with a different `wire_type` | no | use a different name, or keep the original wire type |
@@ -157,9 +158,17 @@ What a `ServiceProxy` call raises for any error the **service** answered with: `
 
 No reply arrived within the budget. The default is `Config.rpc_call_timeout_ms()`, `RPC_CALL_TIMEOUT_MS`, **600000 ms** ([`protobus/config.py`](../../protobus/config.py)); a per-call `timeout_ms` argument overrides it.
 
-The timer is armed *before* the publish, and firing it deletes the pending entry, so an unanswered request cannot leak. The message names the routing key and the correlation id.
+The deadline bounds the **whole call**: waiting for a usable connection, the broker confirm, and the reply. A confirm that stalls does not extend the caller's wait to the 30-second `PUBLISH_CONFIRM_TIMEOUT_MS`, and a call parked on a reconnection is told at its own deadline. Nothing is republished after the deadline, and the reply slot is released on every exit.
 
-Three things produce it: nothing is bound to the routing key and the publish was not `mandatory`, the handler died without replying, or the handler is genuinely slower than the budget. Size the budget against `max_retries × retry_delay_ms`, not against one handler run.
+`published` says how far the call got, because a deadline is not proof that nothing happened:
+
+| `published` | Meaning | Retry? |
+|---|---|---|
+| `False` | the request never left — readiness, or the deadline, came first | safe |
+| `True` | the broker confirmed it and no reply came: nothing consumed it, the handler died, or it is slower than the budget | the handler may have run |
+| `None` | the confirm was still outstanding, or a lost channel left the first copy's fate unknown | may duplicate |
+
+Size the budget against `max_retries × retry_delay_ms`, not against one handler run.
 
 ### `DisconnectedError`
 

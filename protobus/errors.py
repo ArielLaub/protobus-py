@@ -277,13 +277,21 @@ class CustomTypeConflictError(Exception):
 
 class RpcTimeoutError(Exception):
     """
-    A unary RPC call got no reply within its timeout.
+    A unary RPC call ran out of its deadline.
 
-    Happens whenever nothing is bound to the routing key, the exchange drops
-    the message, or the handler dies without replying.
+    The deadline bounds the whole call — waiting for a usable connection,
+    the broker confirm, and the reply — so ``published`` says how far it
+    got: ``False`` means the request never left (safe to retry), ``True``
+    means the broker confirmed it and no reply came (the handler may have
+    run, or nothing is bound to the routing key), ``None`` means the confirm
+    itself was still outstanding — the broker may or may not hold it.
     """
 
     code = "RPC_TIMEOUT"
+
+    def __init__(self, message: str, published: Optional[bool] = None) -> None:
+        super().__init__(message)
+        self.published = published
 
 
 class PublishError(Exception):

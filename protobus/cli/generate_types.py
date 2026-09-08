@@ -11,6 +11,7 @@ the exact signatures ``ServiceProxy`` installs — a unary method is an
 The counterpart of the TypeScript port's ``exportTS()`` / ``protobus generate``.
 """
 
+import keyword
 import os
 import re
 from pathlib import Path
@@ -42,11 +43,22 @@ _SCALARS: Dict[int, str] = {
 }
 
 
+class GenerationError(ValueError):
+    """The schema is legal protobuf but cannot be expressed as the Python
+    the generator writes. Raised before any output is written."""
+
+
 def _class_name(full_name: str, package: str) -> str:
     """``Combat.Player.Nested`` with ``Combat`` stripped -> ``Player_Nested``;
-    a type from any other package keeps its package as a prefix."""
+    a type from any other package keeps its package as a prefix. A name that
+    is a Python keyword (``class``, ``from``) gets a trailing underscore, as
+    PEP 8 suggests; it is a legal protobuf identifier and must still have a
+    class."""
     name = full_name[len(package) + 1:] if package and full_name.startswith(package + ".") else full_name
-    return name.replace(".", "_")
+    name = name.replace(".", "_")
+    if keyword.iskeyword(name):
+        name += "_"
+    return name
 
 
 class _Emitter:
@@ -59,6 +71,10 @@ class _Emitter:
         self.strip_package = strip_package
         self.lines: List[str] = []
         self.emitted: Set[str] = set()
+        # Generated name -> the protobuf name it came from, so two protobuf
+        # names flattening onto one Python name is a refusal, not a silently
+        # overwritten class.
+        self.claimed: Dict[str, str] = {}
         self.uses_datetime = False
         self.uses_literal = False
         self.uses_any = False
@@ -95,8 +111,18 @@ class _Emitter:
             return f"Optional[{base}]"
         return base
 
+    def claim(self, full_name: str) -> str:
+        """The Python name for a protobuf name, refusing a collision."""
+        name = _class_name(full_name, self.strip_package)
+        owner = self.claimed.setdefault(name, full_name)
+        if owner != full_name:
+            raise GenerationError(
+                f"'{full_name}' and '{owner}' would both be generated as '{name}'; "
+                "rename one of them, or generate their packages separately"
+            )
+        return name
+
     def emit_type(self, full_name: str) -> None:
-        package = self.strip_package
         if full_name in self.emitted:
             return
         self.emitted.add(full_name)
@@ -104,7 +130,7 @@ class _Emitter:
         if isinstance(descriptor, EnumDescriptor):
             self.uses_literal = True
             names = ", ".join(f'"{v.name}"' for v in descriptor.values)
-            self.lines.append(f"{_class_name(full_name, package)} = Literal[{names}]")
+            self.lines.append(f"{self.claim(full_name)} = Literal[{names}]")
             self.lines.append("")
             return
         if not isinstance(descriptor, Descriptor):
@@ -112,22 +138,36 @@ class _Emitter:
         if descriptor.GetOptions().map_entry:
             return
         pending: List[str] = []
-        body = []
-        for field in descriptor.fields:
-            body.append(f"    {field.name}: {self.field_type(field, pending)}")
-        self.lines.append(f"class {_class_name(full_name, package)}(TypedDict, total=False):")
-        self.lines.extend(body or ["    pass"])
+        fields = [(field.name, self.field_type(field, pending)) for field in descriptor.fields]
+        class_name = self.claim(full_name)
+        if any(keyword.iskeyword(name) or not name.isidentifier() for name, _ in fields):
+            # A field named `from` is legal protobuf and a legal dict key,
+            # but not a legal attribute in a class-based TypedDict. The
+            # functional form keeps the wire key exactly as declared.
+            entries = ", ".join(f'"{name}": {annotation}' for name, annotation in fields)
+            self.lines.append(f'{class_name} = TypedDict("{class_name}", {{{entries}}}, total=False)')
+        else:
+            self.lines.append(f"class {class_name}(TypedDict, total=False):")
+            self.lines.extend([f"    {name}: {annotation}" for name, annotation in fields] or ["    pass"])
         self.lines.append("")
         for name in pending:
             self.emit_type(name)
 
     def emit_service(self, service: ServiceDescriptor) -> None:
         package = self.strip_package
-        class_name = _class_name(service.full_name, package)
+        class_name = self.claim(service.full_name)
         self.lines.append(f'{class_name.upper()}_NAME = "{service.full_name}"')
         self.lines.append("")
         methods = []
         for method in service.methods:
+            if keyword.iskeyword(method.name) or not method.name.isidentifier():
+                # ServiceProxy installs the method under its protobuf name,
+                # which Python cannot call as `proxy.from(...)` — only as
+                # getattr(proxy, "from"). A Protocol cannot declare it either.
+                raise GenerationError(
+                    f"rpc '{service.full_name}.{method.name}' cannot be a Python method: "
+                    f"'{method.name}' is a keyword. Rename the rpc in the .proto"
+                )
             req = _class_name(method.input_type.full_name, package)
             res = _class_name(method.output_type.full_name, package)
             if method.server_streaming:

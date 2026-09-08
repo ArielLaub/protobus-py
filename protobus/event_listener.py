@@ -165,6 +165,9 @@ class EventListener(BaseListener):
         )
         await self._connection.bind_queue(self._channel, self._retry_queue_name, self._retry_exchange_name, "#", {})
 
+    async def _restore_topology(self) -> None:
+        await self.setup_retry_topology()
+
     def get_retry_options(self) -> Optional[ConsumeRetryOptions]:
         if self._retry_config.max_retries <= 0 or not self._retry_queue_name or not self._dlq_name:
             return None

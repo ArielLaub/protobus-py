@@ -460,3 +460,80 @@ class TestUndecodableInputIsAnsweredNotRetried:
 
     def test_keeps_invalid_method_error_out_of_the_retry_ladder_too(self):
         assert is_handled_error(InvalidMethodError("nope")) is True
+
+
+class TestValidationErrorsNeverCarryTheValue:
+    """The message of an encoding error is logged, at the default level, with
+    no diagnostics opt-in. It names the field and the value's type, never the
+    value; the raising library's own text stays on __cause__ for the caller."""
+
+    PROTO = (
+        'syntax = "proto3"; package Leak; enum E { A = 0; } '
+        "message M { bool enabled = 1; int32 n = 2; float x = 3; bytes b = 4; string s = 5; bigint big = 6; "
+        "timestamp t = 7; E e = 8; M nested = 9; repeated int32 r = 10; map<string, int32> m = 11; } "
+        "service S { rpc go(Leak.M) returns (Leak.M); }"
+    )
+    CASES = [
+        {"enabled": "SYNTHETIC_SECRET"}, {"n": "SYNTHETIC_SECRET"}, {"n": 2**40}, {"x": "SYNTHETIC_SECRET"},
+        {"b": "SYNTHETIC_SECRET!!"}, {"big": -424242}, {"big": "SYNTHETIC_SECRET"}, {"t": "SYNTHETIC_SECRET"},
+        {"e": "SYNTHETIC_SECRET"}, {"nested": {"n": "SYNTHETIC_SECRET"}}, {"r": ["SYNTHETIC_SECRET"]},
+        {"m": {"k": "SYNTHETIC_SECRET"}}, {"s": b"\xff\xfe"}, {"nested": "SYNTHETIC_SECRET"},
+    ]
+
+    def test_every_rejected_value_is_absent_from_the_error_and_the_log(self):
+        from protobus import FieldTypeError, FieldValueError, LogLevel, set_log_level, set_logger
+
+        factory = make_factory(self.PROTO, "Leak.S")
+        lines = []
+
+        class Capture:
+            def debug(self, m): lines.append(str(m))
+            info = warn = error = debug
+
+        previous = None
+        try:
+            set_logger(Capture())
+            set_log_level(LogLevel.Debug)
+            for case in self.CASES:
+                with pytest.raises((FieldTypeError, FieldValueError)) as info:
+                    factory.build_request("Leak.S.go", case, "actor")
+                text = f"{type(info.value).__name__}: {info.value}"
+                assert "SYNTHETIC_SECRET" not in text and "424242" not in text and "1099511627776" not in text, text
+                assert "field '" in text or "expected a dict" in text
+        finally:
+            set_logger(previous or __import__("protobus").DefaultLogger())
+        joined = "\n".join(lines)
+        assert "SYNTHETIC_SECRET" not in joined and "424242" not in joined and "1099511627776" not in joined
+        assert lines, "the failures are still logged"
+
+    def test_the_callers_cause_still_names_the_field_and_keeps_the_codec_text(self):
+        from protobus import FieldValueError
+
+        factory = make_factory(self.PROTO, "Leak.S")
+        with pytest.raises(FieldValueError) as info:
+            factory.build_request("Leak.S.go", {"big": -424242}, "actor")
+        assert "field 'big'" in str(info.value)
+        # The codec's own message is for the caller's process only.
+        assert isinstance(info.value.__cause__, ValueError)
+
+    async def test_the_proxy_log_line_is_value_free_too(self):
+        from protobus import InvalidRequestError, LogLevel, ServiceProxy, set_log_level, set_logger
+
+        factory = make_factory(self.PROTO, "Leak.S")
+        context = FakeContext(factory)
+        proxy = ServiceProxy(context, "Leak.S")
+        await proxy.init()
+        lines = []
+
+        class Capture:
+            def debug(self, m): lines.append(str(m))
+            info = warn = error = debug
+
+        try:
+            set_logger(Capture())
+            set_log_level(LogLevel.Debug)
+            with pytest.raises(InvalidRequestError):
+                await proxy.go({"enabled": "SYNTHETIC_SECRET"})
+        finally:
+            set_logger(__import__("protobus").DefaultLogger())
+        assert lines and "SYNTHETIC_SECRET" not in "\n".join(lines)

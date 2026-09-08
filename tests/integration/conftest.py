@@ -67,6 +67,21 @@ async def cleanup_queues(amqp_url):
         pass
 
 
+@pytest.fixture
+async def fresh_vhost(amqp_url):
+    """An empty vhost of its own for this test: nothing declared, no leftovers
+    from a previous run or a previous test. Skipped without the management
+    plugin. Yields the vhost's AMQP URL."""
+    from . import mgmt
+
+    if not await mgmt.run_blocking(mgmt.management_available):
+        pytest.skip(f"RabbitMQ management API not reachable at {mgmt.ORIGIN}")
+    name = unique("protobus-fresh-")
+    url = await mgmt.create_vhost(name, amqp_url)
+    yield url
+    await mgmt.delete_vhost(name)
+
+
 def pytest_collection_modifyitems(items):
     for item in items:
         if "integration" in str(item.fspath):

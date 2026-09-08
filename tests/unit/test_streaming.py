@@ -27,6 +27,10 @@ async def dispatcher(conn=None):
     return d, conn
 
 
+async def _done():
+    return None
+
+
 def stream_id(d):
     return next(iter(d.pending_streams))
 
@@ -92,11 +96,81 @@ class TestStreamingCallLifetime:
         d, conn = await dispatcher()
         reply = d.publish_streaming(b"", "REQUEST.X.Y.z", 60000)
         sid = stream_id(d)
+        await tick(2)  # the request has gone out
         await reply.aclose()
         await tick(2)
         assert sid not in d.pending_streams
         cancels = [p for p in conn.publishes if p["exchange"] == Config.cancel_exchange_name()]
         assert len(cancels) == 1
+
+    async def test_closing_before_the_request_went_out_withdraws_it(self):
+        # Closed while parked on readiness: the request is never sent, and no
+        # cancel notice is sent for a request the server never saw.
+        conn = FakeConnection()
+        conn.is_connected, conn.is_reconnecting = False, True
+        ready = asyncio.Event()
+
+        async def when_ready(timeout_ms=None):
+            await ready.wait()
+
+        conn.when_ready = when_ready
+        d = MessageDispatcher(conn)
+        d._channel = FakeChannel()
+        d._is_initialized = True
+        for close in (lambda r: r.aclose(), lambda r: r._on_abort() or _done()):
+            reply = d.publish_streaming(b"req", "REQUEST.X.Y.z", 60000)
+            sid = stream_id(d)
+            await tick(2)
+            await close(reply)
+            ready.set()
+            await tick(3)
+            ready.clear()
+            assert conn.publishes == []
+            assert sid not in d.pending_streams
+            with pytest.raises(StopAsyncIteration):
+                await reply.__anext__()
+
+    async def test_a_cancel_notice_never_overtakes_its_request(self):
+        # Closed mid-send: the notice waits for the send to settle.
+        conn = FakeConnection()
+        gate = asyncio.Event()
+
+        async def slow_publish(*_a, **_k):
+            await gate.wait()
+
+        conn.publish_hook = slow_publish
+        d, _ = await dispatcher(conn)
+        reply = d.publish_streaming(b"req", "REQUEST.X.Y.z", 60000)
+        await tick(2)
+        await reply.aclose()
+        await tick(2)
+        assert [p["exchange"] for p in conn.publishes] == [Config.bus_exchange_name()]
+        conn.publish_hook = None
+        gate.set()
+        await tick(3)
+        assert [p["exchange"] for p in conn.publishes] == [Config.bus_exchange_name(), Config.cancel_exchange_name()]
+
+    async def test_cancelling_the_consumer_while_the_publish_is_pending_cleans_up(self):
+        conn = FakeConnection()
+        gate = asyncio.Event()
+
+        async def slow_publish(*_a, **_k):
+            await gate.wait()
+
+        conn.publish_hook = slow_publish
+        d, _ = await dispatcher(conn)
+        reply = d.publish_streaming(b"req", "REQUEST.X.Y.z", 60000)
+        sid = stream_id(d)
+        consumer = asyncio.ensure_future(reply.__anext__())
+        await tick(2)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        assert sid not in d.pending_streams
+        conn.publish_hook = None
+        gate.set()
+        await tick(3)
+        assert [p["exchange"] for p in conn.publishes][-1] == Config.cancel_exchange_name()
 
     async def test_a_cancelled_consumer_task_closes_the_stream(self):
         # asyncio cancellation of the task parked on the next chunk: nobody
@@ -238,6 +312,61 @@ class TestStreamingBackpressure:
             await reply.__anext__()
         assert d._total_buffered_bytes == 0
 
+    async def test_a_buffer_failure_stops_the_producer_without_waiting_for_a_pull(self, monkeypatch):
+        # The consumer is paused. The dispatcher already knows the stream is
+        # unusable, so the producer is told to stop NOW, the slot and the
+        # buffer are released, later frames are ignored, and the error is
+        # still what the next pull raises.
+        monkeypatch.setenv("STREAM_MAX_BUFFERED_CHUNKS", "1")
+        d, conn = await dispatcher()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000)
+        sid = stream_id(d)
+        await tick(2)
+        for i in range(2):
+            body, headers = chunk(i, f"c{i}")
+            await d._on_result(body, sid, headers)
+        await tick(2)
+        assert sid not in d.pending_streams
+        assert d._total_buffered_bytes == 0
+        cancels = [p for p in conn.publishes if p["exchange"] == Config.cancel_exchange_name()]
+        assert len(cancels) == 1 and cancels[0]["properties"]["correlation_id"] == sid
+        # A late frame for the terminated call is ignored.
+        body, headers = chunk(2, "late")
+        await d._on_result(body, sid, headers)
+        assert d._total_buffered_bytes == 0
+        with pytest.raises(StreamBackpressureError):
+            await reply.__anext__()
+
+    async def test_a_sequence_gap_stops_the_producer_without_waiting_for_a_pull(self):
+        d, conn = await dispatcher()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000)
+        sid = stream_id(d)
+        await tick(2)
+        body, headers = chunk(0, "c0")
+        await d._on_result(body, sid, headers)
+        body, headers = chunk(2, "c2")
+        await d._on_result(body, sid, headers)
+        await tick(2)
+        assert sid not in d.pending_streams
+        assert len([p for p in conn.publishes if p["exchange"] == Config.cancel_exchange_name()]) == 1
+        with pytest.raises(StreamSequenceError):
+            await reply.__anext__()
+
+    async def test_a_publish_failure_releases_the_slot_without_a_pull(self):
+        conn = FakeConnection()
+
+        async def hook(*_a):
+            raise RuntimeError("no route")
+
+        conn.publish_hook = hook
+        d, _ = await dispatcher(conn)
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000)
+        sid = stream_id(d)
+        await tick(3)
+        assert sid not in d.pending_streams
+        with pytest.raises(RuntimeError, match="no route"):
+            await reply.__anext__()
+
     async def test_fails_the_stream_past_the_byte_bound(self, monkeypatch):
         monkeypatch.setenv("STREAM_MAX_BUFFERED_BYTES", "10")
         d, _ = await dispatcher()
@@ -275,6 +404,91 @@ def stream_request(correlation_id):
 
 
 class TestServerSideStreamCancellation:
+    async def test_a_producer_that_raises_on_cancellation_is_settled_not_left_unacked(self):
+        # signal.throw_if_aborted() raises CancelledError inside the
+        # generator. That is cancelled work, to be acknowledged — not the
+        # consumer being torn down — or the delivery would occupy the
+        # worker's only prefetch slot until the channel closed.
+        conn = Connection()
+        ch = FakeChannel()
+        entered = asyncio.Event()
+
+        async def handler(_c, _id, _h, context):
+            async def gen():
+                entered.set()
+                await context.signal.wait()
+                context.signal.throw_if_aborted()
+                yield b"unreachable"
+
+            return gen()
+
+        await conn.consume(ch, "Q", handler, ConsumeOptions(), True)
+        delivery = asyncio.ensure_future(ch.deliver(stream_request("cid-throw")))
+        await entered.wait()
+        assert conn.cancel_stream("cid-throw") is True
+        await asyncio.wait_for(delivery, 1)
+        assert not delivery.cancelled()
+        assert len(ch.acked) == 1 and ch.rejected == []
+        assert conn.in_flight_deliveries == 0
+        # Nothing was published for the cancelled stream.
+        assert [p for p in ch.published if p["exchange"] == Config.callbacks_exchange_name()] == []
+
+        # The worker is free: a second delivery is served normally.
+        async def plain(_c, _id, _h, context):
+            async def gen():
+                yield b"a"
+
+            return gen()
+
+        ch2 = FakeChannel()
+        await conn.consume(ch2, "Q", plain, ConsumeOptions(), True)
+        await ch2.deliver(stream_request("cid-next"))
+        assert len(ch2.acked) == 1
+
+    async def test_a_unary_handler_that_raises_on_cancellation_is_settled_too(self):
+        conn = Connection()
+        ch = FakeChannel()
+        entered = asyncio.Event()
+
+        async def handler(_c, _id, _h, context):
+            entered.set()
+            await context.signal.wait()
+            context.signal.throw_if_aborted()
+            return b"unreachable"
+
+        await conn.consume(ch, "Q", handler, ConsumeOptions(), True, retry_options=ConsumeRetryOptions(max_retries=3, retry_queue_name="Q.Retry", dlq_name="Q.DLQ", retry_exchange_name="Q.Retry.Exchange"))
+        delivery = asyncio.ensure_future(ch.deliver(stream_request("cid-unary")))
+        await entered.wait()
+        conn.cancel_stream("cid-unary")
+        await asyncio.wait_for(delivery, 1)
+        # Acked, and NOT sent round the retry ladder.
+        assert len(ch.acked) == 1 and ch.rejected == []
+        assert [p for p in ch.published if p["exchange"] == "Q.Retry.Exchange"] == []
+
+    async def test_cancelling_the_consumer_task_itself_still_propagates(self):
+        # Teardown: nobody cancelled the delivery, the task hosting it is
+        # being cancelled. That must not be mistaken for cancelled work and
+        # acknowledged.
+        conn = Connection()
+        ch = FakeChannel()
+        entered = asyncio.Event()
+
+        async def handler(_c, _id, _h, context):
+            async def gen():
+                entered.set()
+                await asyncio.Event().wait()
+                yield b"unreachable"
+
+            return gen()
+
+        await conn.consume(ch, "Q", handler, ConsumeOptions(), True)
+        delivery = asyncio.ensure_future(ch.deliver(stream_request("cid-teardown")))
+        await entered.wait()
+        delivery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
+        assert ch.acked == [] and ch.rejected == []
+
     async def test_aborts_the_handler_signal_when_the_stream_is_cancelled(self):
         conn = Connection()
         ch = FakeChannel()
@@ -417,3 +631,82 @@ class TestServerSideStreamCancellation:
         conn.cancel_stream("cid-close")
         await delivery
         assert closed.is_set()
+
+
+class TestTheEncodingWrapperOwnsTheHandlerIterator:
+    """Closing what the connection holds — the encoding wrapper — must close
+    the handler's own async generator, or the upstream resource it holds
+    (an HTTP stream to a model provider) outlives the call."""
+
+    def service(self):
+        from protobus import Context, MessageService
+        from protobus.message_factory import MessageFactory
+
+        factory = MessageFactory()
+        factory.init()
+        factory.parse('syntax = "proto3"; package Res; message M { string s = 1; } service S { rpc stream(Res.M) returns (stream Res.M); }', "Res.S")
+
+        class Service(MessageService):
+            service_name = "Res.S"
+            proto_file_name = ""
+
+        ctx = Context(FakeConnection())
+        ctx._message_factory = factory
+        return Service(ctx)
+
+    async def test_closing_the_wrapper_closes_the_upstream_generator(self):
+        svc = self.service()
+        closed = []
+
+        async def upstream():
+            try:
+                yield {"s": "one"}
+                yield {"s": "two"}
+            finally:
+                closed.append(True)
+
+        inner = upstream()
+        wrapper = svc._stream_responses("Res.S.stream", inner)
+        await wrapper.__anext__()
+        assert closed == []
+        await wrapper.aclose()
+        assert closed == [True]
+
+    async def test_an_upstream_context_manager_is_left_before_the_wrapper_finishes_closing(self):
+        svc = self.service()
+        events = []
+
+        class Upstream:
+            async def __aenter__(self):
+                events.append("enter")
+                return self
+
+            async def __aexit__(self, *_exc):
+                events.append("exit")
+
+        async def upstream():
+            async with Upstream():
+                yield {"s": "one"}
+                yield {"s": "two"}
+
+        wrapper = svc._stream_responses("Res.S.stream", upstream())
+        await wrapper.__anext__()
+        await wrapper.aclose()
+        events.append("wrapper closed")
+        assert events == ["enter", "exit", "wrapper closed"]
+
+    async def test_a_handler_error_still_closes_the_generator_and_yields_the_error(self):
+        svc = self.service()
+        closed = []
+
+        async def upstream():
+            try:
+                yield {"s": "one"}
+                raise RuntimeError("upstream broke")
+            finally:
+                closed.append(True)
+
+        wrapper = svc._stream_responses("Res.S.stream", upstream())
+        out = [c async for c in wrapper]
+        assert len(out) == 2  # the chunk, then the terminal error
+        assert closed == [True]

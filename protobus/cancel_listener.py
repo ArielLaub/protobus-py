@@ -17,7 +17,7 @@ as never having sent one.
 from typing import Any, Callable, Optional
 
 from .config import Config
-from .connection import IConnection, attach_restorer
+from .connection import EXCHANGE_OPTIONS, IConnection, attach_restorer
 from .logger import Logger
 
 
@@ -52,7 +52,7 @@ class CancelListener:
         self._channel = await self._connection.open_channel()
         await self._connection.declare_exchange(
             self._channel, Config.cancel_exchange_name(), "fanout",
-            {"durable": True, "auto_delete": False, "internal": False, "arguments": {}},
+            dict(EXCHANGE_OPTIONS),
         )
         # Anonymous queue: the broker names it, this process owns it, and it
         # disappears with the connection.

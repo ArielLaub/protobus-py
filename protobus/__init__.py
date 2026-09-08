@@ -61,6 +61,8 @@ from .message_factory import (
     ResponseError,
     ResponseResult,
     Root,
+    FieldTypeError,
+    FieldValueError,
     UnknownTypeError,
 )
 from .proto_parser import ProtoParseError, parse_proto
@@ -173,7 +175,7 @@ __all__ = [
     "MessageListener", "CallbackListener", "CancelListener", "BaseListener", "Trie",
     # Factory
     "MessageFactory", "Root", "RequestContainer", "ResponseContainer", "ResponseResult",
-    "ResponseError", "EventContainer", "UnknownTypeError", "ProtoParseError", "parse_proto",
+    "ResponseError", "EventContainer", "UnknownTypeError", "FieldTypeError", "FieldValueError", "ProtoParseError", "parse_proto",
     # Errors
     "AlreadyConnectedError", "AlreadyInitializedError", "AlreadyStartedError", "ChannelClosedError",
     "ConnectionError", "CustomTypeConflictError", "DisconnectedError", "HandledError",

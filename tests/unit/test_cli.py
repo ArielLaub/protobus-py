@@ -144,6 +144,53 @@ class TestGeneratedTypesMatchTheRuntimeContract:
         # A single package still gets the short names.
         assert "class Service(Protocol)" in export_python(factory.root, ["Orders.Service"])
 
+    def test_keyword_field_names_generate_importable_typing(self):
+        # `from`, `class`, `import` are legal protobuf identifiers. The
+        # generated module must compile, and the wire key must survive.
+        factory = MessageFactory()
+        factory.init([])
+        factory.parse('syntax = "proto3"; package Audit; message M { string from = 1; int32 class = 2; string ok = 3; } service S { rpc echo(Audit.M) returns (Audit.M); }', "Audit.S")
+        generated = export_python(factory.root, ["Audit.S"])
+        namespace: dict = {}
+        exec(compile(generated, "generated.py", "exec"), namespace)
+        assert set(namespace["M"].__annotations__) == {"from", "class", "ok"}
+
+    def test_a_keyword_message_or_enum_name_is_still_generated(self):
+        factory = MessageFactory()
+        factory.init([])
+        factory.parse('syntax = "proto3"; package Kw; message import { string s = 1; } enum class { A = 0; } message Holder { import i = 1; class c = 2; } service S { rpc go(Kw.Holder) returns (Kw.Holder); }', "Kw.S")
+        generated = export_python(factory.root, ["Kw.S"])
+        namespace: dict = {}
+        exec(compile(generated, "generated.py", "exec"), namespace)
+        assert "import_" in namespace and "class_" in namespace
+        assert namespace["Holder"].__annotations__["i"] == __import__("typing").Optional["import_"]
+
+    def test_an_rpc_named_by_a_keyword_is_refused_with_a_clear_error(self, tmp_path):
+        from protobus.cli.generate_types import GenerationError
+
+        factory = MessageFactory()
+        factory.init([])
+        factory.parse('syntax = "proto3"; package Bad; message M { string s = 1; } service S { rpc from(Bad.M) returns (Bad.M); }', "Bad.S")
+        with pytest.raises(GenerationError, match="rpc 'Bad.S.from' cannot be a Python method"):
+            export_python(factory.root, ["Bad.S"])
+        # Through the CLI, the existing output is left untouched on failure.
+        (tmp_path / "proto").mkdir()
+        (tmp_path / "proto" / "bad.proto").write_text('syntax = "proto3"; package Bad; message M { string s = 1; } service S { rpc from(Bad.M) returns (Bad.M); }')
+        out = tmp_path / "types.py"
+        out.write_text("# previous output\n")
+        with pytest.raises(GenerationError):
+            generate_types(proto_dir=str(tmp_path / "proto"), output=str(out), cwd=str(tmp_path))
+        assert out.read_text() == "# previous output\n"
+
+    def test_two_protobuf_names_that_flatten_onto_one_python_name_are_refused(self):
+        from protobus.cli.generate_types import GenerationError
+
+        factory = MessageFactory()
+        factory.init([])
+        factory.parse('syntax = "proto3"; package Flat; message A { message B_C { string s = 1; } } message A_B { message C { string s = 1; } } message Both { A.B_C x = 1; A_B.C y = 2; } service S { rpc go(Flat.Both) returns (Flat.Both); }', "Flat.S")
+        with pytest.raises(GenerationError, match="would both be generated as 'A_B_C'"):
+            export_python(factory.root, ["Flat.S"])
+
     def test_a_missing_proto_directory_is_reported(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             generate_types(proto_dir=str(tmp_path / "nope"), output=str(tmp_path / "t.py"), cwd=str(tmp_path))

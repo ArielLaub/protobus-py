@@ -18,7 +18,7 @@
 
 A protobus service is **one durable queue** bound to a topic exchange, and **N processes competing for it**.
 
-Everything else — load balancing, failover, backpressure, retry delay, priority — is a property RabbitMQ already gives that queue. Protobus does not implement any of it in Python; it declares the topology and gets out of the way.
+Load balancing, failover, backpressure, retry delay and priority are then properties RabbitMQ already gives that queue: competing consumers, redelivery of an unacked message, prefetch, a TTL queue with a dead-letter exchange, `x-max-priority`. What protobus implements in Python is the part above the broker — publisher-confirm tracking, the decision to retry or answer, the topology declarations and their restoration, reply correlation, stream buffering and cancellation. What it does *not* implement is any of the queueing itself.
 
 That is the whole design, and it is what makes the rest of this page short.
 
@@ -34,7 +34,7 @@ flowchart LR
     style Q fill:#1f6feb,color:#fff,stroke:#1f6feb
 ```
 
-Add a replica and throughput goes up. Kill a replica mid-message and the unacked delivery returns to the queue for another replica. Neither is protobus code.
+Add a replica and the queue is shared between one more consumer — which raises throughput when the handler, not the broker or a downstream, is the bottleneck. Kill a replica mid-message and the unacked delivery returns to the queue for another replica. Neither is protobus code.
 
 ---
 

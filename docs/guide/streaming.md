@@ -192,7 +192,7 @@ if stop.signal.aborted:
     ...  # stopped early — the response is partial
 ```
 
-A stream abandoned by an `asyncio` task cancellation — the consuming task itself is cancelled — is closed the same way on the way out.
+A stream abandoned by an `asyncio` task cancellation — the consuming task itself is cancelled, whether it was waiting for the request to publish or for the next chunk — is closed the same way on the way out.
 
 On the server, watch `context.signal` — the fourth argument to your handler:
 
@@ -210,17 +210,9 @@ Cancellation is **cooperative**. A generator cannot be preempted between yields,
 
 The cancellation notice is an ordinary message, published once and not retried. If it is lost, the producer never hears it and runs to completion — the same outcome as never having cancelled. There is no correctness risk; the cost is wasted work.
 
-If that work is expensive enough to matter, detect it and cancel again: chunks still arriving well after you cancelled mean the notice did not land.
+There is no resend: cancellation is idempotent on both sides, so a second `abort()` or `aclose()` sends nothing, and once a stream is closed the client discards whatever else arrives for it, so application code cannot observe whether the producer stopped. A producer whose work is expensive enough to matter should bound it on its own side — a deadline on the upstream call, a cap on tokens — rather than rely on a notice that is best effort by design.
 
-```python
-# Cancel, then re-cancel if the producer is evidently still going.
-stop.abort()
-await asyncio.sleep(1)
-if time.monotonic() - last_chunk_at < 0.5:
-    stop.abort()   # a second notice; the first evidently did not land
-```
-
-The framework deliberately does not do this for you: how long to wait, and whether to bother, depends on what the stream costs.
+Three cases are handled without a notice at all: a stream closed **before its request went out** (while the connection was being restored) is simply withdrawn, and the request is never published; a request whose publish definitely failed has nothing to cancel; and a stream closed **while its request is mid-send** has its notice held until the send settles, so the notice cannot overtake the request it cancels.
 
 #### How it travels
 
@@ -240,7 +232,10 @@ async for chunk in llm.completeStream(req, None, 120_000):
     ...
 ```
 
-If no chunk arrives within the timeout, `StreamTimeoutError` is raised. The unary `MESSAGE_PROCESSING_TIMEOUT` does not apply to streaming calls.
+If no chunk arrives within the timeout, `StreamTimeoutError` is raised.
+
+> [!WARNING]
+> **`MESSAGE_PROCESSING_TIMEOUT` does not bound a streaming handler.** It covers only the call that *creates* the async iterator; the iteration itself has no server-side deadline. A long-running LLM adapter has to bound its own upstream call, and the client's idle timeout is the only clock on the consumer side. This is a known limitation, listed in [Known Issues](../operations/known-issues.md).
 
 ## Server API
 

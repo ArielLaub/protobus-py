@@ -173,8 +173,10 @@ here, and a Python service will not reproduce a Node number in any case.
 
 What the architecture would predict, separately from any measurement:
 
-- Protobuf encodes to fewer bytes than the equivalent JSON, so there is less to
-  write and read.
+- Protobuf usually encodes to fewer bytes than the equivalent JSON — field
+  numbers instead of names, packed integers — so there is often less to write
+  and read. How much less depends on the payload; a message that is mostly
+  free text is about the same size either way.
 - Encoding and decoding run in the `protobuf` package's C++ (upb) runtime, not
   in Python.
 - Routing decisions happen in the broker, so they do not run on your event

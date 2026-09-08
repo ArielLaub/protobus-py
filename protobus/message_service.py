@@ -420,12 +420,25 @@ class MessageService:
         x-protobus-final=true so the client's iterator raises.
         """
         factory = self.context.factory
+        iterator = iterable.__aiter__()
         try:
-            async for chunk in iterable:
+            async for chunk in iterator:
                 yield factory.build_response(method, chunk)
         except Exception as error:
             Logger.error(f"error in streaming method {method}: {error!r}")
             yield factory.build_response(method, sanitize_error_for_client(error))
+        finally:
+            # Closing this wrapper — the connection does so on cancellation
+            # and on any early exit — must close the handler's own iterator
+            # too, or whatever it holds open upstream (an HTTP stream to a
+            # model provider, say) outlives the call. An abandoned
+            # `async for` does not close its iterator by itself.
+            aclose = getattr(iterator, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception as close_error:
+                    Logger.debug(f"closing the iterator of {method}: {close_error!r}")
 
 
 def _handler_wants_context(handler: Callable[..., Any]) -> bool:

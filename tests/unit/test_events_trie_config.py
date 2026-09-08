@@ -181,6 +181,25 @@ class TestEventRetryTopology:
         opts = listener.get_retry_options()
         assert (opts.max_retries, opts.retry_queue_name, opts.retry_exchange_name, opts.dlq_name) == (2, "Svc.Events.Retry", "Svc.Events.Retry.Exchange", "Svc.Events.DLQ")
 
+    async def test_the_ladder_is_declared_again_on_restoration(self):
+        # A replaced broker or a recreated vhost has none of it, and a
+        # consumer restored without it settles its failures into nothing.
+        conn = FakeConnection()
+        listener = EventListener(conn, make_factory(EVENT_PROTO), EventRetryOptions(max_retries=2, retry_delay_ms=250))
+        await listener.init(None, "Svc.Events")
+        await listener.start()
+        conn.declared_queues.clear()
+        conn.declared_exchanges.clear()
+        conn.bindings.clear()
+        await conn.reconnect_now()
+        assert {q["queue"] for q in conn.declared_queues} == {"Svc.Events", "Svc.Events.DLQ", "Svc.Events.Retry"}
+        assert {"Svc.Events.Redelivery", "Svc.Events.Retry.Exchange"} <= {e["exchange"] for e in conn.declared_exchanges}
+        assert {"queue": "Svc.Events", "exchange": "Svc.Events.Redelivery", "routing_key": "#"} in conn.bindings
+        # Declared before consuming resumes, so the first delivery after the
+        # restore already has somewhere to fail to.
+        order = [k for k, _ in conn.operations]
+        assert order.index("declare_queue:Svc.Events.Retry") < order.index("consume")
+
     async def test_the_retry_options_reach_the_consumer(self):
         conn = FakeConnection()
         listener = EventListener(conn, make_factory(EVENT_PROTO), EventRetryOptions(max_retries=1))

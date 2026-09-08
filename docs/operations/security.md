@@ -74,8 +74,14 @@ access control than the bus itself:
 - **Connection URLs.** Logged with the password replaced (`amqp://user:***@…`).
   Scheme, user, host, port and vhost are kept so the line stays useful.
 - **Message and event payloads.** The framework logs sizes, types and
-  correlation IDs, never bodies. Log aggregators typically have far broader
-  read access and longer retention than your broker credentials.
+  correlation IDs, never bodies — and an encoding failure names the field and
+  the offending value's *type*, never the value. Log aggregators typically
+  have far broader read access and longer retention than your broker
+  credentials.
+- **Exception messages from a service handler are the one exception.** They
+  are logged in the service's own process, on the assumption that a service's
+  log is its own; and they cross to the caller unless
+  `PROTOBUS_EXPOSE_INTERNAL_ERRORS=false`, as below.
 - **`x-last-error`** in retry and DLQ metadata. Carries the error class and
   `code`, never the message, because this header persists in a queue and is
   read by dashboards and queue browsers.

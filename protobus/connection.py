@@ -262,6 +262,17 @@ def apply_heartbeat(url: str) -> str:
 # which need not be the original publisher's.
 CARRIED_PROPERTIES = ("content_type", "content_encoding", "priority", "timestamp", "message_type", "app_id")
 
+# The one set of options every declaration of a protobus exchange uses, on
+# the publishing side as well as the consuming side. A publisher that declared
+# the exchange differently from a listener would fail with a 406 on whichever
+# side came second, so there is exactly one definition.
+EXCHANGE_OPTIONS: Dict[str, Any] = {"durable": True, "auto_delete": False, "internal": False, "arguments": {}}
+
+# How long a delivery whose settlement failed waits before it is returned to
+# the queue. Short enough not to hold the worker, long enough that a fault
+# that persists is not retried at full speed.
+SETTLE_FAILURE_REQUEUE_DELAY_S = 1.0
+
 # Names a caller may use in a properties dict, mapped onto pamqp's.
 _PROPERTY_ALIASES = {
     "contentType": "content_type",
@@ -378,6 +389,10 @@ class _ChannelPublishState:
     waiters: List["asyncio.Future[None]"] = field(default_factory=list)
     # Futures of publishes awaiting a confirm, failed when the channel closes.
     pending: Set["asyncio.Future[Any]"] = field(default_factory=set)
+
+
+class _CancelledByCaller(Exception):
+    """A unary handler that cancelled itself after the caller cancelled."""
 
 
 @dataclass(eq=False)
@@ -968,6 +983,15 @@ class Connection(EventEmitter):
                     if context.timeout_reply is not None:
                         setattr(timeout_error, RESPONSE_BUFFER_ATTR, context.timeout_reply)
                     raise timeout_error
+                if handler_task.cancelled():
+                    # The handler ended by raising CancelledError itself —
+                    # `context.signal.throw_if_aborted()` after the caller
+                    # cancelled — not because this consumer is being torn
+                    # down. That is cancelled work, settled below; a handler
+                    # that cancels itself unasked is an ordinary failure.
+                    if delivery_entry.cancelled:
+                        raise _CancelledByCaller()
+                    raise RuntimeError(f"handler for {correlation_id} raised CancelledError without being cancelled")
                 result = handler_task.result()
 
                 # The reply is published before the request is settled, so the
@@ -990,7 +1014,17 @@ class Connection(EventEmitter):
                     await connection.ack(channel, msg)
 
             except asyncio.CancelledError:
-                raise
+                # Two very different things arrive here as CancelledError: a
+                # stream producer that raised it cooperatively after the
+                # caller cancelled (cancelled work, to be settled), and this
+                # consumer task being cancelled from outside (teardown, to be
+                # propagated). Only the first has the delivery marked.
+                if not delivery_entry.cancelled:
+                    raise
+                Logger.debug(f"message {correlation_id} ended because its stream was cancelled")
+                if not options.no_ack and late_ack:
+                    await connection.ack(channel, msg)
+                return
             except BaseException as err:
                 if delivery_entry.cancelled:
                     # A cancelled delivery is a normal outcome: the caller
@@ -1043,6 +1077,12 @@ class Connection(EventEmitter):
                             }
                             retry_props = {
                                 "persistent": True,
+                                # An internal transfer with no destination is
+                                # a fault, not a fan-out to nobody: a missing
+                                # retry queue must fail the settlement (and
+                                # requeue the original), not confirm into
+                                # nothing and let the original be acked.
+                                "mandatory": True,
                                 "correlation_id": correlation_id,
                                 # Carried through so the retried copy is
                                 # recognisable as the same logical message.
@@ -1071,7 +1111,7 @@ class Connection(EventEmitter):
                             }
                             await connection.publish_to_queue(
                                 channel, retry_options.dlq_name, msg.body,
-                                {"persistent": True, "correlation_id": correlation_id, "message_id": properties.message_id, "headers": dlq_headers, **carried},
+                                {"persistent": True, "mandatory": True, "correlation_id": correlation_id, "message_id": properties.message_id, "headers": dlq_headers, **carried},
                             )
                             await connection.ack(channel, msg)
                     else:
@@ -1093,18 +1133,14 @@ class Connection(EventEmitter):
 
         async def consumer_callback(msg: DeliveredMessage) -> None:
             # Counted for the whole settle so a graceful shutdown waits for the
-            # reply/retry/DLQ publish, not just the handler body. A failure to
-            # settle is swallowed: every path that can raise runs before the
-            # ack, so the message stays unacknowledged and is redelivered.
+            # reply/retry/DLQ publish, not just the handler body.
             connection._delivery_started()
             try:
                 await on_message(msg)
             except asyncio.CancelledError:
                 raise
             except BaseException as err:
-                Logger.error(
-                    f"failed to settle message on {queue_name}: {err}. Leaving it unacknowledged for redelivery."
-                )
+                await connection._recover_unsettled(channel, msg, queue_name, err)
             finally:
                 connection._delivery_finished()
 
@@ -1117,6 +1153,40 @@ class Connection(EventEmitter):
             arguments=options.arguments or None,
         )
         return result.consumer_tag
+
+    async def _recover_unsettled(self, channel: Any, msg: DeliveredMessage, queue_name: str, error: BaseException) -> None:
+        """
+        A delivery whose settlement failed — the retry or DLQ publish that
+        was to precede its ack raised — must not sit unacknowledged on an
+        open channel: it would hold the worker's prefetch credit until the
+        channel closed, and with a prefetch of one that is the whole worker.
+
+        It is returned to the queue. When the failed publish was ambiguous
+        (a confirm timeout) the retry copy may also exist, so the message
+        may run twice under the same message id — the documented
+        at-least-once trade, and the opposite of losing it.
+        """
+        correlation_id = getattr(msg.header.properties, "correlation_id", None)
+        message_id = getattr(msg.header.properties, "message_id", None)
+        if isinstance(error, ChannelClosedError) or getattr(channel, "is_closed", False):
+            # Nothing can be settled on a closed channel, and nothing needs
+            # to be: the broker requeues its deliveries as the channel goes.
+            Logger.error(
+                f"failed to settle message {correlation_id} on {queue_name}: {error}. The channel is closed; "
+                "the broker requeues the delivery and the listener rebuilds its channel."
+            )
+            return
+        Logger.error(
+            f"failed to settle message {correlation_id} on {queue_name}: {error}. Returning it to the queue "
+            f"(message id {message_id}); if the failed publish did reach the broker it will be handled twice."
+        )
+        # A beat before the requeue, so a settlement that keeps failing does
+        # not spin the handler at full speed against the same fault.
+        await asyncio.sleep(SETTLE_FAILURE_REQUEUE_DELAY_S)
+        try:
+            await self.reject(channel, msg, True)
+        except Exception as reject_error:
+            Logger.error(f"could not requeue message {correlation_id} on {queue_name}: {reject_error}")
 
     # -- publish ----------------------------------------------------------------
 
@@ -1279,6 +1349,16 @@ class Connection(EventEmitter):
                     chunk = await iterator.__anext__()
                 except StopAsyncIteration:
                     break
+                except asyncio.CancelledError:
+                    # The producer raised it itself, cooperatively, after the
+                    # caller cancelled (`signal.throw_if_aborted()`): the
+                    # stream is over and the delivery is settled as cancelled
+                    # work by the caller of this method. Anything else is
+                    # this task being cancelled, and propagates.
+                    if is_cancelled():
+                        Logger.debug(f"stream {correlation_id} producer stopped on cancellation after {seq} chunk(s)")
+                        return
+                    raise
                 # A caller that cancelled is not listening: stop sending and
                 # stop pulling, closing the generator so a cooperative producer
                 # releases whatever it holds open.

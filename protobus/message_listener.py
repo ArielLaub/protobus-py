@@ -158,6 +158,13 @@ class MessageListener(BaseListener):
     def get_retry_config(self) -> RetryConfig:
         return self._retry_config
 
+    async def _restore_topology(self) -> None:
+        # Only once the ladder has been set up: subscribe() is what first
+        # declares it, and a listener restored before its first subscribe
+        # has nothing to put back.
+        if self._retry_queue_name:
+            await self.setup_retry_queues()
+
     def get_retry_options(self) -> Optional[ConsumeRetryOptions]:
         if self._retry_config.max_retries <= 0 or not self._retry_queue_name or not self._dlq_name:
             return None

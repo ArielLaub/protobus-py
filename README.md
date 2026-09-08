@@ -15,10 +15,12 @@ failover, backpressure, retries and dead-lettering are the broker's, not
 Python's.
 
 This is the Python port of [protobus](https://github.com/ArielLaub/protobus)
-(TypeScript). The two are **wire-compatible and behaviourally aligned**: a
-Python service serves TypeScript callers and vice versa, streaming, events,
-custom types and error codes included. Every release runs a cross-language
-suite in both directions against a live broker to keep it that way.
+(TypeScript). The two are **wire-compatible**: a Python service serves
+TypeScript callers and vice versa, streaming, events, custom types and error
+codes included. Every commit runs a cross-language suite in both directions
+against a live broker and a pinned TypeScript revision (2.4.0) to keep it
+that way; the behavioural differences that remain are listed in
+[Known Issues](docs/operations/known-issues.md#differences-from-the-typescript-port).
 
 ---
 
@@ -164,7 +166,8 @@ not have it.
 
 ### Protocol Buffers, not JSON
 
-- **Smaller on the wire** — binary rather than text.
+- **Usually smaller on the wire** — field numbers and packed integers rather
+  than text; how much smaller depends on the payload.
 - **Contract-first** — a `.proto` file is the interface between teams, and
   generated typing (`protobus generate`) tells you when the two drift apart.
 - **Versioning by field number** — adding a field does not break an old peer.

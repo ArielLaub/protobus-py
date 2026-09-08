@@ -8,7 +8,7 @@
 | **Next** | [Troubleshooting](./troubleshooting.md) · [Architecture](../concepts/architecture.md) |
 | **Source** | [`CHANGELOG.md`](../../CHANGELOG.md) · [`tests/integration/test_cross_language.py`](../../tests/integration/test_cross_language.py) |
 
-**On this page** — [Cancellation is cooperative](#cancellation-and-shutdown-are-cooperative) · [Events are lost by default](#a-failing-event-handler-loses-the-event-unless-retry-is-turned-on) · [The retry hop is unconfirmed](#the-retry-hop-is-not-confirmed) · [No tracing](#no-request-tracing) · [Blocking the loop](#a-blocking-handler-blocks-everything) · [Differences from TypeScript](#differences-from-the-typescript-port) · [Reporting](#reporting-issues)
+**On this page** — [Cancellation is cooperative](#cancellation-and-shutdown-are-cooperative) · [No server deadline on a stream](#a-streaming-handler-has-no-server-side-deadline) · [Events are lost by default](#a-failing-event-handler-loses-the-event-unless-retry-is-turned-on) · [The retry hop is unconfirmed](#the-retry-hop-is-not-confirmed) · [A failed settlement may duplicate](#a-failed-settlement-returns-the-message-and-may-duplicate-it) · [No tracing](#no-request-tracing) · [Blocking the loop](#a-blocking-handler-blocks-everything) · [Differences from TypeScript](#differences-from-the-typescript-port) · [Reporting](#reporting-issues)
 
 ---
 
@@ -41,6 +41,25 @@ async def generateReport(self, request, actor, correlation_id, ctx: MessageHandl
 Graceful shutdown itself is built in — `RunnableService.start()` installs signal
 handlers that stop consuming, drain in-flight work, run your `cleanup()` hook
 and then disconnect. See [RunnableService](../reference/api/runnable-service.md).
+
+A stream cancelled by the caller is settled as cancelled work — acknowledged, not retried — whether the producer returned on seeing `signal.aborted` or raised through `signal.throw_if_aborted()`. The cancellation *notice* is best effort and sent once: a lost notice means a producer that runs to completion, and there is no resend API. See [Streaming → Delivery is best effort](../guide/streaming.md#delivery-is-best-effort).
+
+---
+
+## A streaming handler has no server-side deadline
+
+**Severity:** Medium for long-running adapters
+
+**Description:**
+`MESSAGE_PROCESSING_TIMEOUT` (and `processing_timeout_ms`) bounds the call
+that *creates* a streaming handler's async iterator, not the iteration. A
+producer that stalls mid-stream is stopped only by the client's idle timeout
+(`STREAM_IDLE_TIMEOUT_MS`), which reaches the server as a cancellation
+notice — best effort, and cooperative.
+
+**Workaround:**
+Bound the upstream call inside the handler — an HTTP timeout on the model
+provider, a cap on tokens — and watch `context.signal`.
 
 ---
 
@@ -91,6 +110,32 @@ Full account: [Where a message can still be lost](../concepts/delivery-guarantee
 **Workaround:**
 `RetryOptions(max_retries=0)` for work that must not be lost, and handle the
 failure in the handler; treat an RPC timeout as ambiguous either way.
+
+---
+
+## A failed settlement returns the message, and may duplicate it
+
+**Severity:** Low, and inherent to at-least-once
+
+**Description:**
+A failed delivery is settled by publishing its retry or DLQ copy and *then*
+acknowledging the original. When that publish fails, the original is returned
+to the queue after a one-second pause (`basic.reject` with requeue) rather than
+left unacknowledged on an open channel, where it would hold the worker's
+prefetch credit indefinitely. If the failed publish was ambiguous — a confirm
+timeout — the copy may exist as well, so the message can run twice under the
+same `message_id`. A missing retry queue or exchange is a hard failure (the
+copies are published `mandatory`), never a silent ack into nothing.
+
+A channel the broker closes while the socket stays up — a 404 on a deleted
+retry exchange, a 406 on a changed declare — takes its consumer with it; the
+listener notices and rebuilds its channel, queue, bindings and retry topology
+on the live connection, and the connection's own restoration re-declares that
+topology after an outage. Verified against a live broker in
+[`tests/integration/test_fresh_broker.py`](../../tests/integration/test_fresh_broker.py).
+
+**Workaround:**
+Idempotent handlers keyed on `message_id`, as everywhere else.
 
 ---
 
@@ -147,7 +192,12 @@ neither port is "fixed" to match the other by accident.
 | `timestamp` decodes as | a timezone-aware UTC `datetime` | a `Date` |
 | `bytes` decodes as | `bytes` | `Buffer` |
 | a processing timeout that exhausts its retries | the caller is answered with `RemoteError`, code `PROCESSING_TIMEOUT` | the caller is left to its own `RpcTimeoutError` |
-| a request whose publish was unconfirmed when the socket dropped | republished once on the restored channel, same `message_id` | failed with `DisconnectedError` |
+| a request whose publish was unconfirmed when the socket dropped | republished once on the restored channel, same `message_id`, if the deadline allows | failed with `DisconnectedError` |
+| the RPC deadline | bounds readiness, the confirm and the reply; `RpcTimeoutError.published` says how far it got | bounds the reply; a stalled confirm waits out `PUBLISH_CONFIRM_TIMEOUT_MS` |
+| a lost channel on a live connection | the listener rebuilds itself; retry/DLQ topology is re-declared on restoration | not recovered |
+| a failed retry/DLQ publish | the original is requeued after 1 s; the copies are `mandatory` | the original is left unacknowledged |
+| a stream closed before its request was sent | withdrawn: never published | published, then cancelled |
+| a validation error's message | names the field and the type only | may include the value |
 | closing a stream early | `async with`, or `await stream.aclose()` — `break` alone does not close a Python async iterator | `break` — `for await` calls `return()` |
 | a cancelled consumer task | closes the stream and tells the server | n/a |
 | event handler arity | `(event)`, `(event, topic)` or `(event, type, topic)`, by inspection | the same three positions, contextually typed |
@@ -159,7 +209,12 @@ neither port is "fixed" to match the other by accident.
 Wire-level behaviour — envelopes, routing keys, headers, the retry topology,
 priority bytes, custom-type encodings — is identical, and is what
 [`tests/integration/test_cross_language.py`](../../tests/integration/test_cross_language.py)
-checks.
+checks. CI pins the TypeScript side to the **2.4.0** release commit
+(`ba7a9bd`); other 2.x revisions are expected to interoperate but are not
+tested. The TypeScript-driven direction covers unary, ordered streaming, an
+empty stream and a mid-stream error; the Python-driven direction additionally
+covers cancellation (asserted on the TypeScript producer's own counter),
+custom types, maps and events.
 
 ---
 

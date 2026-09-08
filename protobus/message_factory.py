@@ -328,8 +328,23 @@ def _is_map(field: FieldDescriptor) -> bool:
     )
 
 
+class _ValueFree:
+    """Marker: an encoding error whose message never carries the value."""
+
+
+class FieldTypeError(_ValueFree, TypeError):
+    """A field was given a value of the wrong type. Names the field and the
+    type; never the value, because the message is logged."""
+
+
+class FieldValueError(_ValueFree, ValueError):
+    """A field was given a value of the right type that it cannot hold."""
+
+
 def _coerce_scalar(field: FieldDescriptor, value: Any) -> Any:
-    """Turn a Python value into what the protobuf message setter accepts."""
+    """Turn a Python value into what the protobuf message setter accepts.
+    Every error raised here names the field and the value's TYPE, never the
+    value: these messages are logged."""
     t = field.type
     if t in _INT_TYPES:
         if isinstance(value, bool):
@@ -339,21 +354,24 @@ def _coerce_scalar(field: FieldDescriptor, value: Any) -> Any:
         if isinstance(value, float):
             if value.is_integer():
                 return int(value)
-            raise TypeError(f"field '{field.name}' expects an integer, got {value!r}")
+            raise FieldTypeError(f"field '{field.name}' expects an integer, got a non-integral float")
         if isinstance(value, str):
             try:
                 return int(value.strip(), 0)
             except ValueError:
-                raise TypeError(f"field '{field.name}' expects an integer, got {value!r}") from None
-        raise TypeError(f"field '{field.name}' expects an integer, got {type(value).__name__}")
+                raise FieldTypeError(f"field '{field.name}' expects an integer, got a str that is not one") from None
+        raise FieldTypeError(f"field '{field.name}' expects an integer, got {type(value).__name__}")
     if t in _FLOAT_TYPES:
         if isinstance(value, bool):
             return float(value)
         if isinstance(value, (int, float)):
             return float(value)
         if isinstance(value, str):
-            return float(value)
-        raise TypeError(f"field '{field.name}' expects a number, got {type(value).__name__}")
+            try:
+                return float(value)
+            except ValueError:
+                raise FieldTypeError(f"field '{field.name}' expects a number, got a str that is not one") from None
+        raise FieldTypeError(f"field '{field.name}' expects a number, got {type(value).__name__}")
     if t == FieldDescriptor.TYPE_BOOL:
         if isinstance(value, bool):
             return value
@@ -361,27 +379,33 @@ def _coerce_scalar(field: FieldDescriptor, value: Any) -> Any:
             return bool(value)
         if isinstance(value, str) and value.lower() in ("true", "false"):
             return value.lower() == "true"
-        raise TypeError(f"field '{field.name}' expects a bool, got {value!r}")
+        raise FieldTypeError(f"field '{field.name}' expects a bool, got {type(value).__name__}")
     if t == FieldDescriptor.TYPE_STRING:
         if isinstance(value, str):
             return value
         if isinstance(value, (bytes, bytearray)):
-            return bytes(value).decode("utf-8")
+            try:
+                return bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                raise FieldTypeError(f"field '{field.name}' expects a string, got bytes that are not UTF-8") from None
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return str(value)
-        raise TypeError(f"field '{field.name}' expects a string, got {type(value).__name__}")
+        raise FieldTypeError(f"field '{field.name}' expects a string, got {type(value).__name__}")
     if t == FieldDescriptor.TYPE_BYTES:
         if isinstance(value, (bytes, bytearray, memoryview)):
             return bytes(value)
         if isinstance(value, str):
             # The canonical JSON mapping for bytes, and what a value that
             # crossed a JSON boundary looks like.
-            return base64.b64decode(value)
-        raise TypeError(f"field '{field.name}' expects bytes, got {type(value).__name__}")
+            try:
+                return base64.b64decode(value)
+            except (ValueError, TypeError):
+                raise FieldTypeError(f"field '{field.name}' expects bytes, got a str that is not base64") from None
+        raise FieldTypeError(f"field '{field.name}' expects bytes, got {type(value).__name__}")
     if t == FieldDescriptor.TYPE_ENUM:
         enum = field.enum_type
         if isinstance(value, bool):
-            raise TypeError(f"field '{field.name}' expects an enum value, got {value!r}")
+            raise FieldTypeError(f"field '{field.name}' expects an enum value, got bool")
         if isinstance(value, int):
             return value
         if isinstance(value, str):
@@ -389,17 +413,17 @@ def _coerce_scalar(field: FieldDescriptor, value: Any) -> Any:
             if ev is None:
                 if value.lstrip("-").isdigit():
                     return int(value)
-                raise ValueError(f"'{value}' is not a value of enum {enum.full_name}")
+                raise FieldValueError(f"field '{field.name}' got a str that is not a value of enum {enum.full_name}")
             return ev.number
-        raise TypeError(f"field '{field.name}' expects an enum value, got {type(value).__name__}")
-    raise TypeError(f"unsupported field type {t} on '{field.name}'")
+        raise FieldTypeError(f"field '{field.name}' expects an enum value, got {type(value).__name__}")
+    raise FieldTypeError(f"unsupported field type {t} on '{field.name}'")
 
 
 def _fill_message(message: Message, obj: Any, root: Root) -> Message:
     """Populate ``message`` from a dict (or a Message of the same type)."""
     if isinstance(obj, Message):
         if obj.DESCRIPTOR.full_name != message.DESCRIPTOR.full_name:
-            raise TypeError(
+            raise FieldTypeError(
                 f"expected a {message.DESCRIPTOR.full_name}, got a {obj.DESCRIPTOR.full_name}"
             )
         message.CopyFrom(obj)
@@ -407,7 +431,7 @@ def _fill_message(message: Message, obj: Any, root: Root) -> Message:
     if obj is None:
         return message
     if not isinstance(obj, dict):
-        raise TypeError(
+        raise FieldTypeError(
             f"expected a dict for {message.DESCRIPTOR.full_name}, got {type(obj).__name__}"
         )
 
@@ -420,29 +444,46 @@ def _fill_message(message: Message, obj: Any, root: Root) -> Message:
             continue
         if value is None:
             continue
+        try:
+            _fill_field(message, field, value, root)
+        except (FieldTypeError, FieldValueError):
+            raise
+        except Exception as err:
+            # Whatever raised below — a custom codec, protobuf's own setter,
+            # a decoder — may have put the offending VALUE in its message.
+            # That text is for the caller, as __cause__; what protobus
+            # raises and logs names the field and the type, never the value.
+            raise FieldValueError(
+                f"field '{field.name}' of {descriptor.full_name} rejected a {type(value).__name__} ({type(err).__name__})"
+            ) from err
+    return message
 
+
+def _fill_field(message: Message, field: FieldDescriptor, value: Any, root: Root) -> None:
+    for_error = message.DESCRIPTOR.full_name
+    if True:
         custom = _custom_type_of(field)
 
         if _is_map(field):
             if not isinstance(value, dict):
-                raise TypeError(f"field '{field.name}' expects a dict, got {type(value).__name__}")
+                raise FieldTypeError(f"field '{field.name}' expects a dict, got {type(value).__name__}")
             target = getattr(message, field.name)
             value_field = field.message_type.fields_by_name["value"]
             value_custom = _custom_type_of(value_field)
             for k, v in value.items():
                 if v is None:
-                    continue
+                    return
                 if value_custom is not None:
                     target[k].value = _wire_value(value_custom, v)
                 elif value_field.type == FieldDescriptor.TYPE_MESSAGE:
                     _fill_message(target[k], v, root)
                 else:
                     target[k] = _coerce_scalar(value_field, v)
-            continue
+            return
 
         if _is_repeated(field):
             if isinstance(value, (str, bytes, dict)) or not isinstance(value, Iterable):
-                raise TypeError(f"field '{field.name}' expects a list, got {type(value).__name__}")
+                raise FieldTypeError(f"field '{field.name}' expects a list, got {type(value).__name__}")
             target = getattr(message, field.name)
             for item in value:
                 if custom is not None:
@@ -451,7 +492,7 @@ def _fill_message(message: Message, obj: Any, root: Root) -> Message:
                     _fill_message(target.add(), item, root)
                 else:
                     target.append(_coerce_scalar(field, item))
-            continue
+            return
 
         if custom is not None:
             getattr(message, field.name).value = _wire_value(custom, value)
@@ -463,7 +504,6 @@ def _fill_message(message: Message, obj: Any, root: Root) -> Message:
             sub.SetInParent()
         else:
             setattr(message, field.name, _coerce_scalar(field, value))
-    return message
 
 
 def _wire_value(custom: CustomType, value: Any) -> Any:

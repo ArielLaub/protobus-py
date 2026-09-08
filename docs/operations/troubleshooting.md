@@ -346,12 +346,15 @@ InvalidRequestError: failed parsing message
 ```
 
 with a log line just above it naming the field:
-`failed building message 'Calc.AddRequest': field 'a' expects an integer, got 'x'`.
+`failed building message 'Calc.AddRequest': field 'a' expects an integer, got a str that is not one`.
 
 **Cause.** A value in the request dict does not fit its field: a string where
 the schema says `int32`, an enum name the enum does not declare, a `list` for a
-scalar. The exception's `__cause__` carries the field name; the payload itself
-is deliberately kept out of the exception and the log.
+scalar. The exception's `__cause__` is a `FieldTypeError` or `FieldValueError`
+naming the field and the value's type; the value itself is deliberately kept
+out of every protobus exception message and log line. (A codec's own error —
+the reason a `bigint` was refused — is chained one level further down, in the
+caller's process only.)
 
 ---
 

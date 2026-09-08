@@ -160,6 +160,7 @@ class TestCancellationIsAdditive:
         d = MessageDispatcher(conn)
         await d.init()
         reply = d.publish_streaming(b"req", "REQUEST.A.B.c", 5000)
+        await tick(2)  # the request has gone out
         await reply.aclose()
         await tick(2)
         cancels = [p for p in conn.publishes if p["exchange"] == Config.cancel_exchange_name()]
@@ -185,6 +186,7 @@ class TestCancellationIsAdditive:
         await d.init()
         controller = AbortController()
         reply = d.publish_streaming(b"req", "REQUEST.A.B.c", 5000, StreamOptions(signal=controller.signal))
+        await tick(2)  # the request has gone out
         controller.abort()
         await reply.aclose()
         await tick(2)

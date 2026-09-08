@@ -389,3 +389,95 @@ class TestDispatchHonoursTheBrokerRoutingKey:
         buf = f.build_request("Bank.Api.read", {"x": "a"}, "alice")
         await svc._on_message(buf, "cid", {})
         assert calls == ["read"]
+
+
+class TestAFailedSettlementDoesNotOccupyTheWorker:
+    """The retry/DLQ publish that precedes an ack can fail. The delivery must
+    not then sit unacknowledged on an open channel, holding the prefetch."""
+
+    def retry(self):
+        return ConsumeRetryOptions(max_retries=2, retry_queue_name="Q.Retry", retry_exchange_name="Q.Retry.Exchange", dlq_name="Q.DLQ")
+
+    async def test_a_retry_publish_that_times_out_returns_the_delivery_to_the_queue(self, monkeypatch):
+        import protobus.connection as connection_module
+
+        monkeypatch.setenv("PUBLISH_CONFIRM_TIMEOUT_MS", "5")
+        monkeypatch.setattr(connection_module, "SETTLE_FAILURE_REQUEUE_DELAY_S", 0.01)
+        conn, ch = Connection(), FakeChannel(auto_confirm=False)
+
+        async def fail(*_a):
+            raise RuntimeError("synthetic handler failure")
+
+        await conn.consume(ch, "Q", fail, ConsumeOptions(), True, self.retry())
+        await ch.deliver(make_delivery())
+        assert ch.acked == []
+        assert ch.rejected == [{"delivery_tag": 1, "requeue": True}]
+        assert ch.closed is False
+        assert conn.in_flight_deliveries == 0
+
+    async def test_a_definite_publish_failure_returns_the_delivery_too(self, monkeypatch):
+        import protobus.connection as connection_module
+
+        monkeypatch.setattr(connection_module, "SETTLE_FAILURE_REQUEUE_DELAY_S", 0.01)
+        conn, ch = Connection(), FakeChannel(auto_confirm=False)
+
+        async def fail(*_a):
+            raise RuntimeError("synthetic handler failure")
+
+        async def nack_the_retry():
+            while not ch.published_to("Q.Retry.Exchange"):
+                await asyncio.sleep(0)
+            ch.published_to("Q.Retry.Exchange")[0].nack()
+
+        await conn.consume(ch, "Q", fail, ConsumeOptions(), True, self.retry())
+        nacker = asyncio.ensure_future(nack_the_retry())
+        await ch.deliver(make_delivery())
+        await nacker
+        assert ch.acked == []
+        assert [r["requeue"] for r in ch.rejected] == [True]
+
+    async def test_nothing_is_attempted_on_a_channel_that_closed(self, monkeypatch):
+        import protobus.connection as connection_module
+
+        monkeypatch.setattr(connection_module, "SETTLE_FAILURE_REQUEUE_DELAY_S", 0.01)
+        conn, ch = Connection(), FakeChannel(auto_confirm=False)
+
+        async def fail(*_a):
+            raise RuntimeError("synthetic handler failure")
+
+        async def close_under_the_retry():
+            while not ch.published_to("Q.Retry.Exchange"):
+                await asyncio.sleep(0)
+            await ch.close()  # confirms outstanding: ChannelClosedError
+
+        await conn.consume(ch, "Q", fail, ConsumeOptions(), True, self.retry())
+        closer = asyncio.ensure_future(close_under_the_retry())
+        await ch.deliver(make_delivery())
+        await closer
+        # The broker requeues on channel close; nothing to settle here.
+        assert ch.acked == [] and ch.rejected == []
+
+    async def test_a_retry_copy_that_routes_nowhere_fails_the_settlement(self, monkeypatch):
+        # The retry queue is gone. The copy is published mandatory, so the
+        # broker returns it; the original is requeued rather than acked into
+        # a confirmed-but-unrouted retry.
+        import protobus.connection as connection_module
+
+        monkeypatch.setattr(connection_module, "SETTLE_FAILURE_REQUEUE_DELAY_S", 0.01)
+        conn, ch = Connection(), FakeChannel(auto_confirm=False)
+
+        async def fail(*_a):
+            raise RuntimeError("synthetic handler failure")
+
+        async def return_the_retry():
+            while not ch.published_to("Q.Retry.Exchange"):
+                await asyncio.sleep(0)
+            ch.published_to("Q.Retry.Exchange")[0].return_unroutable()
+
+        await conn.consume(ch, "Q", fail, ConsumeOptions(), True, self.retry())
+        returner = asyncio.ensure_future(return_the_retry())
+        await ch.deliver(make_delivery())
+        await returner
+        assert ch.published_to("Q.Retry.Exchange")[0].mandatory is True
+        assert ch.acked == []
+        assert [r["requeue"] for r in ch.rejected] == [True]
