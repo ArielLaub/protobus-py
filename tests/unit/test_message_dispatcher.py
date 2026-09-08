@@ -171,10 +171,15 @@ class TestCallOptionsMessageId:
             await d.publish(b"body", "REQUEST.Svc.Api.doThing", False, None, CallOptions(message_id="order-4711"))
         assert [p["properties"]["message_id"] for p in conn.publishes] == ["order-4711", "order-4711"]
 
-    async def test_sets_no_message_id_property_when_the_caller_supplies_none(self):
+    async def test_mints_a_fresh_id_per_call_when_the_caller_supplies_none(self):
+        # Minted here rather than in the connection layer, so a republish
+        # after a lost channel carries the same identity as the first attempt.
         d, conn = await dispatcher()
         await d.publish(b"body", "REQUEST.Svc.Api.doThing", False)
-        assert "message_id" not in conn.publishes[-1]["properties"]
+        await d.publish(b"body", "REQUEST.Svc.Api.doThing", False)
+        ids = [p["properties"]["message_id"] for p in conn.publishes]
+        assert all(isinstance(i, str) and i for i in ids)
+        assert ids[0] != ids[1]
 
     async def test_refuses_an_empty_id_rather_than_silently_minting_a_uuid(self):
         d, conn = await dispatcher()

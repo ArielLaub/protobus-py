@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from .config import Config
 from .connection import IConnection, attach_restorer
-from .errors import InvalidMessageError, NotConnectedError
+from .errors import ChannelClosedError, InvalidMessageError, NotConnectedError
 from .logger import Logger
 from .message_factory import MessageFactory
 
@@ -60,6 +60,9 @@ class EventDispatcher:
             "correlation_id": str(uuid.uuid4()),
             "content_type": "application/octet-stream",
             "delivery_mode": 2,
+            # Fixed before the first attempt, so a republish after a lost
+            # channel is recognisably the same event.
+            "message_id": str(uuid.uuid4()),
         }
         try:
             event = self._message_factory.build_event(event_type, content, topic)
@@ -67,7 +70,16 @@ class EventDispatcher:
             # Without the payload — events carry PII too.
             Logger.error(f"failed building event '{event_type}': {err}")
             raise InvalidMessageError(f"failed building event '{event_type}'") from err
-        await self._connection.publish(self._channel, Config.events_exchange_name(), topic, event, properties)
+        try:
+            await self._connection.publish(self._channel, Config.events_exchange_name(), topic, event, properties)
+        except ChannelClosedError:
+            # The socket died underneath the publish: wait for the restored
+            # channel and publish once more under the same message id.
+            if self._connection.is_connected and not self._connection.is_reconnecting:
+                raise
+            if callable(when_ready):
+                await when_ready()
+            await self._connection.publish(self._channel, Config.events_exchange_name(), topic, event, properties)
 
     async def close(self) -> None:
         self._connection.off("disconnected", self._bound_on_disconnected)

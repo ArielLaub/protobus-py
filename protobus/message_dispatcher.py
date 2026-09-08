@@ -12,6 +12,7 @@ from .cancellation import AbortSignal
 from .config import Config
 from .connection import IConnection, attach_restorer
 from .errors import (
+    ChannelClosedError,
     DisconnectedError,
     InvalidMessageIdError,
     NotConnectedError,
@@ -315,6 +316,39 @@ class MessageDispatcher:
         if callable(when_ready):
             await when_ready()
 
+    def _reply_to(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        The current callback queue, read at publish time rather than earlier.
+
+        The callback queue is exclusive and auto-delete, so a reconnection
+        replaces it; a request carrying the previous queue's name would be
+        answered into nothing.
+        """
+        if properties.get("reply_to") is not None:
+            return {**properties, "reply_to": self._callback_listener.callback_queue}
+        return properties
+
+    async def _publish_on_the_bus(self, routing_key: str, content: bytes, properties: Dict[str, Any]) -> None:
+        """
+        Publish to the bus exchange, riding out a socket that dies underneath
+        the publish.
+
+        A ChannelClosedError is an ambiguous outcome in general. When the
+        cause is the connection going away — the socket died between the
+        readiness check and the confirm — the publish is repeated once on the
+        restored channel, under the SAME message id, so a consumer that did
+        receive the first copy can recognise the second. The channel and the
+        reply queue are re-read after readiness: a reconnection replaces both.
+        """
+        try:
+            await self._connection.publish(self._channel, Config.bus_exchange_name(), routing_key, content, self._reply_to(properties))
+        except ChannelClosedError:
+            if self._connection.is_connected and not self._connection.is_reconnecting:
+                raise
+            Logger.debug(f"publish to {routing_key} lost its channel to a disconnection; republishing once after recovery")
+            await self._await_publishable()
+            await self._connection.publish(self._channel, Config.bus_exchange_name(), routing_key, content, self._reply_to(properties))
+
     async def publish(
         self,
         content: bytes,
@@ -358,40 +392,71 @@ class MessageDispatcher:
             properties["message_id"] = caller_message_id
 
         if not rpc:
-            await self._connection.publish(self._channel, Config.bus_exchange_name(), routing_key, content, properties)
+            await self._publish_on_the_bus(routing_key, content, self._with_identity(properties))
             return None
 
         limit = timeout_ms if timeout_ms is not None else Config.rpc_call_timeout_ms()
         loop = asyncio.get_running_loop()
-        future: "asyncio.Future[bytes]" = loop.create_future()
+        properties = self._with_identity(properties)
+        deadline = loop.time() + limit / 1000
+        republished = False
 
-        # Arm the reply callback BEFORE publishing: a fast service can reply
-        # while the confirm is still in flight.
-        def on_timeout() -> None:
-            entry = self._callbacks.get(correlation_id)
-            if entry is not None and entry.future is future:
-                self._callbacks.pop(correlation_id, None)
-                if not future.done():
-                    future.set_exception(RpcTimeoutError(
-                        f"no reply for {routing_key} (correlationId {correlation_id}) within {limit}ms"
-                    ))
+        while True:
+            remaining_ms = max(1, int((deadline - loop.time()) * 1000))
+            future: "asyncio.Future[bytes]" = loop.create_future()
 
-        timer = loop.call_later(limit / 1000, on_timeout)
-        self._callbacks[correlation_id] = _CallbackEntry(future, timer)
+            # Arm the reply callback BEFORE publishing: a fast service can reply
+            # while the confirm is still in flight.
+            def on_timeout(future: "asyncio.Future[bytes]" = future) -> None:
+                entry = self._callbacks.get(correlation_id)
+                if entry is not None and entry.future is future:
+                    self._callbacks.pop(correlation_id, None)
+                    if not future.done():
+                        future.set_exception(RpcTimeoutError(
+                            f"no reply for {routing_key} (correlationId {correlation_id}) within {limit}ms"
+                        ))
 
-        try:
+            timer = loop.call_later(remaining_ms / 1000, on_timeout)
+            self._callbacks[correlation_id] = _CallbackEntry(future, timer)
+
             try:
-                await self._connection.publish(self._channel, Config.bus_exchange_name(), routing_key, content, properties)
-            except BaseException:
-                # The request never made it, so no reply is coming. Release
-                # the slot now and surface the publish failure — it wins over
-                # a deadline that may have expired meanwhile.
+                try:
+                    await self._connection.publish(
+                        self._channel, Config.bus_exchange_name(), routing_key, content, self._reply_to(properties),
+                    )
+                except ChannelClosedError:
+                    # The socket died underneath the publish. When that is a
+                    # disconnection (rather than a channel-level failure on a
+                    # live connection), the request is repeated once on the
+                    # restored channel under the same message id — see
+                    # _publish_on_the_bus — with the reply slot re-armed, since
+                    # the disconnect will have failed the one armed above.
+                    if republished or (self._connection.is_connected and not self._connection.is_reconnecting):
+                        raise
+                    republished = True
+                    self._release_callback(correlation_id, timer)
+                    Logger.debug(f"request {correlation_id} lost its channel to a disconnection; republishing once after recovery")
+                    await self._await_publishable()
+                    continue
+                except BaseException:
+                    # The request never made it, so no reply is coming. Release
+                    # the slot now and surface the publish failure — it wins over
+                    # a deadline that may have expired meanwhile.
+                    self._release_callback(correlation_id, timer)
+                    raise
+                return await future
+            finally:
+                # Cancellation-safe: whatever ended the wait, the slot is freed.
                 self._release_callback(correlation_id, timer)
-                raise
-            return await future
-        finally:
-            # Cancellation-safe: whatever ended the wait, the slot is freed.
-            self._release_callback(correlation_id, timer)
+
+    @staticmethod
+    def _with_identity(properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Fix the message id before the first attempt, so a republish after a
+        lost channel is recognisably the same message. Left absent from the
+        caller-visible properties dict when it was not supplied."""
+        if properties.get("message_id"):
+            return properties
+        return {**properties, "message_id": str(uuid.uuid4())}
 
     def _release_callback(self, correlation_id: str, timer: asyncio.TimerHandle) -> None:
         timer.cancel()
@@ -475,13 +540,14 @@ class StreamingReply:
             when_ready = getattr(self._dispatcher._connection, "when_ready", None)
             if callable(when_ready):
                 await when_ready()
-            await self._dispatcher._connection.publish(
-                self._dispatcher._channel, Config.bus_exchange_name(), routing_key, content,
+            await self._dispatcher._publish_on_the_bus(
+                routing_key, content,
                 {
                     "content_type": "application/octet-stream",
                     "correlation_id": self._id,
                     "reply_to": self._dispatcher._callback_listener.callback_queue,
                     "delivery_mode": 2,
+                    "message_id": str(uuid.uuid4()),
                 },
             )
         except asyncio.CancelledError:
