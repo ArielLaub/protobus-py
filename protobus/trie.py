@@ -1,139 +1,84 @@
-"""Trie data structure for topic matching with wildcard support."""
+"""Topic matching with RabbitMQ's wildcards: ``*`` for exactly one word,
+``#`` for zero or more."""
 
 from typing import Any, Dict, List, Optional, Set
 
 
 class TrieNode:
-    """
-    A node in the Trie data structure supporting wildcard matching.
-
-    Supports two wildcard types:
-    - '*' (single-level): matches exactly one segment
-    - '#' (multi-level): matches zero or more segments
-    """
-
-    def __init__(self, word: str = ""):
+    def __init__(self, word: str = "") -> None:
         self.word = word
-        # A list, not a single slot: several subscribers may register the same
-        # pattern. The previous single `value` was overwritten by each new
-        # registration, so only the last subscriber to a topic was ever called
-        # while the queue binding stayed in place and the broker kept
-        # delivering. Parity with TS protobus 2461a28.
+        # A list, not a single slot: several subscribers may register the
+        # same pattern. Empty on a node that is only a step along the way to
+        # a longer pattern, which is what keeps partial matches from matching.
         self.values: List[Any] = []
         self.children: Dict[str, "TrieNode"] = {}
-        self.single_wildcard: Optional["TrieNode"] = None  # '*' wildcard
-        self.super_wildcard: Optional["TrieNode"] = None   # '#' wildcard
+        self.single_wildcard: Optional["TrieNode"] = None  # '*'
+        self.super_wildcard: Optional["TrieNode"] = None  # '#'
 
     def add_match(self, pattern: str, value: Any) -> None:
-        """
-        Add a pattern to the trie with an associated value.
+        node = self
+        for part in pattern.split("."):
+            if part == "*":
+                if node.single_wildcard is None:
+                    node.single_wildcard = TrieNode("*")
+                node = node.single_wildcard
+            elif part == "#":
+                if node.super_wildcard is None:
+                    node.super_wildcard = TrieNode("#")
+                node = node.super_wildcard
+            else:
+                node = node.children.setdefault(part, TrieNode(part))
+        node.values.append(value)
 
-        Args:
-            pattern: Dot-separated pattern string (e.g., "user.*.created")
-            value: Value to associate with the pattern
-        """
-        parts = pattern.split(".")
-        self._add_match_deep(parts, 0, value)
+    def match_topic(self, topic: str) -> List[Any]:
+        results: List[Any] = []
+        seen: Set[int] = set()
+        self._match(topic.split("."), 0, results, seen)
+        return results
 
-    def _add_match_deep(self, parts: List[str], index: int, value: Any) -> None:
-        """Recursively add pattern parts to the trie."""
-        if index >= len(parts):
-            self.values.append(value)
+    def _collect(self, results: List[Any], seen: Set[int]) -> None:
+        for value in self.values:
+            # Deduplicate one value reached through two patterns, keeping
+            # registration order.
+            if id(value) not in seen:
+                seen.add(id(value))
+                results.append(value)
+
+    def _match(self, parts: List[str], index: int, results: List[Any], seen: Set[int]) -> None:
+        if index == len(parts):
+            self._collect(results, seen)
+            # A trailing '#' matches zero words, so a pattern ending in one
+            # ends here too.
+            if self.super_wildcard is not None:
+                self.super_wildcard._match(parts, index, results, seen)
             return
 
         part = parts[index]
-
-        if part == "*":
-            if self.single_wildcard is None:
-                self.single_wildcard = TrieNode("*")
-            self.single_wildcard._add_match_deep(parts, index + 1, value)
-        elif part == "#":
-            if self.super_wildcard is None:
-                self.super_wildcard = TrieNode("#")
-            self.super_wildcard._add_match_deep(parts, index + 1, value)
-        else:
-            if part not in self.children:
-                self.children[part] = TrieNode(part)
-            self.children[part]._add_match_deep(parts, index + 1, value)
-
-    def match_topic(self, topic: str) -> List[Any]:
-        """
-        Find all values matching a given topic string.
-
-        Args:
-            topic: Dot-separated topic string (e.g., "user.123.created")
-
-        Returns:
-            List of values from matching patterns
-        """
-        parts = topic.split(".")
-        results: Set[Any] = set()
-        self._match_topic_deep(parts, 0, results)
-        return list(results)
-
-    def _match_topic_deep(self, parts: List[str], index: int, results: Set[Any]) -> None:
-        """Recursively match topic parts against the trie."""
-        # If we've consumed all parts, collect the values at this node
-        if index >= len(parts):
-            results.update(self.values)
-            # Also check super wildcard at this level (# can match zero segments)
-            if self.super_wildcard is not None:
-                results.update(self.super_wildcard.values)
-            return
-
-        current_part = parts[index]
-
-        # Check exact match
-        if current_part in self.children:
-            self.children[current_part]._match_topic_deep(parts, index + 1, results)
-
-        # Check single wildcard (*)
+        child = self.children.get(part)
+        if child is not None:
+            child._match(parts, index + 1, results, seen)
         if self.single_wildcard is not None:
-            self.single_wildcard._match_topic_deep(parts, index + 1, results)
-
-        # Check super wildcard (#)
+            self.single_wildcard._match(parts, index + 1, results, seen)
         if self.super_wildcard is not None:
-            # # can match zero or more segments
-            # Try matching zero segments (skip to value check)
-            results.update(self.super_wildcard.values)
-
-            # Try matching one segment
-            self.super_wildcard._match_topic_deep(parts, index + 1, results)
-
-            # Try matching multiple segments by staying at super wildcard
-            for i in range(index + 1, len(parts)):
-                self.super_wildcard._match_topic_deep(parts, i + 1, results)
+            # '#' stands for zero or more words: continue from the '#' node
+            # having consumed none, one, ... all of the remaining words.
+            for consumed in range(index, len(parts) + 1):
+                self.super_wildcard._match(parts, consumed, results, seen)
 
 
 class Trie:
-    """Trie data structure for efficient topic matching."""
+    """Maps topic patterns to values; ``match`` returns every value whose
+    pattern matches the topic, each at most once."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._root = TrieNode()
 
     def add_match(self, pattern: str, value: Any) -> None:
-        """
-        Add a pattern to the trie with an associated value.
-
-        Args:
-            pattern: Dot-separated pattern string with optional wildcards
-            value: Value to associate with the pattern
-        """
         self._root.add_match(pattern, value)
 
     def match_topic(self, topic: str) -> List[Any]:
-        """
-        Find all values matching a given topic string.
-
-        Args:
-            topic: Dot-separated topic string
-
-        Returns:
-            List of values from matching patterns
-        """
         return self._root.match_topic(topic)
 
-
-# TS parity aliases: the TypeScript Trie exposes add() and match().
-Trie.add = Trie.add_match  # type: ignore[attr-defined]
-Trie.match = Trie.match_topic  # type: ignore[attr-defined]
+    # TS parity names.
+    add = add_match
+    match = match_topic
