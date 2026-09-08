@@ -341,7 +341,10 @@ def _coerce_scalar(field: FieldDescriptor, value: Any) -> Any:
                 return int(value)
             raise TypeError(f"field '{field.name}' expects an integer, got {value!r}")
         if isinstance(value, str):
-            return int(value.strip(), 0)
+            try:
+                return int(value.strip(), 0)
+            except ValueError:
+                raise TypeError(f"field '{field.name}' expects an integer, got {value!r}") from None
         raise TypeError(f"field '{field.name}' expects an integer, got {type(value).__name__}")
     if t in _FLOAT_TYPES:
         if isinstance(value, bool):
@@ -453,7 +456,11 @@ def _fill_message(message: Message, obj: Any, root: Root) -> Message:
         if custom is not None:
             getattr(message, field.name).value = _wire_value(custom, value)
         elif field.type == FieldDescriptor.TYPE_MESSAGE:
-            _fill_message(getattr(message, field.name), value, root)
+            sub = getattr(message, field.name)
+            _fill_message(sub, value, root)
+            # An empty dict is still a present message: `{}` and "unset" are
+            # different things on the wire and must stay different here.
+            sub.SetInParent()
         else:
             setattr(message, field.name, _coerce_scalar(field, value))
     return message
