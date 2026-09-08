@@ -39,7 +39,7 @@ extract python "# client.py" "$WORK/client.py"
 extract python "# event_subscriber.py" "$WORK/event_subscriber.py"
 
 cd "$WORK"
-export LOG_LEVEL=warn
+export LOG_LEVEL=warn PYTHONUNBUFFERED=1
 "$PYTHON" server.py > server.log 2>&1 &
 "$PYTHON" event_subscriber.py > subscriber.log 2>&1 &
 for _ in $(seq 1 40); do
