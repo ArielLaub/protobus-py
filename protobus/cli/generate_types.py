@@ -167,7 +167,7 @@ def services_in(root: Root) -> List[str]:
     """Every service declared by a user schema in ``root``."""
     names: List[str] = []
     for file_name, fdp in root.files.items():
-        if file_name.startswith("google/protobuf/") or file_name.startswith("protobus/"):
+        if file_name.startswith("google/protobuf/") or file_name.startswith("protobus/custom_types"):
             continue
         for service in fdp.service:
             names.append(f"{fdp.package}.{service.name}" if fdp.package else service.name)

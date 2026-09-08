@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "protobus"
-version = "1.5.0"
-description = "The Protobus micro-services framework - Python port"
+version = "2.0.0"
+description = "Protobus: RabbitMQ + Protocol Buffers micro-services framework (Python port, wire-compatible with the TypeScript original)"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -20,22 +20,27 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Distributed Computing",
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "aio-pika>=9.0.0",
-    "protobuf>=4.0.0",
+    "aiormq>=6.8,<7",
+    "protobuf>=5.26,<7",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "pytest-cov>=4.0.0",
-    "mypy>=1.0.0",
-    "ruff>=0.1.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0",
+    "pytest-timeout>=2.3",
+    "mypy>=1.8",
+    "ruff>=0.4",
+    "build>=1.0",
 ]
 
 [project.scripts]
@@ -52,7 +57,11 @@ include = ["protobus*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests/unit"]
+markers = [
+    "integration: needs a RabbitMQ broker (PROTOBUS_TEST_AMQP_URL)",
+    "cross_language: needs the TypeScript protobus checkout built next to this one",
+]
 
 [tool.mypy]
 python_version = "3.10"
