@@ -294,6 +294,53 @@ class TestShutdownOrdering:
             await Svc.launch(Ctx(), Svc)
         assert order == ["stop_consuming", "cleanup", "disconnect"]
 
+    async def test_one_signal_shuts_down_every_service_running_in_the_process(self):
+        # asyncio keeps ONE handler per signal, so a second service's run()
+        # must not displace the first service's shutdown.
+        import os
+        import signal
+
+        stopped = []
+
+        class Conn:
+            is_connected = True
+            in_flight_deliveries = 0
+
+            async def disconnect(self):
+                pass
+
+        class Ctx:
+            connection = Conn()
+            factory = None
+
+        def svc(name):
+            class Svc(RunnableService):
+                service_name = name
+
+                def __init__(self, context, options=None, **kw):
+                    self.context = context
+                    self._shutdown_event = None
+                    self._shutting_down = False
+
+                async def init(self):
+                    pass
+
+                async def stop_consuming(self):
+                    stopped.append(name)
+
+            return Svc
+
+        first = await svc("A.Service").launch(Ctx())
+        second = await svc("B.Service").launch(Ctx())
+        runs = [asyncio.ensure_future(first.run()), asyncio.ensure_future(second.run())]
+        await tick(2)
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert await asyncio.wait_for(asyncio.gather(*runs), 2) == [0, 0]
+        assert sorted(stopped) == ["A.Service", "B.Service"]
+        # The loop's handler is gone with the last service.
+        loop = asyncio.get_running_loop()
+        assert loop.remove_signal_handler(signal.SIGTERM) is False
+
     async def test_the_drain_budget_is_configurable(self, monkeypatch):
         monkeypatch.setenv("SHUTDOWN_DRAIN_TIMEOUT_MS", "123")
         seen = {}

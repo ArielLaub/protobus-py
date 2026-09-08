@@ -98,6 +98,29 @@ class TestStreamingCallLifetime:
         cancels = [p for p in conn.publishes if p["exchange"] == Config.cancel_exchange_name()]
         assert len(cancels) == 1
 
+    async def test_a_cancelled_consumer_task_closes_the_stream(self):
+        # asyncio cancellation of the task parked on the next chunk: nobody
+        # will read any further, so the producer is told to stop, as it is
+        # for aclose().
+        d, conn = await dispatcher()
+        reply = d.publish_streaming(b"", "REQUEST.X.Y.z", 60000)
+        sid = stream_id(d)
+
+        async def consume():
+            async for _chunk in reply:
+                pass
+
+        task = asyncio.ensure_future(consume())
+        await tick(3)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await tick(2)
+        assert sid not in d.pending_streams
+        cancels = [p for p in conn.publishes if p["exchange"] == Config.cancel_exchange_name()]
+        assert len(cancels) == 1
+        assert cancels[0]["properties"]["correlation_id"] == sid
+
     async def test_async_with_closes_the_stream(self):
         d, conn = await dispatcher()
         async with d.publish_streaming(b"", "REQUEST.X.Y.z", 60000) as reply:

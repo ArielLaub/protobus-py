@@ -151,6 +151,14 @@ A major, because the wire and the API both change. The migration guide is
   RabbitMQ, the combat sample, the cross-language suite, and a
   build-and-install smoke test — all gating the publish workflow.
 - A `LICENSE` file; the README referenced one that was not there.
+- One shutdown signal stops every `RunnableService` inside `run()` in the
+  process: asyncio keeps one handler per signal, so a second service's
+  `run()` used to displace the first service's shutdown.
+- A streaming consumer whose task is cancelled closes the stream and tells the
+  server to stop, as `aclose()` does.
+- `protobus generate` keeps the package in generated names when the services
+  exported span several packages, so two packages each declaring `Service`
+  and `Request` no longer collapse onto the same classes.
 
 ### Removed
 

@@ -10,7 +10,8 @@ RunnableService: a MessageService with lifecycle management.
 import asyncio
 import os
 import signal
-from typing import Any, Awaitable, Callable, Optional, Type, TypeVar
+import weakref
+from typing import Any, Awaitable, Callable, List, Optional, Set, Type, TypeVar
 
 from .context import IContext
 from .logger import Logger
@@ -20,6 +21,11 @@ T = TypeVar("T", bound="RunnableService")
 
 # Signals a running service shuts down on. Not every platform has SIGTERM.
 _SHUTDOWN_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM") if hasattr(signal, name))
+
+# Services currently inside run(), per loop, and the signals whose loop
+# handler is ours. See RunnableService._install_signal_handlers.
+_running_services: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Set[RunnableService]]" = weakref.WeakKeyDictionary()
+_installed_signals: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, List[signal.Signals]]" = weakref.WeakKeyDictionary()
 
 
 class RunnableService(MessageService):
@@ -105,22 +111,39 @@ class RunnableService(MessageService):
         return self._exit_code
 
     def _install_signal_handlers(self) -> Callable[[], None]:
+        """
+        Register this service with the loop's shutdown signals.
+
+        ``loop.add_signal_handler`` keeps ONE handler per signal, so services
+        running side by side in a process share a handler that shuts every
+        registered service down; each service's ``run()`` adds itself on the
+        way in and removes itself on the way out, and the loop's handlers go
+        with the last one.
+        """
         loop = asyncio.get_running_loop()
-        installed = []
+        running = _running_services.setdefault(loop, set())
+        running.add(self)
+        installed = _installed_signals.setdefault(loop, [])
 
         def request_shutdown(sig_name: str) -> None:
-            loop.create_task(self.shutdown(f"signal: {sig_name}"))
+            for service in list(_running_services.get(loop, ())):
+                loop.create_task(service.shutdown(f"signal: {sig_name}"))
 
-        for sig in _SHUTDOWN_SIGNALS:
-            try:
-                loop.add_signal_handler(sig, request_shutdown, sig.name)
-                installed.append(sig)
-            except (NotImplementedError, RuntimeError, ValueError):
-                # Windows, or not the main thread: no signal handling.
-                pass
+        if not installed:
+            for sig in _SHUTDOWN_SIGNALS:
+                try:
+                    loop.add_signal_handler(sig, request_shutdown, sig.name)
+                    installed.append(sig)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    # Windows, or not the main thread: no signal handling.
+                    pass
 
         def remove() -> None:
-            for sig in installed:
+            running.discard(self)
+            if running:
+                return
+            _running_services.pop(loop, None)
+            for sig in _installed_signals.pop(loop, []):
                 try:
                     loop.remove_signal_handler(sig)
                 except Exception:

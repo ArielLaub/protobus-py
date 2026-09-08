@@ -676,6 +676,10 @@ class StreamingReply:
             except asyncio.CancelledError:
                 if stream.waiter is waiter:
                     stream.waiter = None
+                # The consuming task is going away, so nobody will read what
+                # the producer sends next: stop it, as closing the stream
+                # would, rather than letting it run to completion for nothing.
+                self._cancel()
                 raise
             except BaseException:
                 # The error is on the entry; the loop above raises it.

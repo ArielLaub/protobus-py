@@ -127,6 +127,23 @@ class TestGeneratedTypesMatchTheRuntimeContract:
         assert services_in(factory.root) == ["Demo.Calc"]
         assert "class Calc(Protocol)" in export_python(factory.root, ["Demo.Calc"])
 
+    def test_services_from_several_packages_keep_their_package_in_the_name(self):
+        # One output module: two packages each declaring `Service` and
+        # `Request` must not collapse onto the same class names.
+        factory = MessageFactory()
+        factory.init([])
+        factory.parse('syntax = "proto3"; package Orders; message Request { string id = 1; } message Response { string id = 1; } service Service { rpc get(Orders.Request) returns (Orders.Response); }', "Orders.Service")
+        factory.parse('syntax = "proto3"; package Payments; message Request { string id = 1; } message Response { string id = 1; } service Service { rpc charge(Payments.Request) returns (Payments.Response); }', "Payments.Service")
+        generated = export_python(factory.root, ["Orders.Service", "Payments.Service"])
+        namespace: dict = {}
+        exec(generated, namespace)
+        assert namespace["ORDERS_SERVICE_NAME"] == "Orders.Service"
+        assert namespace["PAYMENTS_SERVICE_NAME"] == "Payments.Service"
+        assert {"Orders_Service", "Orders_Request", "Payments_Service", "Payments_Request"} <= set(namespace)
+        assert "class Service(" not in generated
+        # A single package still gets the short names.
+        assert "class Service(Protocol)" in export_python(factory.root, ["Orders.Service"])
+
     def test_a_missing_proto_directory_is_reported(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             generate_types(proto_dir=str(tmp_path / "nope"), output=str(tmp_path / "t.py"), cwd=str(tmp_path))
