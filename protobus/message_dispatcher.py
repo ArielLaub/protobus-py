@@ -856,7 +856,13 @@ class StreamingReply:
         # withdrawn by cancellation must not surface here as CancelledError.
         stream = self._stream
         if self._publish_task is not None:
-            if not self._publish_task.done():
+            if stream.ended or stream.error is not None:
+                # Already terminal — the idle deadline, a close or an abort
+                # got here before the first pull, or a previous pull already
+                # reported it. There is nothing to wait for; the send, if it
+                # is still in flight, settles on its own.
+                pass
+            elif not self._publish_task.done():
                 # Wait for the send to settle OR for the call to end first —
                 # the idle deadline, a close, an abort. A send stalled on the
                 # confirm must not hold the caller past its own deadline;

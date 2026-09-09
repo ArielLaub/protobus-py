@@ -855,6 +855,28 @@ class TestATerminalOutcomeUnblocksACallerWaitingOnThePublish:
         gate.set()
         await tick(3)
 
+    @pytest.mark.parametrize("how", ["timeout", "close", "abort"])
+    async def test_a_terminal_event_before_the_first_pull_does_not_wait_for_the_send(self, how):
+        conn, d, gate = await self.stalled()
+        ac = AbortController()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 20 if how == "timeout" else 5000, StreamOptions(signal=ac.signal))
+        await tick(2)
+        if how == "timeout":
+            await asyncio.sleep(0.05)
+        elif how == "close":
+            await reply.aclose()
+        else:
+            ac.abort()
+        # The first pull happens AFTER the event, with the send still stalled.
+        expected = StreamTimeoutError if how == "timeout" else StopAsyncIteration
+        with pytest.raises(expected):
+            await asyncio.wait_for(reply.__anext__(), 0.5)
+        # And so does a second pull after the outcome has been observed once.
+        with pytest.raises(expected):
+            await asyncio.wait_for(reply.__anext__(), 0.5)
+        gate.set()
+        await tick(3)
+
     async def test_a_late_publish_failure_does_not_overwrite_the_outcome(self):
         conn, d, gate = await self.stalled()
         reply = d.publish_streaming(b"req", "R.A.B.c", 20)

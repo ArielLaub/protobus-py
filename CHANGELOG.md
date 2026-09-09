@@ -232,6 +232,9 @@ item.
 - **Ambiguous sends are cancelled.** A confirm timeout or a closed channel
   may have reached a producer, so a notice is sent; only a nack or an
   unroutable return — the server never saw the request — goes without one.
+- A stream that timed out, was closed or was aborted *before* its first
+  pull — or after a pull already reported the outcome — no longer waits for
+  a stalled send on the next pull.
 - **A `None` map entry skips that entry only.** The encoding refactor had
   turned the skip into a return, dropping every entry after it.
 
