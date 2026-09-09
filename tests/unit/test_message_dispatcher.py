@@ -21,6 +21,16 @@ from protobus import (
 from ..helpers import FakeConnection, tick
 
 
+async def armed(d, attempts=20):
+    """The reply slots once the call has armed one — independent of how many
+    loop iterations that takes on a given Python version."""
+    for _ in range(attempts):
+        if d.pending_callbacks:
+            return d.pending_callbacks
+        await asyncio.sleep(0)
+    raise AssertionError("no reply slot was armed")
+
+
 async def dispatcher(conn=None):
     conn = conn or FakeConnection()
     d = MessageDispatcher(conn)
@@ -209,7 +219,7 @@ class TestAReplyDeadlineThatExpiresWhileTheConfirmIsInFlight:
         conn = SlowConfirmConnection()
         d, _ = await dispatcher(conn)
         call = asyncio.ensure_future(d.publish(b"x", "REQUEST.A.B.c", True, 5000))
-        await tick(2)
+        await armed(d)
         conn.emit("disconnected")
         conn.release_confirm()
         with pytest.raises(DisconnectedError):
@@ -220,9 +230,8 @@ class TestAReplyDeadlineThatExpiresWhileTheConfirmIsInFlight:
         conn = SlowConfirmConnection()
         d, _ = await dispatcher(conn)
         call = asyncio.ensure_future(d.publish(b"x", "REQUEST.A.B.c", True, 5000))
-        await tick(2)
         # The callback is armed BEFORE the publish resolves.
-        correlation_id = next(iter(d.pending_callbacks))
+        correlation_id = next(iter(await armed(d)))
         await d._on_result(b"fast", correlation_id, {})
         conn.release_confirm()
         assert await call == b"fast"

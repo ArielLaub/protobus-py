@@ -348,16 +348,20 @@ class BaseListener(EventEmitter):
         self._detach_restorer()
         self._connection.off("disconnected", self._bound_on_disconnected)
 
-        if self._connection.is_connected and self._channel is not None:
+        # Given up deliberately, before the channel goes: its closing callback
+        # must read "replaced", not "lost", or it would rebuild a channel for
+        # a listener that is shutting down.
+        channel, self._channel = self._channel, None
+        self._was_started = False
+        if self._connection.is_connected and channel is not None:
             try:
                 if self._consumer_tag:
-                    await self._connection.cancel(self._channel, self._consumer_tag)
-                await self._connection.close_channel(self._channel)
+                    await self._connection.cancel(channel, self._consumer_tag)
+                await self._connection.close_channel(channel)
             except Exception as err:
                 Logger.debug(f"{type(self).__name__}: error during close (may be expected): {err}")
 
         self._consumer_tag = ""
-        self._channel = None
         self._is_initialized = False
         self._was_started = False
         self._bindings = []

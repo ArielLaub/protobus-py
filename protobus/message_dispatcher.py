@@ -351,6 +351,21 @@ class MessageDispatcher:
         if callable(when_ready):
             await when_ready()
 
+    async def _await_publishable_within(self, remaining: Callable[[], float], expired: Callable[[], BaseException]) -> None:
+        """
+        ``_await_publishable`` under a deadline. A connection that is usable
+        right now is not sent through ``wait_for`` at all: that would cost a
+        task hop on older Pythons and make an ordinary publish take extra
+        loop iterations for nothing.
+        """
+        if self._connection.is_connected and not self._connection.is_reconnecting and getattr(self._connection, "is_ready", True):
+            await self._await_publishable()
+            return
+        try:
+            await asyncio.wait_for(self._await_publishable(), timeout=max(0.0, remaining()))
+        except asyncio.TimeoutError:
+            raise expired() from None
+
     def _reply_to(self, properties: Dict[str, Any]) -> Dict[str, Any]:
         """
         The current callback queue, read at publish time rather than earlier.
@@ -450,10 +465,7 @@ class MessageDispatcher:
 
         # Readiness counts against the deadline: a caller parked on a
         # reconnection is told at its own deadline, not the connection's.
-        try:
-            await asyncio.wait_for(self._await_publishable(), timeout=max(0.0, remaining()))
-        except asyncio.TimeoutError:
-            raise timed_out(False) from None
+        await self._await_publishable_within(remaining, lambda: timed_out(False))
 
         republished = False
         while True:
@@ -520,10 +532,7 @@ class MessageDispatcher:
                     # second — if the deadline still allows it.
                     republished = True
                     Logger.debug(f"request {correlation_id} lost its channel to a disconnection; republishing once after recovery")
-                    try:
-                        await asyncio.wait_for(self._await_publishable(), timeout=max(0.0, remaining()))
-                    except asyncio.TimeoutError:
-                        raise timed_out(None) from None
+                    await self._await_publishable_within(remaining, lambda: timed_out(None))
                     continue
                 # A publish failure wins over the deadline: "the request never
                 # left" is the more specific answer.

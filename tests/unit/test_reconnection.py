@@ -556,6 +556,15 @@ class TestALostChannelOnALiveConnectionIsRebuilt:
         # The connection's own restoration owns this case.
         assert len(conn.consumes) == 1
 
+    async def test_not_when_the_listener_closes_its_own_channel(self):
+        conn, listener = await self.listener()
+        first = listener.channel
+        await listener.close()
+        await tick(3)
+        assert listener.channel is None
+        assert len(conn.consumes) == 1
+        assert first.closed is True
+
     async def test_not_after_the_listener_stopped(self):
         conn, listener = await self.listener()
         first = listener.channel

@@ -13,7 +13,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-python}"
 DOC="$REPO_ROOT/docs/guide/getting-started.md"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/protobus-getting-started.XXXXXX")"
-trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/proto"
 
 # Pull each fenced block out of the doc by the file name in its first line.
