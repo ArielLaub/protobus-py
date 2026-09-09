@@ -219,6 +219,21 @@ item.
 - CI pins the TypeScript checkout to the 2.4.0 release commit, and the
   cross-language cancellation test asserts on the TypeScript producer's own
   counter that it stopped.
+- **Completed streams are collectable.** The entry the dispatcher and the
+  reply's finalizer hold now refers to the reply only weakly, and the
+  finalizer is detached on every ordinary release, so consumed, closed,
+  failed, timed-out, aborted and abandoned streams all become unreachable
+  once the application drops them (pinned with weak references and a full
+  collection).
+- **A stalled send no longer holds the caller.** The idle deadline, a close
+  or an abort ends a pull that was waiting for the request to publish; the
+  send settles in the background without overwriting the outcome, and its
+  notice still follows the request.
+- **Ambiguous sends are cancelled.** A confirm timeout or a closed channel
+  may have reached a producer, so a notice is sent; only a nack or an
+  unroutable return — the server never saw the request — goes without one.
+- **A `None` map entry skips that entry only.** The encoding refactor had
+  turned the skip into a return, dropping every entry after it.
 
 ### Removed
 

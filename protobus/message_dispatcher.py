@@ -17,10 +17,12 @@ from .errors import (
     DisconnectedError,
     InvalidMessageIdError,
     NotConnectedError,
+    PublishNackedError,
     RpcTimeoutError,
     StreamBackpressureError,
     StreamSequenceError,
     StreamTimeoutError,
+    UnroutableError,
 )
 from .logger import Logger
 from .priority import validate_message_priority
@@ -131,7 +133,7 @@ class _StreamEntry:
     """A pending streaming RPC: replies arriving as multiple messages with
     the same correlation id, buffered until the consumer pulls them."""
 
-    __slots__ = ("chunks", "buffered_bytes", "last_seq", "waiter", "ended", "error", "touch", "on_failure")
+    __slots__ = ("chunks", "buffered_bytes", "last_seq", "waiter", "ended", "error", "owner")
 
     def __init__(self) -> None:
         self.chunks: Deque[bytes] = deque()
@@ -140,11 +142,13 @@ class _StreamEntry:
         self.waiter: Optional["asyncio.Future[None]"] = None
         self.ended = False
         self.error: Optional[BaseException] = None
-        self.touch: Optional[Callable[[], None]] = None
-        # Called the moment the dispatcher gives up on the stream (a lost
-        # chunk, a buffer bound): the producer is told to stop right then,
-        # not whenever the consumer next pulls.
-        self.on_failure: Optional[Callable[[], None]] = None
+        # The StreamingReply consuming this entry, held WEAKLY: the entry is
+        # what the dispatcher (and the reply's finalizer) hold, so a strong
+        # reference here would keep every completed reply alive forever.
+        self.owner: Optional["weakref.ReferenceType[StreamingReply]"] = None
+
+    def reply(self) -> Optional["StreamingReply"]:
+        return self.owner() if self.owner is not None else None
 
     def wake(self, error: Optional[BaseException] = None) -> None:
         waiter, self.waiter = self.waiter, None
@@ -302,8 +306,9 @@ class MessageDispatcher:
             stream.chunks.append(body)
             stream.buffered_bytes = would_be_bytes
             self._total_buffered_bytes = would_be_total
-            if stream.touch is not None:
-                stream.touch()
+            reply = stream.reply()
+            if reply is not None:
+                reply._arm_idle()
         if is_final:
             stream.ended = True
         stream.wake()
@@ -320,8 +325,9 @@ class MessageDispatcher:
         stream.error = error
         stream.ended = True
         self._drop_buffer(stream)
-        if stream.on_failure is not None:
-            stream.on_failure()
+        reply = stream.reply()
+        if reply is not None:
+            reply._cancel(notify_only=True)
         stream.wake()
 
     @staticmethod
@@ -614,6 +620,17 @@ class MessageDispatcher:
         return StreamingReply(self, content, routing_key, idle_timeout_ms, options)
 
 
+def _publish_outcome_is_ambiguous(error: Optional[BaseException]) -> bool:
+    """
+    Whether a failed publish may nonetheless have reached the broker. Only a
+    nack and an unroutable return are definite; a confirm timeout, a closed
+    channel, and anything unexpected leave the request's fate unknown.
+    """
+    if error is None:
+        return False
+    return not isinstance(error, (PublishNackedError, UnroutableError))
+
+
 class StreamingReply:
     """The async iterator ``publish_streaming`` returns. See its docstring."""
 
@@ -637,14 +654,16 @@ class StreamingReply:
         # Where the request is on its way to the broker. "unsent" can still
         # be withdrawn; "sending" is ambiguous; "sent" was confirmed.
         self._publish_state = "unsent"
+        self._publish_error: Optional[BaseException] = None
         self._loop = asyncio.get_running_loop()
 
         dispatcher._pending_streams[self._id] = self._stream
-        self._stream.touch = self._arm_idle
-        self._stream.on_failure = lambda: self._cancel(notify_only=True)
+        self._stream.owner = weakref.ref(self)
         # A reply dropped without being closed or exhausted must not keep its
-        # buffer and slot alive in the dispatcher.
-        weakref.finalize(self, MessageDispatcher._forget_stream, dispatcher, self._id, self._stream)
+        # buffer and slot alive in the dispatcher. The finalizer holds only
+        # the dispatcher, the id and the entry — nothing that leads back to
+        # this object — and is detached on every ordinary release.
+        self._finalizer = weakref.finalize(self, MessageDispatcher._forget_stream, dispatcher, self._id, self._stream)
 
         aborted_before_start = self._signal is not None and self._signal.aborted
         if self._signal is not None and not aborted_before_start:
@@ -692,11 +711,22 @@ class StreamingReply:
             raise
         except BaseException as err:
             self._publish_state = "failed"
+            self._publish_error = err
+            if self._released:
+                # Already terminal — an idle deadline or a close got there
+                # first. That outcome stands; a cancel notice, if one is due,
+                # is sent by the done-callback _cancel registered.
+                return
             self._stream.error = err
             self._stream.ended = True
             # Nothing is coming: release now rather than on the next pull,
             # which may never happen. The error stays for the consumer.
-            self._release_call()
+            if _publish_outcome_is_ambiguous(err):
+                # The broker may hold the request and a producer may be
+                # running for a caller that will never read: tell it.
+                self._cancel(notify_only=True)
+            else:
+                self._release_call()
             self._stream.wake(err)
 
     # -- idle deadline --------------------------------------------------------
@@ -736,6 +766,9 @@ class StreamingReply:
         self._released = True
         self._clear_idle()
         self._release_signal()
+        detach = getattr(self._finalizer, "detach", None)
+        if callable(detach):
+            detach()
         self._dispatcher._pending_streams.pop(self._id, None)
         self._dispatcher._drop_buffer(self._stream)
 
@@ -776,8 +809,10 @@ class StreamingReply:
         """Tell the producer to stop, if a request may have reached it."""
         if self._publish_state == "unsent":
             return
-        if self._publish_state == "failed" and not isinstance(self._stream.error, ChannelClosedError):
-            # A definite publish failure: the server never saw the request.
+        if self._publish_state == "failed" and not _publish_outcome_is_ambiguous(self._publish_error):
+            # A definite publish failure — nacked, or returned unroutable:
+            # the server never saw the request. Anything ambiguous (a confirm
+            # timeout, a closed channel) may have reached a producer.
             return
         dispatcher = self._dispatcher
         channel = dispatcher._channel
@@ -819,11 +854,27 @@ class StreamingReply:
         # Wait for the publish to settle once before consuming. Its outcome
         # is already on the entry (an error, or nothing); a publish that was
         # withdrawn by cancellation must not surface here as CancelledError.
-        if self._publish_task is not None:
-            await asyncio.wait({self._publish_task})
-            self._publish_task = None
-
         stream = self._stream
+        if self._publish_task is not None:
+            if not self._publish_task.done():
+                # Wait for the send to settle OR for the call to end first —
+                # the idle deadline, a close, an abort. A send stalled on the
+                # confirm must not hold the caller past its own deadline;
+                # the send stays owned and settles in the background.
+                waiter: "asyncio.Future[None]" = self._loop.create_future()
+                stream.waiter = waiter
+                try:
+                    await asyncio.wait({self._publish_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    if stream.waiter is waiter:
+                        stream.waiter = None
+                    if waiter.done() and not waiter.cancelled():
+                        waiter.exception()  # the error, if any, is on the entry
+                    elif not waiter.done():
+                        waiter.cancel()
+            if self._publish_task.done():
+                self._publish_task = None
+
         while True:
             if stream.error is not None:
                 error = stream.error

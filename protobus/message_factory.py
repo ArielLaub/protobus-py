@@ -460,50 +460,51 @@ def _fill_message(message: Message, obj: Any, root: Root) -> Message:
 
 
 def _fill_field(message: Message, field: FieldDescriptor, value: Any, root: Root) -> None:
-    for_error = message.DESCRIPTOR.full_name
-    if True:
-        custom = _custom_type_of(field)
+    """Set one field of ``message`` from a Python value."""
+    custom = _custom_type_of(field)
 
-        if _is_map(field):
-            if not isinstance(value, dict):
-                raise FieldTypeError(f"field '{field.name}' expects a dict, got {type(value).__name__}")
-            target = getattr(message, field.name)
-            value_field = field.message_type.fields_by_name["value"]
-            value_custom = _custom_type_of(value_field)
-            for k, v in value.items():
-                if v is None:
-                    return
-                if value_custom is not None:
-                    target[k].value = _wire_value(value_custom, v)
-                elif value_field.type == FieldDescriptor.TYPE_MESSAGE:
-                    _fill_message(target[k], v, root)
-                else:
-                    target[k] = _coerce_scalar(value_field, v)
-            return
+    if _is_map(field):
+        if not isinstance(value, dict):
+            raise FieldTypeError(f"field '{field.name}' expects a dict, got {type(value).__name__}")
+        target = getattr(message, field.name)
+        value_field = field.message_type.fields_by_name["value"]
+        value_custom = _custom_type_of(value_field)
+        for k, v in value.items():
+            if v is None:
+                # A None entry is skipped, as protobufjs's fromObject skips
+                # it — only THAT entry; the ones after it are kept.
+                continue
+            if value_custom is not None:
+                target[k].value = _wire_value(value_custom, v)
+            elif value_field.type == FieldDescriptor.TYPE_MESSAGE:
+                _fill_message(target[k], v, root)
+            else:
+                target[k] = _coerce_scalar(value_field, v)
+        return
 
-        if _is_repeated(field):
-            if isinstance(value, (str, bytes, dict)) or not isinstance(value, Iterable):
-                raise FieldTypeError(f"field '{field.name}' expects a list, got {type(value).__name__}")
-            target = getattr(message, field.name)
-            for item in value:
-                if custom is not None:
-                    target.add().value = _wire_value(custom, item)
-                elif field.type == FieldDescriptor.TYPE_MESSAGE:
-                    _fill_message(target.add(), item, root)
-                else:
-                    target.append(_coerce_scalar(field, item))
-            return
+    if _is_repeated(field):
+        if isinstance(value, (str, bytes, dict)) or not isinstance(value, Iterable):
+            raise FieldTypeError(f"field '{field.name}' expects a list, got {type(value).__name__}")
+        target = getattr(message, field.name)
+        for item in value:
+            if custom is not None:
+                target.add().value = _wire_value(custom, item)
+            elif field.type == FieldDescriptor.TYPE_MESSAGE:
+                _fill_message(target.add(), item, root)
+            else:
+                target.append(_coerce_scalar(field, item))
+        return
 
-        if custom is not None:
-            getattr(message, field.name).value = _wire_value(custom, value)
-        elif field.type == FieldDescriptor.TYPE_MESSAGE:
-            sub = getattr(message, field.name)
-            _fill_message(sub, value, root)
-            # An empty dict is still a present message: `{}` and "unset" are
-            # different things on the wire and must stay different here.
-            sub.SetInParent()
-        else:
-            setattr(message, field.name, _coerce_scalar(field, value))
+    if custom is not None:
+        getattr(message, field.name).value = _wire_value(custom, value)
+    elif field.type == FieldDescriptor.TYPE_MESSAGE:
+        sub = getattr(message, field.name)
+        _fill_message(sub, value, root)
+        # An empty dict is still a present message: `{}` and "unset" are
+        # different things on the wire and must stay different here.
+        sub.SetInParent()
+    else:
+        setattr(message, field.name, _coerce_scalar(field, value))
 
 
 def _wire_value(custom: CustomType, value: Any) -> Any:

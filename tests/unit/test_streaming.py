@@ -710,3 +710,206 @@ class TestTheEncodingWrapperOwnsTheHandlerIterator:
         out = [c async for c in wrapper]
         assert len(out) == 2  # the chunk, then the terminal error
         assert closed == [True]
+
+
+class TestACompletedStreamIsCollectable:
+    """Nothing the dispatcher holds — the pending entry, the finalizer — may
+    lead back to a StreamingReply the application has dropped. Otherwise
+    every completed call accumulates for the life of the process."""
+
+    async def _run(self, conn, scenario):
+        import weakref
+
+        d = MessageDispatcher(conn)
+        await d.init()
+        ac = AbortController()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000 if scenario != "timeout" else 10, StreamOptions(signal=ac.signal))
+        sid = stream_id(d)
+        await tick(2)
+        if scenario == "consumed":
+            body, headers = chunk(0, "a", final=True)
+            await d._on_result(body, sid, headers)
+            assert [c async for c in reply] == [b"a"]
+        elif scenario == "closed":
+            await reply.aclose()
+        elif scenario == "failed":
+            body, headers = chunk(2, "gap")
+            await d._on_result(body, sid, headers)
+            with pytest.raises(StreamSequenceError):
+                await reply.__anext__()
+        elif scenario == "timeout":
+            with pytest.raises(StreamTimeoutError):
+                await reply.__anext__()
+        elif scenario == "abandoned":
+            pass  # dropped without ever iterating or closing
+        elif scenario == "aborted":
+            ac.abort()
+            with pytest.raises(StopAsyncIteration):
+                await reply.__anext__()
+        ref = weakref.ref(reply)
+        del reply
+        await tick(3)
+        import gc
+
+        gc.collect()
+        await tick(2)
+        return ref, d
+
+    @pytest.mark.parametrize("scenario", ["consumed", "closed", "failed", "timeout", "aborted"])
+    async def test_every_terminal_path_releases_the_object(self, scenario):
+        conn = FakeConnection()
+        ref, d = await self._run(conn, scenario)
+        assert ref() is None, f"a {scenario} stream is still alive after collection"
+        assert len(d.pending_streams) == 0 and d._total_buffered_bytes == 0
+
+    async def test_a_dropped_stream_is_released_once_its_idle_deadline_passes(self):
+        import gc
+        import weakref
+
+        conn = FakeConnection()
+        d = MessageDispatcher(conn)
+        await d.init()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 20)
+        sid = stream_id(d)
+        ref = weakref.ref(reply)
+        del reply
+        await asyncio.sleep(0.05)  # the idle timer, the last strong holder, fires
+        gc.collect()
+        await tick(2)
+        assert ref() is None
+        assert sid not in d.pending_streams
+
+    async def test_the_finalizer_alone_releases_a_dropped_entry_without_a_timer(self):
+        # Belt and braces: with the idle timer out of the picture, dropping
+        # the reply still releases the entry through the finalizer.
+        import gc
+
+        conn = FakeConnection()
+        d = MessageDispatcher(conn)
+        await d.init()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000)
+        sid = stream_id(d)
+        await tick(2)
+        reply._clear_idle()
+        del reply
+        gc.collect()
+        await tick(2)
+        assert sid not in d.pending_streams
+
+
+class TestATerminalOutcomeUnblocksACallerWaitingOnThePublish:
+    """A send stalled on the confirm must not hold the caller past the
+    stream's own idle deadline, close or abort. The send stays owned."""
+
+    async def stalled(self):
+        conn = FakeConnection()
+        gate = asyncio.Event()
+
+        async def hold(*_a, **_k):
+            await gate.wait()
+
+        conn.publish_hook = hold
+        d, _ = await dispatcher(conn)
+        return conn, d, gate
+
+    async def test_the_idle_deadline_raises_promptly(self):
+        conn, d, gate = await self.stalled()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 20)
+        pull = asyncio.ensure_future(reply.__anext__())
+        await asyncio.sleep(0.06)
+        assert pull.done()
+        with pytest.raises(StreamTimeoutError):
+            await pull
+        assert len(d.pending_streams) == 0
+        # The send settles later without disturbing the outcome, and the
+        # notice follows the request rather than preceding it.
+        gate.set()
+        conn.publish_hook = None
+        await tick(3)
+        assert [p["exchange"] for p in conn.publishes] == [Config.bus_exchange_name(), Config.cancel_exchange_name()]
+        with pytest.raises(StreamTimeoutError):
+            await reply.__anext__()
+
+    async def test_close_ends_the_wait(self):
+        conn, d, gate = await self.stalled()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000)
+        pull = asyncio.ensure_future(reply.__anext__())
+        await tick(2)
+        await reply.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(pull, 0.5)
+        gate.set()
+        conn.publish_hook = None
+        await tick(3)
+        assert [p["exchange"] for p in conn.publishes] == [Config.bus_exchange_name(), Config.cancel_exchange_name()]
+
+    async def test_abort_ends_the_wait(self):
+        conn, d, gate = await self.stalled()
+        ac = AbortController()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000, StreamOptions(signal=ac.signal))
+        pull = asyncio.ensure_future(reply.__anext__())
+        await tick(2)
+        ac.abort()
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(pull, 0.5)
+        gate.set()
+        await tick(3)
+
+    async def test_a_late_publish_failure_does_not_overwrite_the_outcome(self):
+        conn, d, gate = await self.stalled()
+        reply = d.publish_streaming(b"req", "R.A.B.c", 20)
+        with pytest.raises(StreamTimeoutError):
+            await asyncio.wait_for(reply.__anext__(), 0.5)
+
+        async def fail(*_a, **_k):
+            raise RuntimeError("late nack")
+
+        conn.publish_hook = fail
+        gate.set()
+        await tick(3)
+        with pytest.raises(StreamTimeoutError):
+            await reply.__anext__()
+
+
+class TestTheCancelNoticeFollowsTheDeliveryOutcome:
+    """Only a request the server definitely never saw goes without a notice.
+    An ambiguous send — a confirm timeout, a closed channel — may have
+    reached a producer, which must be told."""
+
+    async def failing(self, error):
+        conn = FakeConnection()
+
+        async def fail(*_a, **_k):
+            raise error
+
+        conn.publish_hook = fail
+        d, _ = await dispatcher(conn)
+        reply = d.publish_streaming(b"req", "R.A.B.c", 5000)
+        with pytest.raises(type(error)):
+            await reply.__anext__()
+        await reply.aclose()
+        await tick(3)
+        return [p for p in conn.publishes if p["exchange"] == Config.cancel_exchange_name()]
+
+    async def test_a_confirm_timeout_sends_a_notice(self):
+        from protobus import PublishConfirmTimeoutError
+
+        assert len(await self.failing(PublishConfirmTimeoutError("no confirm", "m"))) == 1
+
+    async def test_a_closed_channel_sends_a_notice(self):
+        from protobus import ChannelClosedError
+
+        assert len(await self.failing(ChannelClosedError("closed", "m"))) == 1
+
+    async def test_an_unexpected_error_is_treated_as_ambiguous(self):
+        assert len(await self.failing(RuntimeError("what happened?"))) == 1
+
+    async def test_a_nack_sends_none(self):
+        from protobus import PublishNackedError
+
+        assert await self.failing(PublishNackedError("nacked", "m")) == []
+
+    async def test_an_unroutable_return_sends_none(self):
+        from protobus import UnroutableError
+
+        assert await self.failing(UnroutableError("no route", "m")) == []

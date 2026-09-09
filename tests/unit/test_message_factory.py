@@ -537,3 +537,26 @@ class TestValidationErrorsNeverCarryTheValue:
         finally:
             set_logger(__import__("protobus").DefaultLogger())
         assert lines and "SYNTHETIC_SECRET" not in "\n".join(lines)
+
+
+class TestANoneMapEntryIsSkippedNotTruncating:
+    PROTO = (
+        'syntax = "proto3"; package Maps; message Inner { int32 n = 1; } '
+        "message M { map<string, int32> ints = 1; map<string, Inner> msgs = 2; map<string, bigint> bigs = 3; } "
+        "service S { rpc go(Maps.M) returns (Maps.M); }"
+    )
+
+    @pytest.mark.parametrize("position", ["first", "middle", "last"])
+    def test_every_other_entry_survives(self, position):
+        factory = make_factory(self.PROTO, "Maps.S")
+        entries = [("a", 1), ("b", 2), ("c", 3)]
+        hole = {"first": 0, "middle": 1, "last": 2}[position]
+        ints = {k: (None if i == hole else v) for i, (k, v) in enumerate(entries)}
+        msgs = {k: (None if i == hole else {"n": v}) for i, (k, v) in enumerate(entries)}
+        bigs = {k: (None if i == hole else 10**20 + v) for i, (k, v) in enumerate(entries)}
+        request = factory.decode_request(factory.build_request("Maps.S.go", {"ints": ints, "msgs": msgs, "bigs": bigs}, "a")).data
+        kept = [k for i, (k, _) in enumerate(entries) if i != hole]
+        assert sorted(request["ints"]) == kept
+        assert sorted(request["msgs"]) == kept
+        assert sorted(request["bigs"]) == kept
+        assert request["msgs"][kept[0]]["n"] == dict(entries)[kept[0]]

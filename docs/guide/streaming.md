@@ -212,7 +212,7 @@ The cancellation notice is an ordinary message, published once and not retried. 
 
 There is no resend: cancellation is idempotent on both sides, so a second `abort()` or `aclose()` sends nothing, and once a stream is closed the client discards whatever else arrives for it, so application code cannot observe whether the producer stopped. A producer whose work is expensive enough to matter should bound it on its own side — a deadline on the upstream call, a cap on tokens — rather than rely on a notice that is best effort by design.
 
-Three cases are handled without a notice at all: a stream closed **before its request went out** (while the connection was being restored) is simply withdrawn, and the request is never published; a request whose publish definitely failed has nothing to cancel; and a stream closed **while its request is mid-send** has its notice held until the send settles, so the notice cannot overtake the request it cancels.
+Two cases go without a notice, because the server never saw the request: a stream closed **before its request went out** (while the connection was being restored) is simply withdrawn and never published, and a request the broker **nacked or returned unroutable** has nothing to cancel. An *ambiguous* send — a confirm timeout, a channel that closed mid-send — does get a notice, because a producer may be running for a caller that will never read. A stream closed **while its request is mid-send** has its notice held until the send settles, so it cannot overtake the request it cancels; the caller itself is not held — the idle deadline, a close or an abort ends its wait at once, and the send settles on its own afterwards.
 
 #### How it travels
 
