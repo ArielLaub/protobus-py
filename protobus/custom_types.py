@@ -154,6 +154,13 @@ BIGINT_WIRE_BYTES = BIGINT_BYTES  # 1.x name
 #: Largest value representable in the 32-byte unsigned wire format.
 BIGINT_MAX = (1 << (BIGINT_BYTES * 8)) - 1
 
+# Largest integer a float holds exactly (Number.MAX_SAFE_INTEGER).
+_MAX_SAFE_FLOAT_INT = 2**53 - 1
+
+#: Largest magnitude, in milliseconds, a JavaScript Date (and so a TypeScript
+#: peer) can hold.
+MAX_TIMESTAMP_MS = 8_640_000_000_000_000
+
 
 def bigint_to_bytes(value: Union[int, str]) -> bytes:
     """
@@ -176,6 +183,13 @@ def bigint_to_bytes(value: Union[int, str]) -> bytes:
     elif isinstance(value, float):
         if not value.is_integer():
             raise ValueError(f"bigint value {value!r} is not an integer")
+        # Above 2**53 a float has already lost precision (2.0**60 + 1 is
+        # 2.0**60), so encoding it would send the wrong amount.
+        if abs(value) > _MAX_SAFE_FLOAT_INT:
+            raise ValueError(
+                f"bigint value {value!r} is a float beyond 2**53 - 1 and has already "
+                "lost precision; pass an int or a decimal string instead"
+            )
         value = int(value)
     elif not isinstance(value, int):
         raise ValueError(f"bigint value must be an integer, got {type(value).__name__}")
@@ -235,7 +249,23 @@ def encode_timestamp(value: Union[datetime, int, float, str, None]) -> int:
     if isinstance(value, bool):
         raise ValueError("timestamp value must be a datetime or a number of milliseconds")
     if isinstance(value, (int, float)):
-        return int(value)
+        # NaN and infinity have no instant, and int() would silently truncate
+        # a fractional millisecond, so all three are refused, as is anything
+        # beyond what a JavaScript Date holds: a TypeScript peer could not
+        # decode it. Parity with TypeScript protobus 2.5.0.
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(
+                f"timestamp value {value!r} is not a whole number of milliseconds; "
+                "pass a datetime, an ISO-8601 string, or integer milliseconds"
+            )
+        ms = int(value)
+        if abs(ms) > MAX_TIMESTAMP_MS:
+            raise ValueError(
+                f"timestamp value {value!r} is beyond ±{MAX_TIMESTAMP_MS} milliseconds, "
+                "the range a JavaScript Date holds; pass a datetime, an ISO-8601 string, "
+                "or integer milliseconds within it"
+            )
+        return ms
     if isinstance(value, str):
         text = value.strip()
         if text.endswith("Z"):

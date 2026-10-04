@@ -18,7 +18,7 @@ This is the Python port of [protobus](https://github.com/ArielLaub/protobus)
 (TypeScript). The two are **wire-compatible**: a Python service serves
 TypeScript callers and vice versa, streaming, events, custom types and error
 codes included. Every commit runs a cross-language suite in both directions
-against a live broker and a pinned TypeScript revision (2.4.0) to keep it
+against a live broker and a pinned TypeScript revision (2.5.0) to keep it
 that way; the behavioural differences that remain are listed in
 [Known Issues](docs/operations/known-issues.md#differences-from-the-typescript-port).
 

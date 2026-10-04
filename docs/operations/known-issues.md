@@ -209,8 +209,8 @@ neither port is "fixed" to match the other by accident.
 Wire-level behaviour — envelopes, routing keys, headers, the retry topology,
 priority bytes, custom-type encodings — is identical, and is what
 [`tests/integration/test_cross_language.py`](../../tests/integration/test_cross_language.py)
-checks. CI pins the TypeScript side to the **2.4.0** release commit
-(`ba7a9bd`); other 2.x revisions are expected to interoperate but are not
+checks. CI pins the TypeScript side to the **2.5.0** release commit
+(`b36406c`); other 2.x revisions are expected to interoperate but are not
 tested. The TypeScript-driven direction covers unary, ordered streaming, an
 empty stream and a mid-stream error; the Python-driven direction additionally
 covers cancellation (asserted on the TypeScript producer's own counter),
