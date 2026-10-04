@@ -4,7 +4,7 @@ All notable changes to **protobus-py** are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.0] — 2026-09-08
+## [2.0.0] — 2026-10-04
 
 A ground-up rewrite of the core, bringing the Python port to behavioural parity
 with [protobus](https://github.com/ArielLaub/protobus) 2.4 (TypeScript). It
@@ -12,8 +12,13 @@ responds to an external audit of 1.5.0 that found the two ports diverging in
 every reliability guarantee that matters: acknowledgement, persistence, retries,
 schema loading, event interoperability, shutdown and stream cancellation.
 Every finding is closed below, and the parity is now asserted by a test suite
-ported from the TypeScript one — 480 unit tests, an integration suite against a
+ported from the TypeScript one — 565 unit tests, an integration suite against a
 live broker, and a cross-language suite run in **both** directions.
+
+Prepared on 2026-09-08 and published only now: this file dated it, but it was
+never tagged, so PyPI stayed on 1.5.0. It is verified against TypeScript
+protobus **2.5.0**, and protobus-go 2.0.0's CI exercises it against both other
+ports.
 
 A major, because the wire and the API both change. The migration guide is
 [`docs/migration.md`](docs/migration.md).
@@ -161,6 +166,20 @@ A major, because the wire and the API both change. The migration guide is
   and `Request` no longer collapse onto the same classes.
 
 ### Fixed in the release candidate
+
+- **The built-in scalars refuse input they cannot represent**, as TypeScript
+  protobus 2.5.0 now does ([protobus#25](https://github.com/ArielLaub/protobus/issues/25)).
+  `encode_timestamp` truncated a fractional millisecond through `int()`, raised
+  `OverflowError` rather than `ValueError` for infinity, and accepted values
+  beyond the ±8.64e15 ms a JavaScript `Date` holds, which a TypeScript peer
+  could not decode. `bigint_to_bytes` accepted a `float` above 2**53, whose
+  precision is already gone, and encoded the wrong amount. Each now raises a
+  `ValueError` saying what to pass instead.
+- **A streaming handler that raises before returning its iterator** is
+  answered like a unary raise: a `HandledError` reaches the caller at once,
+  anything else goes through the retry ladder with its terminal reply. This
+  port always did so; a regression test now holds it, for parity with the
+  fix in TypeScript protobus 2.5.0 ([protobus#29](https://github.com/ArielLaub/protobus/issues/29)).
 
 Findings from the pre-release review of `0f3ad45`, each with a regression
 test; the reviewer's probe script now reports the fixed behaviour on every
