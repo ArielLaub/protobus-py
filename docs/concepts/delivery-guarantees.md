@@ -81,11 +81,9 @@ The practical effect: calling a service nobody is running fails in one broker ro
 
 ### Deduplicating on `message_id`
 
-Every publish carries a `message_id`, minted as a UUID by the publish path unless the properties already have one, and the same id is copied onto every retry and DLQ hop ([`protobus/connection.py`](../../protobus/connection.py), `_confirmed_publish` and the retry and DLQ publishes). It is the only thing that identifies two copies as one logical message, which is why the package root says so at the export site:
+Every publish carries a `message_id`, minted as a UUID by the publish path unless the properties already have one, and the same id is copied onto every retry and DLQ hop ([`protobus/connection.py`](../../protobus/connection.py), `_confirmed_publish` and the retry and DLQ publishes). It is the only thing that identifies two copies as one logical message.
 
-> A resolved `publish()` means the broker confirmed the message; these are the ways that can fail. `PublishConfirmTimeoutError` and `ChannelClosedError` are AMBIGUOUS (the message may or may not have been stored), so retrying either can duplicate. Deduplicate on `message_id`.
->
-> Source: [`protobus/__init__.py`](../../protobus/__init__.py)
+A resolved `publish()` means the broker confirmed the message. `PublishConfirmTimeoutError` and `ChannelClosedError` are ambiguous: the message may or may not have been stored, so retrying either can duplicate it ([`protobus/errors.py`](../../protobus/errors.py)). Deduplicate on `message_id`.
 
 A handler reads it off the framework context, which arrives as the fourth argument to a service method that declares one, alongside `redelivered`. The context type is `MessageHandlerContext`, exported from the package root ([`protobus/connection.py`](../../protobus/connection.py)):
 
