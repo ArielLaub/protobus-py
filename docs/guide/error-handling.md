@@ -2,15 +2,15 @@
 
 > Which failures protobus retries, which it answers, and how each one reaches the caller.
 
-**Read this if** you are writing a handler and need to decide what to raise — or you have a message stuck in a retry loop.
+**Read this if** you are writing a handler and need to decide what to raise, or you have a message stuck in a retry loop.
 
 | | |
 |---|---|
 | **Prerequisites** | [Getting Started](./getting-started.md) |
-| **Next** | [Delivery Guarantees](../concepts/delivery-guarantees.md) — the mechanism · [Errors reference](../reference/errors.md) — every class |
+| **Next** | [Delivery Guarantees](../concepts/delivery-guarantees.md): the mechanism · [Errors reference](../reference/errors.md): every class |
 | **Source** | [`protobus/errors.py`](../../protobus/errors.py) · [`protobus/message_service.py`](../../protobus/message_service.py) · [`protobus/connection.py`](../../protobus/connection.py) |
 
-**On this page** — [The one decision](#the-one-decision) · [Terminal failures](#terminal-failures-handlederror) · [Retriable failures](#retriable-failures-anything-else) · [What the caller sees](#what-the-caller-sees) · [Tuning the ladder](#tuning-the-retry-ladder) · [Events are different](#events-are-different) · [Anti-patterns](#anti-patterns)
+**On this page:** [The one decision](#the-one-decision) · [Terminal failures](#terminal-failures-handlederror) · [Retriable failures](#retriable-failures-anything-else) · [What the caller sees](#what-the-caller-sees) · [Tuning the ladder](#tuning-the-retry-ladder) · [Events are different](#events-are-different) · [Anti-patterns](#anti-patterns)
 
 ---
 
@@ -20,8 +20,8 @@ Every exception from a handler answers a single question: **would running this a
 
 | Answer | Raise | What protobus does |
 |---|---|---|
-| No — the same input fails the same way | `HandledError` | replies to the caller immediately, rejects the message without requeue. **No retry.** |
-| Maybe — a dependency was briefly unavailable | any other exception | parks the message on `<Service>.Retry` and redelivers it, up to `max_retries` times, then dead-letters it |
+| No: the same input fails the same way | `HandledError` | replies to the caller immediately, rejects the message without requeue. **No retry.** |
+| Maybe: a dependency was briefly unavailable | any other exception | parks the message on `<Service>.Retry` and redelivers it, up to `max_retries` times, then dead-letters it |
 
 Getting this wrong is expensive in both directions. A validation failure raised as
 a plain `Exception` retries four times over fifteen seconds and dead-letters a
@@ -65,7 +65,7 @@ class NotFoundError(HandledError):
 ```
 
 > [!NOTE]
-> `is_handled_error(err)` is duck-typed — it accepts any exception with
+> `is_handled_error(err)` is duck-typed: it accepts any exception with
 > `is_handled = True` ([`protobus/errors.py`](../../protobus/errors.py)). An error
 > crossing a module boundary, or one from a differently-installed copy of
 > protobus, still classifies correctly.
@@ -99,14 +99,14 @@ message goes to `<Service>.DLQ` carrying headers that say why.
 
 > [!IMPORTANT]
 > **The caller stays parked for the whole ladder.** No reply is published while a
-> message is being retried, so with the defaults — `max_retries=3`,
-> `retry_delay_ms=5000` — a permanently failing call blocks its caller for roughly
+> message is being retried, so with the defaults (`max_retries=3`,
+> `retry_delay_ms=5000`) a permanently failing call blocks its caller for roughly
 > **15 seconds** before it is told anything. The full mechanism, the six `x-*`
 > headers, and how this interacts with `RPC_CALL_TIMEOUT_MS` are in
 > [Delivery Guarantees](../concepts/delivery-guarantees.md).
 
 A handler that exceeds `MESSAGE_PROCESSING_TIMEOUT` (or the service's
-`processing_timeout_ms`) is cancelled and treated the same way — it climbs the
+`processing_timeout_ms`) is cancelled and treated the same way: it climbs the
 ladder as a `TimeoutError` with code `PROCESSING_TIMEOUT`, and the caller is
 told so once the ladder is exhausted.
 
@@ -115,7 +115,7 @@ told so once the ladder is exhausted.
 ## What the caller sees
 
 A `ServiceProxy` call raises a **`RemoteError`** carrying `message`, `code` and
-`method` — not an instance of your class. The class does not survive the wire;
+`method`, not an instance of your class. The class does not survive the wire;
 the `code` you set on `HandledError` does.
 
 ```python
@@ -138,7 +138,7 @@ async def create(proxy: ServiceProxy, order_id: str | None) -> dict | None:
 > exists precisely so you do not have to.
 
 What reaches the caller for a *non*-`HandledError` depends on
-`PROTOBUS_EXPOSE_INTERNAL_ERRORS`, which defaults to `true` — the unhandled
+`PROTOBUS_EXPOSE_INTERNAL_ERRORS`, which defaults to `true`: the unhandled
 error's own message is sent. Set it to `false` and the caller gets an
 `InternalServiceError` message carrying a correlation id instead, with code
 `INTERNAL_ERROR`. See [Security](../operations/security.md) and
@@ -166,12 +166,12 @@ class OrdersService(RunnableService):
 ```
 
 `RunnableService.start()` and `launch()` accept the same options as keyword
-arguments — `await OrdersService.start(context, max_concurrent=4, retry=RetryOptions(max_retries=5))`
-— when you would rather not override `__init__`.
+arguments (`await OrdersService.start(context, max_concurrent=4, retry=RetryOptions(max_retries=5))`)
+when you would rather not override `__init__`.
 
 | Option | Default | Effect |
 |---|---:|---|
-| `max_retries` | `3` | attempts after the first failure. **`0` disables retry entirely** — no `.Retry` or `.DLQ` queue is declared, and a failure is answered and rejected |
+| `max_retries` | `3` | attempts after the first failure. **`0` disables retry entirely**: no `.Retry` or `.DLQ` queue is declared, and a failure is answered and rejected |
 | `retry_delay_ms` | `5000` | the TTL on `<Service>.Retry`, so the delay is fixed, not exponential |
 | `message_ttl_ms` | `None` | a total lifetime for the message; past it the broker discards it regardless of retries left |
 
@@ -187,7 +187,7 @@ arguments — `await OrdersService.start(context, max_concurrent=4, retry=RetryO
 
 > [!CAUTION]
 > **By default a failing event handler is not retried, and the event is not
-> dead-lettered — it is discarded.** `EventListener` supplies no retry options
+> dead-lettered; it is discarded.** `EventListener` supplies no retry options
 > unless the service opts in ([`protobus/event_listener.py`](../../protobus/event_listener.py)),
 > so an exception takes the reject-without-requeue branch in
 > [`protobus/connection.py`](../../protobus/connection.py) and leaves only a
@@ -220,8 +220,8 @@ class OrderProjection(RunnableService):
 ```
 
 If an event genuinely needs at-least-once processing with retries, either opt in
-to the event retry ladder — `MessageServiceOptions(event_retry=EventRetryOptions(...))`,
-see [Events → Turning retry on](./events.md#retry) — or model it as an RPC to a
+to the event retry ladder (`MessageServiceOptions(event_retry=EventRetryOptions(...))`,
+see [Events → Turning retry on](./events.md#retry)) or model it as an RPC to a
 service that owns the work, and let the request queue's ladder do its job.
 
 ---
@@ -243,7 +243,7 @@ transient failure into a permanent one. Only do it when you have established the
 failure is not transient.
 
 **A hand-rolled circuit breaker around a proxy call.** Reasonable in general, but
-it belongs in your application code and is not protobus-specific — see
+it belongs in your application code and is not protobus-specific; see
 [Patterns](./patterns.md#resilience-patterns).
 
 ---

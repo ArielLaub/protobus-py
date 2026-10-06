@@ -1,6 +1,6 @@
 # Streaming RPC
 
-Protobus supports **server-streaming RPC** — a single request from the client can produce *many* response messages from the server, delivered as they're produced, instead of one bundled response at the end.
+Protobus supports **server-streaming RPC**: a single request from the client can produce *many* response messages from the server, delivered as they're produced, instead of one bundled response at the end.
 
 The motivating use case is LLM token streaming: a model generates a 500-word answer over 10 seconds, and you want to show each token to the user as it arrives rather than waiting for the full response.
 
@@ -36,19 +36,19 @@ The framework handles correlation IDs, the reply queue, end-of-stream detection,
 
 Use streaming when:
 
-- The response is **incrementally meaningful** — each chunk is useful before the next arrives (LLM tokens, log tails, video frames, progress updates).
-- The response **takes too long** to deliver as one blob — users perceive latency by *time to first byte*, not by total response time.
-- You want to **cancel** cleanly — closing the stream unwinds the work upstream.
+- The response is **incrementally meaningful**: each chunk is useful before the next arrives (LLM tokens, log tails, video frames, progress updates).
+- The response **takes too long** to deliver as one blob; users perceive latency by *time to first byte*, not by total response time.
+- You want to **cancel** cleanly; closing the stream unwinds the work upstream.
 
 Don't use streaming when:
 
-- The chunks are tiny and the response is fast — adding stream overhead just to deliver 50 bytes hurts more than it helps.
-- The client always needs the full response before doing anything — pagination over unary calls is simpler.
-- The data is **not naturally ordered** — streaming guarantees in-order delivery within a single call, which costs flexibility you might not want.
+- The chunks are tiny and the response is fast; adding stream overhead to deliver 50 bytes hurts more than it helps.
+- The client always needs the full response before doing anything; pagination over unary calls is simpler.
+- The data is **not naturally ordered**: streaming guarantees in-order delivery within a single call, which costs flexibility you might not want.
 
 ## Wire protocol
 
-A streaming response is **N+1 AMQP messages** published to the client's reply queue, all carrying the same `correlation_id` as the request. End-of-stream is signaled by an AMQP **header** on the final message; the message body is a regular response payload like any other. The format is shared with the TypeScript port — a Python client streams from a TypeScript server and vice versa, which [`tests/integration/test_cross_language.py`](../../tests/integration/test_cross_language.py) verifies.
+A streaming response is **N+1 AMQP messages** published to the client's reply queue, all carrying the same `correlation_id` as the request. End-of-stream is signaled by an AMQP **header** on the final message; the message body is a regular response payload like any other. The format is shared with the TypeScript port: a Python client streams from a TypeScript server and vice versa, which [`tests/integration/test_cross_language.py`](../../tests/integration/test_cross_language.py) verifies.
 
 ### Per-message headers
 
@@ -57,30 +57,30 @@ A streaming response is **N+1 AMQP messages** published to the client's reply qu
 | `x-protobus-final` | `boolean` | yes (on terminal) | `false` (or absent) → more messages follow. `true` → this is the last chunk. |
 | `x-protobus-seq` | `uint32` | optional | Monotonically increasing 0-based sequence. Useful for diagnostics; not required for correctness (RabbitMQ guarantees order within the single-publisher → single-queue → single-consumer topology of an RPC reply). |
 
-The standard AMQP `correlation_id` is reused exactly as for unary calls — it ties every chunk back to the request that initiated the stream.
+The standard AMQP `correlation_id` is reused exactly as for unary calls; it ties every chunk back to the request that initiated the stream.
 
 ### Why headers, not the payload
 
 Streaming markers are **transport-layer concerns**, not application data. Keeping them on AMQP headers means:
 
-- `ResponseContainer` stays semantically clean — it's "result OR error", not "result OR error PLUS streaming state".
-- Adding new transport flags later (cancel, ack, window) costs nothing — no proto bump.
+- `ResponseContainer` stays semantically clean: it's "result OR error", not "result OR error PLUS streaming state".
+- Adding new transport flags later (cancel, ack, window) costs nothing: no proto bump.
 - Old unary clients never see streaming concepts they don't understand.
 - The same call site code works whether the framework batches one message or a hundred.
 
 ### End-of-stream rules
 
-The terminal message carries `x-protobus-final: true`. Its body is a regular response container — typically containing the last data chunk (e.g., the final `delta` plus `stop_reason` and `usage` for an LLM call), but it can also be empty or an error.
+The terminal message carries `x-protobus-final: true`. Its body is a regular response container, typically containing the last data chunk (e.g., the final `delta` plus `stop_reason` and `usage` for an LLM call), but it can also be empty or an error.
 
 Three terminal outcomes the client must handle:
 
-1. **Normal completion** — `x-protobus-final: true` + a result payload. The iterator yields the final chunk and stops.
-2. **Mid-stream error** — `x-protobus-final: true` + an error payload. The iterator raises `RemoteError`.
-3. **Timeout / disconnect** — no terminal message arrives within the idle timeout. The iterator raises `StreamTimeoutError`.
+1. **Normal completion**: `x-protobus-final: true` + a result payload. The iterator yields the final chunk and stops.
+2. **Mid-stream error**: `x-protobus-final: true` + an error payload. The iterator raises `RemoteError`.
+3. **Timeout / disconnect**: no terminal message arrives within the idle timeout. The iterator raises `StreamTimeoutError`.
 
 ## Declaring a streaming method
 
-Use the standard gRPC syntax — the `stream` keyword on the response type:
+Use the standard gRPC syntax, the `stream` keyword on the response type:
 
 ```protobuf
 service Llm {
@@ -96,7 +96,7 @@ message CompleteChunk {
 }
 ```
 
-Protobus reads the `server_streaming` flag from the method's descriptor at startup — no custom convention, no annotation. If you've used gRPC, this is the same syntax.
+Protobus reads the `server_streaming` flag from the method's descriptor at startup: no custom convention, no annotation. If you've used gRPC, this is the same syntax.
 
 The proxy and the service base class inspect this flag once when methods are wired up:
 
@@ -105,7 +105,7 @@ The proxy and the service base class inspect this flag once when methods are wir
 
 ## Client API
 
-The proxy method returns an async iterator — you consume it with `async for`:
+The proxy method returns an async iterator; you consume it with `async for`:
 
 ```python
 from protobus import ServiceProxy
@@ -129,7 +129,7 @@ The full signature is `completeStream(request, actor=None, idle_timeout_ms=None,
 
 ### Error handling
 
-Errors are raised inside the iteration — same model as any async generator:
+Errors are raised inside the iteration, the same model as any async generator:
 
 ```python
 from protobus import RemoteError, StreamTimeoutError
@@ -152,7 +152,7 @@ except RemoteError as err:
 
 Cancelling stops the **producer**, not just the reader. Two ways to trigger it.
 
-**Close the stream.** Python does not close an async iterator when you `break` out of `async for` — unlike JavaScript's `for await`, the iterator is simply abandoned. Use the stream as an `async with` block, or call `await stream.aclose()`; either releases the client's slot and sends a cancellation notice to the server:
+**Close the stream.** Python does not close an async iterator when you `break` out of `async for`; unlike JavaScript's `for await`, the iterator is abandoned. Use the stream as an `async with` block, or call `await stream.aclose()`; either releases the client's slot and sends a cancellation notice to the server:
 
 ```python
 async with llm.completeStream(req) as stream:
@@ -162,7 +162,7 @@ async with llm.completeStream(req) as stream:
             break   # leaving the `async with` closes the stream; the server stops too
 ```
 
-**Pass an `AbortSignal`.** Closing only takes effect from inside the consuming code, so it cannot help when the decision is made elsewhere — a Stop button in a different request handler, or a client that disconnects. A signal fires immediately, from anywhere:
+**Pass an `AbortSignal`.** Closing only takes effect from inside the consuming code, so it cannot help when the decision is made elsewhere: a Stop button in a different request handler, or a client that disconnects. A signal fires immediately, from anywhere:
 
 ```python
 from protobus import AbortController, StreamOptions
@@ -179,7 +179,7 @@ async for chunk in llm.completeStream(req, None, None, StreamOptions(signal=stop
     send(chunk)
 ```
 
-An aborted stream **ends the loop rather than raising** — the same outcome as
+An aborted stream **ends the loop rather than raising**, the same outcome as
 closing it, since both mean the caller asked to stop. That leaves "I cancelled"
 and "the server finished" looking identical from inside the loop, which matters
 when the signal belongs to someone else. Check the signal afterwards when you
@@ -189,12 +189,12 @@ need to tell them apart:
 async for chunk in llm.completeStream(req, None, None, StreamOptions(signal=stop.signal)):
     send(chunk)
 if stop.signal.aborted:
-    ...  # stopped early — the response is partial
+    ...  # stopped early: the response is partial
 ```
 
-A stream abandoned by an `asyncio` task cancellation — the consuming task itself is cancelled, whether it was waiting for the request to publish or for the next chunk — is closed the same way on the way out.
+A stream abandoned by an `asyncio` task cancellation (the consuming task itself is cancelled, whether it was waiting for the request to publish or for the next chunk) is closed the same way on the way out.
 
-On the server, watch `context.signal` — the fourth argument to your handler:
+On the server, watch `context.signal`, the fourth argument to your handler:
 
 ```python
 async def completeStream(self, request, actor, correlation_id, context: MessageHandlerContext):
@@ -204,21 +204,21 @@ async def completeStream(self, request, actor, correlation_id, context: MessageH
         yield {"text": delta.choices[0].delta.content or ""}
 ```
 
-Cancellation is **cooperative**. A generator cannot be preempted between yields, so a handler that ignores its signal runs to completion — the framework stops publishing its output, so the caller is unaffected either way, but the work is still done. Checking the signal is what makes cancellation *save* anything. `context.signal.wait()` is a coroutine that returns when the signal fires, for handlers that would rather race it against their upstream call than poll.
+Cancellation is **cooperative**. A generator cannot be preempted between yields, so a handler that ignores its signal runs to completion. The framework stops publishing its output, so the caller is unaffected either way, but the work is still done. Checking the signal is what makes cancellation *save* anything. `context.signal.wait()` is a coroutine that returns when the signal fires, for handlers that would rather race it against their upstream call than poll.
 
 #### Delivery is best effort
 
-The cancellation notice is an ordinary message, published once and not retried. If it is lost, the producer never hears it and runs to completion — the same outcome as never having cancelled. There is no correctness risk; the cost is wasted work.
+The cancellation notice is an ordinary message, published once and not retried. If it is lost, the producer never hears it and runs to completion, the same outcome as never having cancelled. There is no correctness risk; the cost is wasted work.
 
-There is no resend: cancellation is idempotent on both sides, so a second `abort()` or `aclose()` sends nothing, and once a stream is closed the client discards whatever else arrives for it, so application code cannot observe whether the producer stopped. A producer whose work is expensive enough to matter should bound it on its own side — a deadline on the upstream call, a cap on tokens — rather than rely on a notice that is best effort by design.
+There is no resend: cancellation is idempotent on both sides, so a second `abort()` or `aclose()` sends nothing, and once a stream is closed the client discards whatever else arrives for it, so application code cannot observe whether the producer stopped. A producer whose work is expensive enough to matter should bound it on its own side (a deadline on the upstream call, a cap on tokens) rather than rely on a notice that is best effort by design.
 
-Two cases go without a notice, because the server never saw the request: a stream closed **before its request went out** (while the connection was being restored) is simply withdrawn and never published, and a request the broker **nacked or returned unroutable** has nothing to cancel. An *ambiguous* send — a confirm timeout, a channel that closed mid-send — does get a notice, because a producer may be running for a caller that will never read. A stream closed **while its request is mid-send** has its notice held until the send settles, so it cannot overtake the request it cancels; the caller itself is not held — the idle deadline, a close or an abort ends its wait at once, and the send settles on its own afterwards.
+Two cases go without a notice, because the server never saw the request: a stream closed **before its request went out** (while the connection was being restored) is withdrawn and never published, and a request the broker **nacked or returned unroutable** has nothing to cancel. An *ambiguous* send (a confirm timeout, a channel that closed mid-send) does get a notice, because a producer may be running for a caller that will never read. A stream closed **while its request is mid-send** has its notice held until the send settles, so it cannot overtake the request it cancels; the caller itself is not held: the idle deadline, a close or an abort ends its wait at once, and the send settles on its own afterwards.
 
 #### How it travels
 
 Cancellation is published to a **fanout** exchange (`proto.bus.cancel`), and every service process binds its own exclusive, auto-deleting queue to it. Each replica sees every cancellation and acts only on correlation IDs it is actually running.
 
-Fanout rather than a routed queue because the caller has no way to know *which* replica picked up its request. A shared queue would deliver the notice to one replica at random — usually the wrong one.
+Fanout rather than a routed queue because the caller has no way to know *which* replica picked up its request. A shared queue would deliver the notice to one replica at random, usually the wrong one.
 
 If the broker credentials cannot declare that exchange, the service logs a warning and runs without cancellation support rather than failing to start.
 
@@ -262,7 +262,7 @@ The framework:
 
 1. Detects that the method is declared as `stream` in the proto (via `server_streaming` on the method descriptor).
 2. For each yielded value: encodes a response container, publishes to `reply_to` with `x-protobus-final: false` and an incrementing `x-protobus-seq`.
-3. When the generator exhausts, publishes the last yield's message with `x-protobus-final: true` (look-ahead by one — no extra empty terminal needed when the user yielded the finalization data last).
+3. When the generator exhausts, publishes the last yield's message with `x-protobus-final: true` (look-ahead by one; no extra empty terminal needed when the user yielded the finalization data last).
 
 > [!IMPORTANT]
 > A streaming handler holds its consumer slot for the whole life of the stream, and `max_concurrent` defaults to **1**. A streaming service at the default serves one caller at a time; [`sample/tokenStream`](../../sample/tokenStream) raises it to 8 for exactly this reason.
@@ -308,18 +308,18 @@ are each within their limits and 320 MiB into the heap.
 
 Whether these are reachable depends entirely on the workload. LLM token deltas
 arriving at reading speed will not approach them. A handler yielding rows from
-a database as fast as it can read them, to a consumer doing per-row work, will
-— and the failure is loud rather than an out-of-memory kill.
+a database as fast as it can read them, to a consumer doing per-row work, will.
+The failure is loud rather than an out-of-memory kill.
 
 ## Backward compatibility
 
 The streaming feature is **purely additive**:
 
 - **Existing unary RPCs are unchanged.** No proto changes, no API changes, no header changes. The framework only inspects the streaming flag when wiring up a method, and unary methods follow the exact same path they did before.
-- **Old clients calling new unary methods** — works, no change.
-- **Old clients calling new streaming methods** — the proxy method shape changes from a coroutine to an async iterator. This is an API change you opt into per-method by adding `stream` to your `.proto`.
-- **New clients calling old unary methods** — works, no change.
-- **Mixed-version services in the same cluster** — fine, as long as the *individual method* contract agrees on whether it's streaming.
+- **Old clients calling new unary methods**: works, no change.
+- **Old clients calling new streaming methods**: the proxy method shape changes from a coroutine to an async iterator. This is an API change you opt into per-method by adding `stream` to your `.proto`.
+- **New clients calling old unary methods**: works, no change.
+- **Mixed-version services in the same cluster**: fine, as long as the *individual method* contract agrees on whether it's streaming.
 
 ## Comparison with gRPC
 
@@ -332,10 +332,10 @@ Protobus streaming intentionally mirrors gRPC's server-streaming model so the me
 | Transport | HTTP/2 with stream frames | AMQP with multiple replies on a correlation id |
 | Ordering guarantee | Per-stream FIFO | Per-stream FIFO (RabbitMQ single-queue/single-consumer) |
 | End-of-stream signal | HTTP/2 END_STREAM frame | `x-protobus-final: true` header |
-| Cancellation | Client cancels the call | close the stream, or an `AbortSignal`. Both notify the server; cooperative and best effort — see [Cancellation](#cancellation) |
+| Cancellation | Client cancels the call | close the stream, or an `AbortSignal`. Both notify the server; cooperative and best effort; see [Cancellation](#cancellation) |
 | Client-streaming / bidi | Supported | Not supported, not planned |
 
-The biggest practical difference: gRPC streams ride on HTTP/2's multiplexed connection, so the cost per stream is low and you can have thousands open. Protobus rides on a single AMQP reply queue per client, multiplexed by `correlation_id` — the per-stream cost is the same as a unary call, but very-high-fanout topologies should be benchmarked.
+The biggest practical difference: gRPC streams ride on HTTP/2's multiplexed connection, so the cost per stream is low and you can have thousands open. Protobus rides on a single AMQP reply queue per client, multiplexed by `correlation_id`; the per-stream cost is the same as a unary call, but very-high-fanout topologies should be benchmarked.
 
 ## Limitations
 
@@ -346,36 +346,36 @@ The biggest practical difference: gRPC streams ride on HTTP/2's multiplexed conn
   seen is dropped by the dispatcher, so the common case does not reach the
   caller twice; a gap in the sequence fails the stream with
   `StreamSequenceError` rather than handing over a short stream that looks
-  complete. Neither is exactly-once — a peer that sends no `x-protobus-seq`
+  complete. Neither is exactly-once: a peer that sends no `x-protobus-seq`
   header disables the check entirely, since a violation must not be inferred
   from missing information. For idempotent chunks (LLM deltas, log lines) this
   is comfortably enough; for non-idempotent chunks, the caller is responsible.
 - **No chunk-level retry/DLQ.** Standard retry/DLQ applies to the entire RPC, not to individual chunks.
 - **Single reply queue per Context.** All in-flight streams share the reply
-  queue of the Context's dispatcher, not of the proxy — so building more
+  queue of the Context's dispatcher, not of the proxy, so building more
   `ServiceProxy` instances over the same Context changes nothing. Separate
   reply queues means separate Contexts, and a Context holds its own
   connection.
 
 ## Implementation notes
 
-For framework contributors. Skip if you're just using streaming.
+For framework contributors. Skip if you're only using streaming.
 
 The streaming path differs from unary in four places:
 
-1. **`MessageFactory.is_streaming_method(full_name)`** ([`protobus/message_factory.py`](../../protobus/message_factory.py)) — reads `server_streaming` from the method descriptor. The flag is populated by the parser's handling of the `stream` keyword; no custom handling required.
+1. **`MessageFactory.is_streaming_method(full_name)`** ([`protobus/message_factory.py`](../../protobus/message_factory.py)): reads `server_streaming` from the method descriptor. The flag is populated by the parser's handling of the `stream` keyword; no custom handling required.
 
-2. **`ServiceProxy.init()`** ([`protobus/service_proxy.py`](../../protobus/service_proxy.py)) — at proxy-build time, branches on the streaming flag. Streaming methods are exposed as functions returning a `StreamingCall` rather than a coroutine.
+2. **`ServiceProxy.init()`** ([`protobus/service_proxy.py`](../../protobus/service_proxy.py)): at proxy-build time, branches on the streaming flag. Streaming methods are exposed as functions returning a `StreamingCall` rather than a coroutine.
 
-3. **`MessageDispatcher.publish_streaming()`** ([`protobus/message_dispatcher.py`](../../protobus/message_dispatcher.py)) — keeps `pending_streams`, keyed by correlation id. The callback listener pushes incoming chunks into the entry's buffer; the `StreamingReply` async iterator drains them. The terminal message (`x-protobus-final: true`) marks the entry ended and wakes the parked consumer.
+3. **`MessageDispatcher.publish_streaming()`** ([`protobus/message_dispatcher.py`](../../protobus/message_dispatcher.py)): keeps `pending_streams`, keyed by correlation id. The callback listener pushes incoming chunks into the entry's buffer; the `StreamingReply` async iterator drains them. The terminal message (`x-protobus-final: true`) marks the entry ended and wakes the parked consumer.
 
-4. **`Connection._publish_stream_reply()`** ([`protobus/connection.py`](../../protobus/connection.py)) — invoked when a handler returns an async iterator of encoded replies. Look-ahead-by-one buffers each chunk so the framework can mark the last one as final without publishing an extra empty terminal.
+4. **`Connection._publish_stream_reply()`** ([`protobus/connection.py`](../../protobus/connection.py)): invoked when a handler returns an async iterator of encoded replies. Look-ahead-by-one buffers each chunk so the framework can mark the last one as final without publishing an extra empty terminal.
 
-The wire format itself uses **only AMQP headers** — no `ResponseContainer` schema changes. This is what makes the feature purely additive.
+The wire format itself uses **only AMQP headers**, no `ResponseContainer` schema changes. This is what makes the feature purely additive.
 
 ## See also
 
-- [Message Flow](../concepts/message-flow.md) — the underlying unary RPC pipeline this builds on
-- [Error Handling](./error-handling.md) — `HandledError` and retry semantics, which apply identically to streaming
-- [Configuration](../reference/configuration.md) — `STREAM_IDLE_TIMEOUT_MS` setting
-- [`sample/tokenStream`](../../sample/tokenStream) — a runnable token-stream demo with a Stop button, showing how many tokens the server is spared
+- [Message Flow](../concepts/message-flow.md): the underlying unary RPC pipeline this builds on
+- [Error Handling](./error-handling.md): `HandledError` and retry semantics, which apply identically to streaming
+- [Configuration](../reference/configuration.md): `STREAM_IDLE_TIMEOUT_MS` setting
+- [`sample/tokenStream`](../../sample/tokenStream): a runnable token-stream demo with a Stop button, showing how many tokens the server is spared

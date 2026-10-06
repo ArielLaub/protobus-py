@@ -7,10 +7,10 @@
 | | |
 |---|---|
 | **Prerequisites** | [Getting Started](../guide/getting-started.md) |
-| **Next** | [Security](./security.md) — what a log line must never carry · [Troubleshooting](./troubleshooting.md) |
+| **Next** | [Security](./security.md): what a log line must never carry · [Troubleshooting](./troubleshooting.md) |
 | **Source** | [`protobus/logger.py`](../../protobus/logger.py) |
 
-**On this page** — [Levels](#levels-first) · [Your own sink](#install-your-own-sink) · [Structured records](#structured-records) · [What a record never carries](#what-a-record-never-carries) · [Payload diagnostics](#opt-in-payload-diagnostics) · [Your own records](#emitting-your-own-records) · [Testing](#silencing-it-in-tests)
+**On this page:** [Levels](#levels-first) · [Your own sink](#install-your-own-sink) · [Structured records](#structured-records) · [What a record never carries](#what-a-record-never-carries) · [Payload diagnostics](#opt-in-payload-diagnostics) · [Your own records](#emitting-your-own-records) · [Testing](#silencing-it-in-tests)
 
 ---
 
@@ -126,7 +126,7 @@ class LoguruLogger:
 
 The default sink, `DefaultLogger`, is a thin wrapper over a `logging` logger named
 `protobus`. It attaches its own stderr handler and sets `propagate = False` only
-when that logger has no handlers yet — so configure the `protobus` logger
+when that logger has no handlers yet, so configure the `protobus` logger
 *before* importing protobus and your handlers are used instead.
 
 ---
@@ -251,7 +251,7 @@ unless you install a serializer.
 
 Call sites can offer payload material lazily. It is assembled only once you have
 installed a serializer, and what survives into the record is entirely your
-decision — **the framework applies no redaction to the value you return.**
+decision: **the framework applies no redaction to the value you return.**
 
 ```python
 from protobus import LogDiagnostics, LogRecord, set_diagnostics_serializer
@@ -296,7 +296,7 @@ line is still emitted without diagnostics.
 
 > [!CAUTION]
 > This hook is the point at which payloads can leave the process. Whatever you
-> return is passed to your sink as-is — redact it there.
+> return is passed to your sink as-is, so redact it there.
 
 ---
 

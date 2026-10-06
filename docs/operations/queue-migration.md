@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Prerequisites** | [Architecture](../concepts/architecture.md) — what a service declares in the broker |
+| **Prerequisites** | [Architecture](../concepts/architecture.md): what a service declares in the broker |
 | **Next** | [Message Priority](../guide/priority.md) · [Errors](../reference/errors.md#retryqueuemismatcherror) |
 | **Source** | [`protobus/message_listener.py`](../../protobus/message_listener.py) · [`protobus/event_listener.py`](../../protobus/event_listener.py) |
 
 RabbitMQ fixes a queue's arguments when the queue is declared. Redeclaring an
-existing durable queue with different arguments does not update it — the broker
+existing durable queue with different arguments does not update it; the broker
 rejects the declare with `PRECONDITION_FAILED` and closes the channel.
 
 This matters for four Protobus options, each of which becomes a queue argument:
@@ -28,8 +28,8 @@ cases surface as the broker's raw `PRECONDITION_FAILED`.
 
 `max_priority` is the one most likely to be *added* to a service that is already
 running, since the whole point is to fix a queue that is misbehaving in
-production. Turning it on is Procedure A below applied to `<service_name>` alone
-— `.Retry` and `.DLQ` do not carry `x-max-priority` and must not be deleted.
+production. Turning it on is Procedure A below applied to `<service_name>` alone:
+`.Retry` and `.DLQ` do not carry `x-max-priority` and must not be deleted.
 See [Message Priority](../guide/priority.md) for why.
 
 Queue names are derived from the service name and stay stable across
@@ -39,7 +39,7 @@ Migrating is an operational step, and one of the two procedures below.
 
 ## Procedure A: drain and delete (same queue name)
 
-Use this when the queue name must stay the same — for example when other tooling,
+Use this when the queue name must stay the same, for example when other tooling,
 dashboards or alerts reference it.
 
 1. **Stop the producers**, or accept that messages published during the window
@@ -54,7 +54,7 @@ dashboards or alerts reference it.
 
    For a retry queue, "drained" also means waiting out the old `x-message-ttl`,
    since parked messages only leave when their TTL expires.
-4. **Delete the queue.** `--if-empty` is the safety catch — it refuses rather
+4. **Delete the queue.** `--if-empty` is the safety catch: it refuses rather
    than silently discarding anything that arrived late:
 
    ```bash
@@ -92,11 +92,11 @@ migration with no unroutable window.
 ## Avoiding the problem
 
 - Treat `retry_delay_ms`, `message_ttl_ms` and `max_priority` as deployment-time
-  constants. Pick them before the first production deploy — for a brand-new
+  constants. Pick them before the first production deploy; for a brand-new
   service, declaring `max_priority` up front costs nothing and saves the
   migration entirely.
 - Drive them from configuration that is reviewed alongside the code, not from an
-  environment variable that differs per environment — a value that varies
+  environment variable that differs per environment, because a value that varies
   between staging and production means one of the two brokers will reject the
   declare after a promotion.
 - Keep them out of per-instance overrides. Two instances of the same service
@@ -123,7 +123,7 @@ or reverting the value to what the existing queue was declared with.
 
 1.x declared a single `<service_name>.retry` queue (lower-case) with its own
 arguments. 2.0 declares `<service_name>.Retry`, `<service_name>.Retry.Exchange`
-and `<service_name>.DLQ` — different names, so the two do not collide, but the
+and `<service_name>.DLQ`: different names, so the two do not collide, but the
 old queue stays bound and keeps accumulating whatever was routed to it. Delete
 it with Procedure A once the 1.x consumers are gone. See
 [Migration](../migration.md).

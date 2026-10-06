@@ -1,13 +1,13 @@
 # Schema Design
 
-> The `.proto` file is the contract. Everything else — the queue name, the routing key, the generated types — follows from it.
+> The `.proto` file is the contract. Everything else (the queue name, the routing key, the generated types) follows from it.
 
 **Read this if** you are about to write or change a schema, or you want to know which changes are safe to deploy.
 
 | | |
 |---|---|
 | **Prerequisites** | [Getting Started](./getting-started.md) |
-| **Next** | [CLI](../reference/cli.md) — generating types from it · [Custom Types](../reference/custom-types.md) |
+| **Next** | [CLI](../reference/cli.md): generating types from it · [Custom Types](../reference/custom-types.md) |
 | **Source** | [`protobus/proto_parser.py`](../../protobus/proto_parser.py) · [`protobus/message_factory.py`](../../protobus/message_factory.py) · [`protobus/custom_types.py`](../../protobus/custom_types.py) |
 
 ## Basic Structure
@@ -150,7 +150,7 @@ message decoded by either port reads the same:
 
 | Field | Unset on the wire decodes as |
 |---|---|
-| scalar (`string`, `int32`, `bool`, …) | its zero value — `""`, `0`, `False` |
+| scalar (`string`, `int32`, `bool`, …) | its zero value: `""`, `0`, `False` |
 | `enum` | the zero value's **name**, as a `str` |
 | message | `None` |
 | `repeated` | `[]` |
@@ -159,7 +159,7 @@ message decoded by either port reads the same:
 
 Proto3 does not distinguish "unset" from "zero" for a plain scalar, so
 `request.get("count")` is `0` either way. Declare a field `optional` when the
-distinction matters — see [Migration → The dangerous one](../migration.md#the-dangerous-one-proto3-zero-values)
+distinction matters; see [Migration → The dangerous one](../migration.md#the-dangerous-one-proto3-zero-values)
 for what this changed from 1.x.
 
 ### Built-in Custom Types
@@ -214,7 +214,7 @@ The `timestamp` type provides convenient `datetime` handling:
 
 - Serializes to int64 (milliseconds since epoch)
 - Deserializes to a **timezone-aware UTC** `datetime`
-- Accepts a `datetime` (aware, or naive — read in the process's local zone),
+- Accepts a `datetime` (aware, or naive, read in the process's local zone),
   an ISO-8601 string, or a number of milliseconds as input
 
 ```protobuf
@@ -291,8 +291,8 @@ message Entity {
 
 > [!WARNING]
 > Without the syntax line the file is read as proto2. protobus-py's parser
-> tolerates the missing field labels, but the TypeScript port's does not — it
-> reports the custom type as `illegal token 'uuid'` — so a schema shared across
+> tolerates the missing field labels, but the TypeScript port's does not (it
+> reports the custom type as `illegal token 'uuid'`), so a schema shared across
 > the two ports must carry the line. A type that is not registered fails with
 > `ProtoParseError: unknown type 'uuid' (… not a registered custom type:
 > bigint, timestamp)`, naming the file and line.
@@ -302,7 +302,7 @@ message Entity {
 > that factory's root, but the codec itself goes into a module-level registry
 > shared by everything in the process. Two factories cannot hold different
 > definitions of the same name, and a name registered through one is visible to
-> all of them. Re-registering a name is allowed and refreshes its codec —
+> all of them. Re-registering a name is allowed and refreshes its codec,
 > unless the new definition disagrees about `wire_type`, which is refused with
 > `CustomTypeConflictError`, because the wrapper message was fixed at first
 > registration. Namespace your names if a process hosts more than one schema.

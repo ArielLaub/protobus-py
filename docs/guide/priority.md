@@ -6,13 +6,13 @@ so every method of a service shares that queue and RabbitMQ delivers them FIFO.
 That is usually what you want, and occasionally ruinous. The case this feature
 exists for: a service whose "start the job" RPC fans out one message per user
 onto its own queue. The fan-out is thousands of messages long, and the *next*
-control message — a second start, a cancel, a status request — lands behind all
+control message (a second start, a cancel, a status request) lands behind all
 of them and breaches its deadline while every replica is healthy and busy.
 
 The shape it was diagnosed in: three control calls issued during one 5,232-
 message drain, all three accepted by the broker, all three timed out at their
 deadline, both replicas connected and consuming the whole time. Nothing was
-broken. The queue was simply one lane, and the lane was full.
+broken. The queue was one lane, and the lane was full.
 
 Message priority fixes that without a second service and without a second queue:
 the control message is published at a higher priority and overtakes the bulk
@@ -20,7 +20,7 @@ traffic still sitting in the queue.
 
 > **Priority is opt-in and OFF by default.** A service that does not ask for it
 > declares its queue exactly as every previous version of protobus did. See
-> [Backward compatibility](#backward-compatibility) — the guarantee is precise,
+> [Backward compatibility](#backward-compatibility): the guarantee is precise,
 > and the one thing it does *not* cover is enabling priority on a queue that
 > already exists.
 
@@ -48,11 +48,11 @@ integer from 1 to 255 (a `bool` is refused); anything else raises
 
 **`max_priority` requires `late_ack`, which is the default.** Passing
 `late_ack=False` alongside it raises. Priority reorders what is still in the
-*queue*, and RabbitMQ applies no QoS prefetch to an auto-ack consumer — so an
+*queue*, and RabbitMQ applies no QoS prefetch to an auto-ack consumer, so an
 early-ack consumer is handed the entire backlog and there is nothing left to
 reorder. This is refused rather than warned about because the failure is
 invisible: the queue is correctly declared, the operator has already done the
-one-time migration to enable it, and the feature simply does nothing.
+one-time migration to enable it, and the feature does nothing.
 
 **Keep the number small.** RabbitMQ maintains internal structures per priority
 level, so a large range costs memory and throughput and buys nothing.
@@ -98,7 +98,7 @@ neighbouring levels rarely produce two distinguishable outcomes.
 
 Unary and fire-and-forget proxy methods take a `CallOptions` as their last
 argument. (Streaming methods take `StreamOptions` in that position instead and
-cannot carry a priority — see [Scope](#scope).)
+cannot carry a priority; see [Scope](#scope).)
 
 ```python
 from protobus import CallOptions, Config, ServiceProxy
@@ -106,12 +106,12 @@ from protobus import CallOptions, Config, ServiceProxy
 recs = ServiceProxy(context, "Recommendations.Service")
 await recs.init()
 
-# Control message — overtakes the backlog.
+# Control message: overtakes the backlog.
 await recs.processSingleRecommendation(
     {"rule_key": rule_key}, actor, True, None, CallOptions(priority=Config.PRIORITY_CONTROL),
 )
 
-# The fan-out this control message produces — ordinary bulk traffic.
+# The fan-out this control message produces: ordinary bulk traffic.
 await recs.processUserSingleRecommendation(
     {"user_id": user_id, "rule_key": rule_key}, actor, False, None, CallOptions(priority=Config.PRIORITY_NORMAL),
 )
@@ -129,8 +129,8 @@ with no error anywhere.
 
 A priority above the queue's `x-max-priority` is not an error and not useful:
 the broker clamps it **for ordering** while preserving the property as sent. On
-an `x-max-priority: 2` queue, a message published at 5 sorts as a 2 — so it goes
-behind an earlier 2 rather than ahead of it — and still reads back as 5.
+an `x-max-priority: 2` queue, a message published at 5 sorts as a 2 (so it goes
+behind an earlier 2 rather than ahead of it) and still reads back as 5.
 
 ### Scope
 
@@ -154,21 +154,21 @@ is written to show this rather than hide it: with prefetch 1, a control message
 published *after* 30 bulk messages is handled **second**, not first. The one
 ahead of it is the one already in the consumer's hands. That test counts
 messages; the TypeScript repository's `message_priority_latency.test.ts` times
-them, which turns out to matter — see
+them, which turns out to matter; see
 [The count is not the wait](#the-count-is-not-the-wait).
 
 So the honest claim is a change of scale, not a guarantee:
 
 | | Bulk messages ahead of a control message |
 |---|---|
-| Without priority | the whole backlog — thousands |
-| With priority | at most `max_concurrent × replicas` — typically single digits |
+| Without priority | the whole backlog: thousands |
+| With priority | at most `max_concurrent × replicas`, typically single digits |
 
 If you need a hard bound on that *count* rather than a large improvement,
 priority is not the mechanism. But the count is rarely what you actually care
-about — see [The count is not the wait](#the-count-is-not-the-wait) below.
+about; see [The count is not the wait](#the-count-is-not-the-wait) below.
 
-When the consumer is saturated the bound above is not merely an upper limit —
+When the consumer is saturated the bound above is more than an upper limit:
 it is an equality. Measured, one replica, a 50-message backlog, only the
 prefetch varying, with every prefetched delivery held in its handler:
 
@@ -181,14 +181,14 @@ prefetch varying, with every prefetched delivery held in its handler:
 The control message emerges at *exactly* the prefetch. Measured independently
 in both ports, with the same result.
 
-**The equality holds while the consumer is saturated** — that is, while all
+**The equality holds while the consumer is saturated**, that is, while all
 `max_concurrent` slots are genuinely occupied by in-flight handlers. That is the
 case this feature exists for: a slow handler with work queueing up behind it. If
 handlers instead finish faster than messages arrive, slots keep freeing and the
-consumer simply drains the backlog; the control message can then be handled much
+consumer drains the backlog; the control message can then be handled much
 later than `max_concurrent` (measured: index 49 of 51 at a prefetch of 5) because
 the queue it would have jumped was already consumed while it was in flight. That
-case is not a problem — a backlog that drains in milliseconds is not a backlog —
+case is not a problem (a backlog that drains in milliseconds is not a backlog),
 but it does mean a benchmark with a fast handler measures something other than
 this limit.
 
@@ -201,13 +201,13 @@ it leads to precisely the wrong tuning decision.
 
 **Those prefetched messages are being worked concurrently.** They are not
 queued in front of the control message, they are running *beside each other*.
-The control message waits for **one slot to free** — about one task duration —
+The control message waits for **one slot to free** (about one task duration),
 whether that slot is one of three or one of thirty.
 
 And the more slots there are, the more often one of them frees, so extra
-parallelism can only shorten that wait — never lengthen it. Measured against a
+parallelism can only shorten that wait, never lengthen it. Measured against a
 live broker (TypeScript port, one replica, a 30-message backlog of one-second
-handlers — the [worked example](#a-worked-example) below):
+handlers; the [worked example](#a-worked-example) below):
 
 | `max_concurrent` | Control message at | Handled after | Whole batch |
 |---:|---:|---:|---:|
@@ -216,13 +216,13 @@ handlers — the [worked example](#a-worked-example) below):
 | 3, no priority | index 30 | **9,993 ms** | 10.0 s |
 
 The index tripled with the prefetch. The wait moved by two milliseconds, which
-is noise — and two milliseconds is the *floor*, not a coincidence: in a flood
+is noise, and two milliseconds is the *floor*, not a coincidence: in a flood
 every slot starts at once and so frees at once, one task duration later. In
 steady state, with completions staggered across the slots, a slot frees more
 often than that and the control message is picked up sooner still.
 
 So `max_concurrent` is the width of the window priority cannot see into measured
-*in messages* — and that width costs no time. Tune it for throughput; it is not
+*in messages*, and that width costs no time. Tune it for throughput; it is not
 a priority knob, and turning it down to "tighten" the bound buys a smaller
 number and a slower service.
 
@@ -277,9 +277,9 @@ class WorkService(MessageService):
         return {"tag": request["tag"]}
 ```
 
-Flood the slow method, wait until every prefetch slot is genuinely busy — the
-test asserts this rather than assuming it, because an unsaturated consumer just
-drains the backlog and the run measures nothing — then send the control call:
+Flood the slow method, wait until every prefetch slot is genuinely busy (the
+test asserts this rather than assuming it, because an unsaturated consumer
+drains the backlog and the run measures nothing), then send the control call:
 
 ```python
 for i in range(30):
@@ -302,19 +302,19 @@ how long it takes for one of the parallel slots to free, against ten seconds of
 waiting for the batch to finish. Tripling the prefetch tripled the index and
 left the wait alone.
 
-The third line is also the mutation check — the identical scenario with the
-priority taken off the call — and it is a real test, not a snippet: dropping
+The third line is also the mutation check (the identical scenario with the
+priority taken off the call), and it is a real test: dropping
 `CallOptions(priority=Config.PRIORITY_CONTROL)` from the first case takes it
 from 965 ms to 9,999 ms and fails its assertion, and so does leaving the
 priority on the call while dropping `max_priority` from the queue. Both halves
-are load-bearing — `test_priority.py` checks both.
+are load-bearing; `test_priority.py` checks both.
 
 ## Backward compatibility
 
 The four guarantees below are each pinned by a test.
 
 **1. Opt-in only.** With `max_priority` unset, `x-max-priority` is absent from
-the queue arguments entirely — not present-and-`None`. A service that does
+the queue arguments entirely, not present-and-`None`. A service that does
 not ask for priority declares `{}` (or `{'x-message-ttl': …}`), byte-identical
 to the version before this feature existed, so its existing queue redeclares
 cleanly on upgrade.
@@ -346,7 +346,7 @@ reasons that both had to be checked:
   failed message, it re-publishes it and builds a fresh properties object by
   hand, so anything not copied is dropped. Without it, a control message that
   failed once would come back at priority 0 and queue behind the entire bulk
-  backlog — the exact failure this feature exists to prevent, reachable only
+  backlog: the exact failure this feature exists to prevent, reachable only
   after something else has already gone wrong. The DLQ hop carries it too.
 
 The general rule, and the one to remember when touching this code: **anywhere
@@ -366,7 +366,7 @@ Operation failed: QueueDeclare; 406 (PRECONDITION-FAILED) with message
 ```
 
 A 406 kills the channel the declare was issued on. Each listener opens its own
-channel, so this is not a process-wide channel outage — but `init()` rejects and
+channel, so this is not a process-wide channel outage, but `init()` rejects and
 **the service does not start**. Hitting it on a *reconnection* is no quieter:
 the failed restore propagates to the connection, which discards that generation,
 reports itself disconnected and retries, then gives up through its reconnection
@@ -376,7 +376,7 @@ migration below.
 So enabling `max_priority` on a service that has already run against a broker
 requires a one-time, operator-driven **drain, delete and recreate** of that
 service's main queue. Follow **Procedure A** in
-[Queue Migration](../operations/queue-migration.md) — the same procedure as for a changed
+[Queue Migration](../operations/queue-migration.md), the same procedure as for a changed
 `message_ttl_ms`, applied to `<service_name>` only (not `.Retry`, not `.DLQ`).
 
 Deploying the new code before the queue is deleted fails loudly on startup with
@@ -396,7 +396,7 @@ asked for; an explicit `0` sent as `0`), and what each refuses (`max_priority`
 with early ack). Verified against a live broker, both ports running at once:
 a TypeScript publisher's `priority` is honoured by a Python consumer's
 `max_priority` queue, and a TypeScript service redeclares a Python-created
-priority queue without a 406 — the two emit the same queue arguments, which is
+priority queue without a 406: the two emit the same queue arguments, which is
 the one disagreement that would take a channel down.
 
 Verified in **both** directions against a live broker with both ports running:

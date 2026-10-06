@@ -32,7 +32,7 @@ For real authorisation, put the control where it can be enforced:
   rather than sharing one. A compromised service is then bounded by what its
   own user can reach.
 - **Per-service vhosts and permissions.** Ordinary `set_permissions` regexes
-  match **resource names** — exchanges and queues — not routing keys. Every RPC
+  match **resource names** (exchanges and queues), not routing keys. Every RPC
   publisher writes to the one shared `proto.bus` exchange, so write permission
   on that exchange authorises publishing *any* `REQUEST.*` key, for any service.
   Vhost permissions bound which exchanges and queues a service can reach; on
@@ -41,7 +41,7 @@ For real authorisation, put the control where it can be enforced:
   impersonating another. `set_topic_permissions` is a separate mechanism, and
   the only one that takes the routing key into account when authorising a
   publish to a topic exchange. It must be configured explicitly: with no topic
-  permissions defined — the state of a fresh installation — publishing to a
+  permissions defined (the state of a fresh installation), publishing to a
   topic exchange is always authorised once resource access passes.
 
   ```bash
@@ -55,7 +55,7 @@ For real authorisation, put the control where it can be enforced:
   body method disagrees with the routing key it arrived on (see
   [MessageService → Only methods your subclass defines are dispatchable](../reference/api/message-service.md#only-methods-your-subclass-defines-are-dispatchable)).
   The broker decides which keys a service may publish; the service refuses a
-  body that contradicts its key. Neither is a substitute for the other — without
+  body that contradicts its key. Neither is a substitute for the other: without
   topic permissions the broker enforces nothing about routing keys, and without
   the dispatch check a caller who is allowed one key could still ask for another
   method.
@@ -74,7 +74,7 @@ access control than the bus itself:
 - **Connection URLs.** Logged with the password replaced (`amqp://user:***@…`).
   Scheme, user, host, port and vhost are kept so the line stays useful.
 - **Message and event payloads.** The framework logs sizes, types and
-  correlation IDs, never bodies — and an encoding failure names the field and
+  correlation IDs, never bodies, and an encoding failure names the field and
   the offending value's *type*, never the value. Log aggregators typically
   have far broader read access and longer retention than your broker
   credentials.
@@ -93,12 +93,12 @@ suppressing this by default would degrade every consumer's error reporting to
 guard against a downstream bug.
 
 Set `PROTOBUS_EXPOSE_INTERNAL_ERRORS=false` where that assumption does not
-hold — chiefly a gateway that relays protobus errors onward to untrusted
+hold, chiefly a gateway that relays protobus errors onward to untrusted
 clients. Callers then receive a generic message plus the correlation ID, while
 the real error still reaches the service's own log.
 
 A gateway should map errors to a public vocabulary deliberately rather than
-relaying whatever it received. The setting is a safety net, not a substitute.
+relaying whatever it received. The setting is a safety net and does not replace that mapping.
 
 ## Delivery guarantees
 
@@ -108,15 +108,15 @@ not provide exactly-once effects, and no broker-level mechanism can.
 A publish returns only when RabbitMQ confirms it. Two failure modes are
 deliberately reported as *ambiguous* rather than as failures:
 
-- `PublishConfirmTimeoutError` — no confirm arrived in time.
-- `ChannelClosedError` — the channel closed with the publish unconfirmed.
+- `PublishConfirmTimeoutError`: no confirm arrived in time.
+- `ChannelClosedError`: the channel closed with the publish unconfirmed.
 
 In both cases the broker may or may not have stored the message. Retrying can
 therefore duplicate it. Every publish carries a stable `message_id`, preserved
 across retries, so consumers can deduplicate.
 
 **Handlers should be idempotent.** This is a requirement of the delivery
-contract, not a nice-to-have — particularly for handlers that also write to a
+contract and not optional, particularly for handlers that also write to a
 database, where the message and the transaction can succeed independently.
 
 ---

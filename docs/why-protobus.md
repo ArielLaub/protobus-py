@@ -10,7 +10,7 @@
 | **Next** | [Getting Started](./guide/getting-started.md) · [Architecture](./concepts/architecture.md) |
 | **Source** | [`protobus/`](../protobus) |
 
-**On this page** — [The choice](#the-choice) · [Porting](#porting-to-another-language) · [What it is not](#what-protobus-is-not) · [When to choose it](#when-to-choose-protobus) · [Performance](#performance)
+**On this page:** [The choice](#the-choice) · [Porting](#porting-to-another-language) · [What it is not](#what-protobus-is-not) · [When to choose it](#when-to-choose-protobus) · [Performance](#performance)
 
 ---
 
@@ -28,7 +28,7 @@ a broker is good at are left to the broker rather than implemented above it:
 |---|---|
 | Load balancing | competing consumers on one queue |
 | Routing | topic exchange bindings (`REQUEST.<Service>.*`) |
-| Redelivery on consumer loss | late ack — an unacked delivery returns to the queue |
+| Redelivery on consumer loss | late ack: an unacked delivery returns to the queue |
 | Retry delay | the retry queue's `x-message-ttl`, drained by DLX |
 | Persistence | durable queues, persistent messages |
 | Dead letters | a real `<Service>.DLQ` |
@@ -40,8 +40,8 @@ library:
 **There is less protobus in the path.** A message goes from a publisher to a
 RabbitMQ exchange to a queue to a consumer. No process holds a registry of live
 instances, so no process has a stale one. When a consumer dies mid-request, its
-delivery was never acked and the broker gives it to another consumer — that is
-queue behaviour, not recovery code.
+delivery was never acked and the broker gives it to another consumer. That is
+ordinary queue behaviour; no recovery code is involved.
 
 **There is less protobus to reimplement.** See below.
 
@@ -61,7 +61,7 @@ choices rather than from any single feature.
 
 **A small dependency surface.** Two runtime dependencies: `aiormq` and
 `protobuf`. Pure logic translates to another language fairly mechanically and
-can be checked against shared tests. A dependency boundary does not — different
+can be checked against shared tests. A dependency boundary does not: different
 API shapes, concurrency models, error handling and lifecycle semantics all have
 to be re-established, and preserving behaviour across that boundary is where
 the work actually is. Protobus has one such boundary that matters, the AMQP
@@ -72,8 +72,8 @@ design.
 **Broker-owned messaging behaviour.** Queueing, consumer distribution, retry
 delays and dead-lettering are not translated at all, because they are not in
 the library. They stay in RabbitMQ while you change the service language.
-Service discovery and failure recovery — the parts hardest to validate in a
-port — are not code a port inherits.
+Service discovery and failure recovery (the parts hardest to validate in a
+port) are not code a port inherits.
 
 So the accurate claim is: *a small dependency surface plus broker-owned
 messaging behaviour reduces the code and integration work another language
@@ -84,11 +84,11 @@ implementation requires.* Not that there is nothing to implement.
 Protobuf over AMQP is not self-describing. A peer has to speak protobus's own
 conventions:
 
-- three envelope messages — `RequestContainer`, `ResponseContainer`,
+- three envelope messages: `RequestContainer`, `ResponseContainer`,
   `EventContainer`
 - the routing-key scheme, `REQUEST.<Service>.<method>`, and the rule that the
   envelope's `method` must agree with it
-- the three exchanges — `proto.bus`, `proto.bus.callback`, `proto.bus.events` —
+- the three exchanges (`proto.bus`, `proto.bus.callback`, `proto.bus.events`),
   and how replies are addressed by `reply_to` with `correlation_id` echoed
 - the error encoding on `ResponseContainer`
 - for streaming, the `x-protobus-*` headers
@@ -116,11 +116,11 @@ not a protocol you can skip.
 - **Not a web framework.** No HTTP, no GraphQL, no WebSockets, no DI container,
   no API gateway. It moves messages between services.
 - **Not schemaless.** Every call is a `.proto` contract. If you want to send an
-  ad-hoc object, this is friction, not a feature.
+  ad-hoc object, the contract gets in the way.
 - **Not exactly-once, and not lossless.** See
   [Delivery Guarantees](./concepts/delivery-guarantees.md).
 - **Not a retry system for events by default.** A failed event handler drops
-  its event unless the service opts in to the event retry ladder — a
+  its event unless the service opts in to the event retry ladder. This is a
   deliberate default with real consequences. See
   [Events → Retry](./guide/events.md#retry) and
   [Known Issues](./operations/known-issues.md).
@@ -130,13 +130,13 @@ not a protocol you can skip.
 If you are comparing, read their own documentation rather than a summary
 written by a competitor:
 
-- [Nameko](https://www.nameko.io/) — RabbitMQ-based, with RPC and events, built
+- [Nameko](https://www.nameko.io/): RabbitMQ-based, with RPC and events, built
   on eventlet rather than asyncio
-- [FastStream](https://faststream.airt.ai/) — transport-agnostic (RabbitMQ,
+- [FastStream](https://faststream.airt.ai/): transport-agnostic (RabbitMQ,
   Kafka, NATS, Redis), Pydantic-typed, asyncio-native
-- [Celery](https://docs.celeryq.dev/) — a task queue rather than a service bus;
+- [Celery](https://docs.celeryq.dev/): a task queue rather than a service bus;
   fire-and-forget jobs with results as an afterthought
-- [MassTransit](https://masstransit.io/) — .NET, and closest in philosophy to
+- [MassTransit](https://masstransit.io/): .NET, and closest in philosophy to
   protobus in that it leans on the broker rather than abstracting it
 
 ---
@@ -146,11 +146,11 @@ written by a competitor:
 Choose it when:
 
 - **RabbitMQ is already your broker**, or you are happy to commit to it
-- **You want the broker's behaviour rather than a reimplementation of it** —
+- **You want the broker's behaviour rather than a reimplementation of it**:
   competing consumers, topic routing, DLX, priorities
-- **Contracts matter more than convenience** — `.proto` files as the interface
+- **Contracts matter more than convenience**: `.proto` files as the interface
   between teams, and generated typing that fails the type-check when they drift
-- **You expect more than one language on the bus** — the TypeScript port is
+- **You expect more than one language on the bus**: the TypeScript port is
   verified compatible on every commit
 - **You want a small dependency footprint** you can read end to end
 
@@ -160,7 +160,7 @@ Choose something else when:
 - **You want one framework for HTTP, GraphQL and messaging**
 - **JSON is fine** and a schema step is overhead you do not want
 - **Your messages are ad-hoc** and pinning them to a contract would slow you down
-- **You are not on asyncio** — every protobus API is a coroutine
+- **You are not on asyncio**: every protobus API is a coroutine
 
 ---
 
@@ -173,8 +173,8 @@ here, and a Python service will not reproduce a Node number in any case.
 
 What the architecture would predict, separately from any measurement:
 
-- Protobuf usually encodes to fewer bytes than the equivalent JSON — field
-  numbers instead of names, packed integers — so there is often less to write
+- Protobuf usually encodes to fewer bytes than the equivalent JSON (field
+  numbers instead of names, packed integers), so there is often less to write
   and read. How much less depends on the payload; a message that is mostly
   free text is about the same size either way.
 - Encoding and decoding run in the `protobuf` package's C++ (upb) runtime, not
@@ -182,7 +182,7 @@ What the architecture would predict, separately from any measurement:
 - Routing decisions happen in the broker, so they do not run on your event
   loop.
 - One process is one asyncio loop, so throughput scales by process count, not
-  by `max_concurrent` — see [Getting Started → Project
+  by `max_concurrent`; see [Getting Started → Project
   layout](./guide/getting-started.md#project-layout).
 
 Whether any of that is visible in your workload is an empirical question.

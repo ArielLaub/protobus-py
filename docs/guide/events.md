@@ -6,11 +6,11 @@
 
 | | |
 |---|---|
-| **Prerequisites** | [Getting Started](./getting-started.md) — a service that runs · [Schema](./schema.md) |
-| **Next** | [Error Handling](./error-handling.md) · [Message Flow](../concepts/message-flow.md) — the event on the wire |
+| **Prerequisites** | [Getting Started](./getting-started.md): a service that runs · [Schema](./schema.md) |
+| **Next** | [Error Handling](./error-handling.md) · [Message Flow](../concepts/message-flow.md): the event on the wire |
 | **Source** | [`protobus/event_dispatcher.py`](../../protobus/event_dispatcher.py) · [`protobus/event_listener.py`](../../protobus/event_listener.py) · [`protobus/message_service.py`](../../protobus/message_service.py) · [`protobus/trie.py`](../../protobus/trie.py) |
 
-**On this page** — [The shape of it](#the-shape-of-it) · [A subscriber needs a service block](#a-subscriber-still-needs-a-service-block) · [Publishing](#publishing) · [Subscribing](#subscribing) · [Topics route, types do not](#topics-route-types-do-not) · [Wildcards](#wildcard-patterns) · [Several handlers](#several-handlers-one-topic) · [When a handler raises](#when-a-handler-raises) · [Turning retry on](#retry) · [What survives what](#what-survives-what) · [A subscriber that is not a service](#a-subscriber-that-is-not-a-service) · [Worked example](#worked-example)
+**On this page:** [The shape of it](#the-shape-of-it) · [A subscriber needs a service block](#a-subscriber-still-needs-a-service-block) · [Publishing](#publishing) · [Subscribing](#subscribing) · [Topics route, types do not](#topics-route-types-do-not) · [Wildcards](#wildcard-patterns) · [Several handlers](#several-handlers-one-topic) · [When a handler raises](#when-a-handler-raises) · [Turning retry on](#retry) · [What survives what](#what-survives-what) · [A subscriber that is not a service](#a-subscriber-that-is-not-a-service) · [Worked example](#worked-example)
 
 ---
 
@@ -30,7 +30,7 @@ flowchart LR
     style N fill:#9a6700,color:#fff,stroke:#9a6700
 ```
 
-Each subscribing **service** has one durable queue named `<service_name>.Events`, and its replicas compete for it — an event is handled once per service, not once per replica. Events published while every replica of a service is down are waiting in that queue when one comes back.
+Each subscribing **service** has one durable queue named `<service_name>.Events`, and its replicas compete for it: an event is handled once per service, not once per replica. Events published while every replica of a service is down are waiting in that queue when one comes back.
 
 > [!NOTE]
 > Events are published without AMQP's `mandatory` flag, deliberately. An event nobody has subscribed to is discarded by the broker in silence, and that is normal rather than an error. Publishing an event proves nothing about it having been received.
@@ -41,7 +41,7 @@ Each subscribing **service** has one durable queue named `<service_name>.Events`
 
 This is the first thing that goes wrong.
 
-Protobus resolves a class's contract by looking `service_name` up in the loaded schema — `_resolve_contract` in [`protobus/message_service.py`](../../protobus/message_service.py) trims segments from the right until one names a `service`. A class with no matching `service` anywhere raises at `init()`:
+Protobus resolves a class's contract by looking `service_name` up in the loaded schema: `_resolve_contract` in [`protobus/message_service.py`](../../protobus/message_service.py) trims segments from the right until one names a `service`. A class with no matching `service` anywhere raises at `init()`:
 
 ```
 MissingProto: no service in the schema matches 'Notifications.Service' or any
@@ -82,7 +82,7 @@ class NotificationService(RunnableService):
 > [!IMPORTANT]
 > **Order matters.** `subscribe_event` binds a routing key on the listener's queue and channel, both of which are created by `MessageService.init()`. Calling it before `super().init()` raises.
 >
-> `RunnableService.launch()` and `start()` also accept a `post_init` coroutine, called after `init()` — a place to subscribe without overriding `init` at all. [Getting Started → Subscribe to events](./getting-started.md#6-subscribe-to-events) does it that way.
+> `RunnableService.launch()` and `start()` also accept a `post_init` coroutine, called after `init()`, a place to subscribe without overriding `init` at all. [Getting Started → Subscribe to events](./getting-started.md#6-subscribe-to-events) does it that way.
 
 ---
 
@@ -96,7 +96,7 @@ async publish_event(event_type: str, content: Any, topic: str | None = None) -> 
 
 | Argument | Meaning |
 |---|---|
-| `event_type` | the fully qualified **message** type — `<Package>.<MessageType>`. It must be a message in the loaded schema; it is not part of any `service` block. |
+| `event_type` | the fully qualified **message** type, `<Package>.<MessageType>`. It must be a message in the loaded schema; it is not part of any `service` block. |
 | `content` | a `dict` matching that message. Field names follow the `.proto` exactly, so `order_id` stays `order_id`. |
 | `topic` | the routing key. Omit it and it defaults to `EVENT.<event_type>`. |
 
@@ -158,7 +158,7 @@ async def on_shipped(event: dict, event_type: str, topic: str) -> None:
 | `type` | the event type as carried in the envelope, e.g. `Orders.OrderShipped` |
 | `topic` | the topic **from the envelope body**, which is not always the routing key the delivery matched |
 
-A handler may declare fewer parameters and is called with what it declares — `(event)` or `(event, topic)`. Note that the two-parameter form receives the **topic**, not the type; a handler with `*args` is treated as three-parameter.
+A handler may declare fewer parameters and is called with what it declares: `(event)` or `(event, topic)`. The two-parameter form receives the **topic**, not the type; a handler with `*args` is treated as three-parameter.
 
 ```python
 from protobus import RunnableService
@@ -192,18 +192,18 @@ Each call does two things: it binds `topic` on this service's `.Events` queue, a
 The single most misleading thing about the API is that `type` looks like a filter. It is not.
 
 > [!WARNING]
-> **When you pass a `topic`, the `event_type` argument to `subscribe_event` is ignored for routing.** It is used only to compute the default topic when you omit one ([`protobus/event_listener.py`](../../protobus/event_listener.py), `subscribe`). Nothing anywhere compares an arriving event's type against the type you subscribed with. `subscribe_event('Orders.OrderShipped', h, 'ORDERS.#')` runs `h` for **every** event published under a topic beginning `ORDERS.` — including `Orders.OrderCancelled`, and including a type from another team's package.
+> **When you pass a `topic`, the `event_type` argument to `subscribe_event` is ignored for routing.** It is used only to compute the default topic when you omit one ([`protobus/event_listener.py`](../../protobus/event_listener.py), `subscribe`). Nothing anywhere compares an arriving event's type against the type you subscribed with. `subscribe_event('Orders.OrderShipped', h, 'ORDERS.#')` runs `h` for **every** event published under a topic beginning `ORDERS.`, including `Orders.OrderCancelled`, and including a type from another team's package.
 
 Two consequences worth designing around:
 
 - **Guard on `event_type` inside a broad handler**, or give each event type a topic prefix that no other type shares.
-- **A wildcard subscriber must have every type it can receive in its own schema.** The listener decodes with the type carried in the envelope, so an unknown type makes `decode_event` raise — and that is a handler failure, with the consequences in [When a handler raises](#when-a-handler-raises).
+- **A wildcard subscriber must have every type it can receive in its own schema.** The listener decodes with the type carried in the envelope, so an unknown type makes `decode_event` raise, and that is a handler failure, with the consequences in [When a handler raises](#when-a-handler-raises).
 
 There is a matching asymmetry on the two `topic` values in play:
 
 | | Value |
 |---|---|
-| the delivery matched on | the AMQP routing key — what the trie matches, and what the broker used |
+| the delivery matched on | the AMQP routing key: what the trie matches, and what the broker used |
 | the handler's 3rd argument | the `topic` field inside the envelope body |
 
 They agree for anything published by protobus. The listener prefers the routing key precisely because the body does not have to: it is publisher-controlled, and trusting it would let a publisher reach handlers its routing key was never permitted to reach.
@@ -264,7 +264,7 @@ class ReportingService(RunnableService):
 ```
 
 > [!CAUTION]
-> They are **not** independent. The handlers share one delivery and one acknowledgement, and they are awaited in a plain loop — so if the first raises, the second never runs and the whole delivery is lost. Independent side effects that must not take each other down belong in separate services with separate queues.
+> They are **not** independent. The handlers share one delivery and one acknowledgement, and they are awaited in a plain loop, so if the first raises, the second never runs and the whole delivery is lost. Independent side effects that must not take each other down belong in separate services with separate queues.
 
 Two more limits on this shape:
 
@@ -281,7 +281,7 @@ This is the section to read before you rely on events for anything that must not
 flowchart TD
     D[("Orders.Service.Events delivers")] --> H["run every matching handler"]
     H --> OK{"did they all resolve?"}
-    OK -->|yes| A["ack — done"]
+    OK -->|yes| A["ack: done"]
     OK -->|"no, one raised"| R["reject, requeue = false"]
     R --> G["the event is discarded"]
 
@@ -291,7 +291,7 @@ flowchart TD
 > [!CAUTION]
 > **By default a failed event handler does not retry, and there is no event DLQ.** `MessageListener` declares `<Service>.Retry`, `<Service>.Retry.Exchange` and `<Service>.DLQ` for the RPC queue. `EventListener` declares none of them unless you ask, so the connection layer takes its no-retry branch: the delivery is rejected without requeue and the message is gone. There is also no caller to reply to, so nothing anywhere records that it happened beyond one `rejecting message` line in the log.
 >
-> Rejecting is what keeps the subscriber alive — an unacknowledged delivery would hold the prefetch and stall everything behind the first permanently-failing event. [Turning retry on](#turning-retry-on) replaces that trade rather than removing it.
+> Rejecting is what keeps the subscriber alive: an unacknowledged delivery would hold the prefetch and stall everything behind the first permanently-failing event. [Turning retry on](#turning-retry-on) replaces that trade rather than removing it.
 
 Corollaries:
 
@@ -323,7 +323,7 @@ class BillingService(RunnableService):
     async def park_for_replay(self, event: dict, error: Exception) -> None: ...
 ```
 
-or, when the work genuinely must not be lost, do not model it as an event at all. An RPC has the retry ladder and the DLQ — see [Delivery Guarantees](../concepts/delivery-guarantees.md).
+or, when the work genuinely must not be lost, do not model it as an event at all. An RPC has the retry ladder and the DLQ; see [Delivery Guarantees](../concepts/delivery-guarantees.md).
 
 <a id="retry"></a>
 ### Turning retry on
@@ -351,7 +351,7 @@ It declares four objects alongside `<Service>.Events`:
 |---|---|
 | `<Service>.Events.Retry` | parks the failed event for `retry_delay_ms`, then dead-letters it |
 | `<Service>.Events.Retry.Exchange` | topic exchange the failed event is published to, so its routing key survives the hop |
-| `<Service>.Events.Redelivery` | topic exchange bound only to `<Service>.Events` — where the expired event comes back |
+| `<Service>.Events.Redelivery` | topic exchange bound only to `<Service>.Events`, where the expired event comes back |
 | `<Service>.Events.DLQ` | where an event lands once `max_retries` hops are spent |
 
 The redelivery exchange is the part worth understanding. A request's retry
@@ -384,11 +384,11 @@ Verified against a real broker in
 
 | Failure | Event in flight |
 |---|---|
-| Broker restarts | **survives** — published persistent (`delivery_mode` 2), and `<Service>.Events` is durable |
-| Every replica of a subscriber is down | **survives** — the queue is durable and not auto-delete, so it accumulates |
-| A replica is killed mid-handler | **redelivered** — late ack, so the delivery was never settled |
-| The handler raises | **lost** by default — rejected without requeue. With [`event_retry`](#retry): retried, then dead-lettered |
-| Nobody has ever subscribed | **lost** — no binding matches, and events are not published `mandatory` |
+| Broker restarts | **survives**: published persistent (`delivery_mode` 2), and `<Service>.Events` is durable |
+| Every replica of a subscriber is down | **survives**: the queue is durable and not auto-delete, so it accumulates |
+| A replica is killed mid-handler | **redelivered**: late ack, so the delivery was never settled |
+| The handler raises | **lost** by default: rejected without requeue. With [`event_retry`](#retry): retried, then dead-lettered |
+| Nobody has ever subscribed | **lost**: no binding matches, and events are not published `mandatory` |
 
 > [!WARNING]
 > The second row is a real operational hazard in the other direction. `<Service>.Events` is durable and never auto-deletes, so the event queue of a service you deleted keeps filling forever. See [Queue Migration](../operations/queue-migration.md).
