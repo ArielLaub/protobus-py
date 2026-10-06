@@ -124,9 +124,10 @@ needs only protobuf and an AMQP client.
 
 | Language | Repo | Status |
 |---|---|---|
-| TypeScript / Node | [protobus](https://github.com/ArielLaub/protobus) | stable |
+| TypeScript | [protobus](https://github.com/ArielLaub/protobus) | stable (reference) |
 | Python | [protobus-py](https://github.com/ArielLaub/protobus-py) (this repository) | stable |
 | Go | [protobus-go](https://github.com/ArielLaub/protobus-go) | stable |
+| C++ | [protobus-cpp](https://github.com/ArielLaub/protobus-cpp) | new |
 
 The Python and TypeScript ports are verified wire-compatible in both directions
 on every commit ([`tests/integration/test_cross_language.py`](../tests/integration/test_cross_language.py)).
