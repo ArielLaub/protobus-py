@@ -4,7 +4,7 @@ All notable changes to **protobus-py** are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.0] — 2026-10-04
+## [2.0.0] - 2026-10-04
 
 A ground-up rewrite of the core, bringing the Python port to behavioural parity
 with [protobus](https://github.com/ArielLaub/protobus) 2.4 (TypeScript). It
@@ -12,7 +12,7 @@ responds to an external audit of 1.5.0 that found the two ports diverging in
 every reliability guarantee that matters: acknowledgement, persistence, retries,
 schema loading, event interoperability, shutdown and stream cancellation.
 Every finding is closed below, and the parity is now asserted by a test suite
-ported from the TypeScript one — 565 unit tests, an integration suite against a
+ported from the TypeScript one: 565 unit tests, an integration suite against a
 live broker, and a cross-language suite run in **both** directions.
 
 Prepared on 2026-09-08 and published only now: this file dated it, but it was
@@ -23,7 +23,7 @@ ports.
 A major, because the wire and the API both change. The migration guide is
 [`docs/migration.md`](docs/migration.md).
 
-### Changed — the transport
+### Changed: the transport
 
 - **`aiormq` replaces `aio-pika`.** aio-pika's robust connection ran its own
   reconnection underneath ours; the two fought over one socket, which is how
@@ -48,7 +48,7 @@ A major, because the wire and the API both change. The migration guide is
   is repeated once on the restored channel under the same `message_id`, with
   the reply slot re-armed and the reply queue re-read.
 
-### Changed — consuming
+### Changed: consuming
 
 - **Late ack with a bounded prefetch is the default.** 1.5 auto-acked unless
   `max_concurrent` was set, so a worker dying mid-request lost the message.
@@ -58,8 +58,8 @@ A major, because the wire and the API both change. The migration guide is
   the original `REQUEST.<Service>.<method>` routing key survives the TTL /
   DLX round-trip and a mixed-language pair of workers agree on what a retried
   delivery looks like. After `max_retries` hops the message lands on
-  `<Service>.DLQ` — the queue the listener declares, not one named after the
-  routing key — with `x-retry-count`, `x-original-routing-key`,
+  `<Service>.DLQ` (the queue the listener declares, not one named after the
+  routing key) with `x-retry-count`, `x-original-routing-key`,
   `x-original-queue`, `x-first-failure-time`, `x-dlq-time` and a
   non-disclosing `x-last-error`. Retry options actually reach the consumer;
   in 1.5 they were computed and dropped.
@@ -80,7 +80,7 @@ A major, because the wire and the API both change. The migration guide is
 - Every service method receives a fourth argument when it declares one:
   `MessageHandlerContext(signal, routing_key, message_id, redelivered)`.
 
-### Changed — schema and wire
+### Changed: schema and wire
 
 - **No `protoc`.** `.proto` files are parsed at runtime by the library
   (`protobus.proto_parser`) into protobuf's own `DescriptorPool`, as the
@@ -110,7 +110,7 @@ A major, because the wire and the API both change. The migration guide is
   and names the contract in the envelope, and a request is dispatched only if
   its body method agrees with the routing key the broker delivered on.
 
-### Changed — API
+### Changed: API
 
 - `Context.init(url, proto_locations, options)`; `Context.close()`.
   `MessageFactory.init()` is synchronous.
@@ -137,8 +137,8 @@ A major, because the wire and the API both change. The migration guide is
 
 ### Added
 
-- **Stream cancellation reaches the producer.** Closing a streaming call —
-  `async with`, `aclose()`, or an `AbortSignal` in `StreamOptions` — publishes
+- **Stream cancellation reaches the producer.** Closing a streaming call
+  (`async with`, `aclose()`, or an `AbortSignal` in `StreamOptions`) publishes
   a cancel notice on `proto.bus.cancel`; the service's `context.signal`
   aborts and its generator is closed. Streams are bounded by chunks, bytes
   per call and bytes across all calls; a duplicate chunk is dropped and a gap
@@ -154,7 +154,7 @@ A major, because the wire and the API both change. The migration guide is
   stopping it, and a server-side count proving the producer stopped.
 - CI: unit tests on Python 3.10–3.13, the integration suite against
   RabbitMQ, the combat sample, the cross-language suite, and a
-  build-and-install smoke test — all gating the publish workflow.
+  build-and-install smoke test, all gating the publish workflow.
 - A `LICENSE` file; the README referenced one that was not there.
 - One shutdown signal stops every `RunnableService` inside `run()` in the
   process: asyncio keeps one handler per signal, so a second service's
@@ -189,7 +189,7 @@ item.
   The message and event dispatchers declare `proto.bus`, `proto.bus.events`
   and `proto.bus.cancel` on their own channel, with the one set of options
   every listener uses, at init and on restoration. Publishing an event on an
-  empty vhost — the case that failed in CI — confirms; a request to a
+  empty vhost (the case that failed in CI) confirms; a request to a
   service nobody runs is `UnroutableError`, not a closed channel.
 - **A cooperatively cancelled delivery is settled.** A producer that raises
   through `signal.throw_if_aborted()` after the caller cancelled is
@@ -197,7 +197,7 @@ item.
   worker's prefetch. Cancellation of the consumer task itself still
   propagates.
 - **Stream lifecycle.** A stream closed before its request went out is
-  withdrawn — nothing is published, no notice is sent; a stream closed
+  withdrawn: nothing is published, no notice is sent; a stream closed
   mid-send holds its notice until the send settles, so it cannot overtake the
   request. A consumer task cancelled while the request is still publishing
   cleans up like one cancelled while waiting for a chunk. A buffer bound or
@@ -206,7 +206,7 @@ item.
   publish failure releases the slot without a pull. A reply object dropped
   without being closed is released by a finalizer.
 - **The encoding wrapper closes the handler's iterator** in a `finally`, so
-  an upstream resource — an HTTP stream to a model provider — is released
+  an upstream resource (an HTTP stream to a model provider) is released
   when the stream is cancelled, not when the generator is collected.
 - **The RPC deadline bounds the whole call**: readiness, the broker confirm
   and the reply. A stalled confirm no longer extends a 5 ms budget to the
@@ -221,7 +221,7 @@ item.
   DLQ copies are published `mandatory`, so a missing destination fails the
   settlement instead of confirming into nothing. A channel the broker closes
   on a live connection (a 404 on a deleted retry exchange) is rebuilt by its
-  listener — queue, bindings, retry topology, consumer — and the
+  listener (queue, bindings, retry topology, consumer) and the
   connection's restoration re-declares retry/DLQ objects and bindings
   before consuming resumes. Both verified against a live broker on a fresh
   vhost.
@@ -250,9 +250,9 @@ item.
   notice still follows the request.
 - **Ambiguous sends are cancelled.** A confirm timeout or a closed channel
   may have reached a producer, so a notice is sent; only a nack or an
-  unroutable return — the server never saw the request — goes without one.
+  unroutable return (the server never saw the request) goes without one.
 - A stream that timed out, was closed or was aborted *before* its first
-  pull — or after a pull already reported the outcome — no longer waits for
+  pull, or after a pull already reported the outcome, no longer waits for
   a stalled send on the next pull.
 - **A `None` map entry skips that entry only.** The encoding refactor had
   turned the skip into a return, dropping every entry after it.
@@ -275,18 +275,18 @@ is guaranteed, what is at-least-once, and what is best effort.
 
 ---
 
-## [1.5.0] — 2026-09-01
+## [1.5.0] - 2026-09-01
 
 Two independent bodies of work land in this release: **opt-in message
 priority**, and a **parity pass against the two audits already merged into
 the TypeScript port**. They are listed separately below because they share
 nothing but a version number.
 
-The two meet in exactly one place, and it is worth stating: the retry and
+The two meet in exactly one place: the retry and
 DLQ paths *re-publish* rather than relying on the broker to dead-letter, so
 any property not copied there is lost. The audit rewrote where those
 re-publishes are addressed; the priority copy rides on the corrected
-publish. Both fixes are live — a retried message reaches the retry queue,
+publish. Both fixes are live: a retried message reaches the retry queue,
 and it arrives at the priority it had.
 
 ---
@@ -294,7 +294,7 @@ and it arrives at the priority it had.
 ## Message priority
 
 - **Message priority.** A service can opt its queue into RabbitMQ priority
-  ordering so control traffic jumps a bulk backlog sitting on the same queue —
+  ordering so control traffic jumps a bulk backlog sitting on the same queue:
   the case where a control RPC fans out thousands of messages onto its own
   queue and the next control RPC then waits behind all of them. One queue, no
   extra service. See [`docs/advanced/message-priority.md`](docs/advanced/message-priority.md).
@@ -314,7 +314,7 @@ and it arrives at the priority it had.
 
 - **This is opt-in and backward compatible in both directions.** A listener
   that does not pass `max_priority` declares its queue with the identical
-  argument set as before — no `x-max-priority` key at all. Publishing a
+  argument set as before, with no `x-max-priority` key at all. Publishing a
   priority to a queue that has no `x-max-priority` is accepted and ignored by
   the broker, so a new client is safe against an old service, and an old
   client is safe against a new one.
@@ -324,7 +324,7 @@ and it arrives at the priority it had.
   that adds `x-max-priority` with a `406 PRECONDITION_FAILED`, which closes the
   channel it was made on. Other listeners on the same connection survive that
   (verified), but the declare happens inside `init()`, so the listener never
-  starts and `MessageService.init()` raises — the service fails to boot.
+  starts and `MessageService.init()` raises: the service fails to boot.
   Re-declaring with the *same* `x-max-priority` is idempotent, so restarts
   after the migration are fine.
   Only the service queue needs it; `.retry` and `.DLQ` are deliberately left
@@ -332,7 +332,7 @@ and it arrives at the priority it had.
 
 - **Retries and DLQ now carry the message's priority.**
   `Connection._retry_message` re-publishes rather than relying on the broker's
-  dead-lettering, so it was silently dropping `priority` — a control message
+  dead-lettering, so it was silently dropping `priority`: a control message
   that failed once came back at priority 0 and queued behind the whole bulk
   backlog, which is the exact failure priority exists to prevent and is only
   visible after something has already gone wrong. `_send_to_dlq` copies it too:
@@ -345,27 +345,27 @@ and it arrives at the priority it had.
   of a high-priority one. It shrinks the window by orders of magnitude; it does
   not eliminate it.
 
-  **While the consumer is saturated** — every prefetch slot occupied by an
-  in-flight handler — the relationship is an exact equality. Measured on one
+  **While the consumer is saturated** (every prefetch slot occupied by an
+  in-flight handler) the relationship is an exact equality. Measured on one
   replica with a 50-message backlog and only the prefetch varying:
   `max_concurrent` of 1/5/20 puts the control message at index 1/5/20, and
-  `max_concurrent=100` puts it at index 50 — the whole backlog was prefetched
+  `max_concurrent=100` puts it at index 50: the whole backlog was prefetched
   and **priority is inert**. So `max_concurrent` is not an independent
   throughput dial once priority is in play: raising it widens the window
   priority cannot see into by exactly the amount you raise it.
 
   The saturation condition is load-bearing and is stated in the docs, because
-  protobus does not serialise deliveries — a free prefetch slot keeps pulling
+  protobus does not serialise deliveries; a free prefetch slot keeps pulling
   from the queue while other handlers run. With a **fast** handler the backlog
   drains itself and there is nothing left to jump: same setup holding only the
   first delivery, prefetch 5 and 20 both consumed all 50 bulk messages before
   the control message was published. That measures the drain rate, not the
   prefetch window. The test asserts peak in-flight == prefetch so the
-  precondition is encoded rather than assumed.
+  precondition is checked by the test.
 
 - **`max_priority` requires `max_concurrent` (and `late_ack`), and is refused
   without them.** With no prefetch bound the broker pushes the whole queue into
-  the consumer's buffer and priority does nothing whatsoever. Measured — 300
+  the consumer's buffer and priority does nothing whatsoever. Measured: 300
   bulk messages arriving while the consumer is already draining, then one
   control message: `max_concurrent=1, late_ack=True` handled it at position 92
   of 301; `max_concurrent=1, late_ack=False` and `max_concurrent=None` both
@@ -373,8 +373,8 @@ and it arrives at the priority it had.
   ignores QoS prefetch for auto-ack consumers. This raises
   `InvalidPriorityError` at construction rather than warning, because the
   failure is otherwise invisible: the queue is correctly declared, the operator
-  has done the migration, and the feature is simply inert. Via
-  `MessageServiceOptions` only `max_concurrent` is needed — `MessageService`
+  has done the migration, and the feature is inert. Via
+  `MessageServiceOptions` only `max_concurrent` is needed; `MessageService`
   sets `late_ack` itself.
 
 - **Port parity, verified across the wire.** The TypeScript port gains the same
@@ -384,12 +384,11 @@ and it arrives at the priority it had.
   client against a live broker and confirmed both halves that matter: a TS
   `priority` is honoured by a Python `max_priority` queue (control message
   handled at index 1 of 21, with the consumer already draining), and the two
-  ports emit an **identical queue argument set** — a TS service re-declares a
+  ports emit an **identical queue argument set**: a TS service re-declares a
   Python-created priority queue with no 406, while the negative control (a TS
   service without `maxPriority`) is correctly rejected. The reverse direction,
   Python publisher → TS consumer, was then run too: control handled at index 1
-  of 21, identical to the forward direction. Both directions verified, not
-  inferred.
+  of 21, identical to the forward direction. Both directions verified.
 
   Three deliberate divergences, all behaviourally invisible because RabbitMQ
   cannot distinguish an absent priority from an explicit `0`: amqplib omits the
@@ -420,18 +419,18 @@ limited to **silent data corruption or loss** and **hangs and leaks**;
 cross-port divergences and lower-severity items are listed as known debt in
 the pull request rather than half-fixed here.
 
-### Fixed — message loss
+### Fixed: message loss
 
 - **Every retry destroyed its message.** `_retry_message` built its message with
   `expiration=str(retry_delay_ms)`, and aio-pika's `encode_expiration` is a
-  `singledispatch` registered for `int`, `float`, `timedelta` and `datetime` —
+  `singledispatch` registered for `int`, `float`, `timedelta` and `datetime`,
   not `str`. It raised `ValueError` at publish time on every aio-pika ≥ 9; the
   surrounding bare `except` logged it, and the delivery was acked regardless.
   Any message whose handler raised a non-`HandledError` was destroyed on its
   first retry, on every install. `expiration` is now a number of seconds.
 - **The retry publish was addressed to nothing.** It published to the topic bus
-  exchange with the key `"<delivery routing key>.retry"` — four segments
-  against the three-segment binding a service declares — while the retry queue
+  exchange with the key `"<delivery routing key>.retry"` (four segments
+  against the three-segment binding a service declares) while the retry queue
   is named after the *consumer's queue* and is bound to nothing. Verified
   against a real broker: the broker returns the message as unroutable. Retries
   now go to the retry queue by name through the default exchange, the technique
@@ -450,7 +449,7 @@ the pull request rather than half-fixed here.
   subscriber was ever called while the binding stayed in place and the broker
   kept delivering. Nodes now hold a list.
 
-### Fixed — silent data corruption
+### Fixed: silent data corruption
 
 - **`bigint` reshaped values it could not represent.** A negative was
   two's-complemented into 256 bits and read back by the unsigned decoder as a
@@ -467,7 +466,7 @@ the pull request rather than half-fixed here.
   Unknown fields are ignored rather than rejected, matching protobufjs.
 - **An error reply with no method decoded as a success.** `decode_response`
   required a non-empty `error.method`, so an error raised before the method was
-  known — the reply to a request that did not decode — fell through to the
+  known (the reply to a request that did not decode) fell through to the
   result path and reached the caller as an empty successful result.
 - **A truncated stream looked like a finished one.** Losing the connection
   mid-stream pushed the same `_STREAM_END` sentinel a *complete* stream ends
@@ -478,7 +477,7 @@ the pull request rather than half-fixed here.
   and never read, so a lost chunk was delivered as a shorter but apparently
   complete stream. Gaps now raise `StreamSequenceError`.
 
-### Fixed — security
+### Fixed: security
 
 - **The message body chose the method.** The handler was resolved as
   `getattr(self, request.method.split(".")[-1])` with nothing checked against
@@ -490,10 +489,10 @@ the pull request rather than half-fixed here.
   bound to the service's own contract: the body's method must name this
   service, must agree with the routing key RabbitMQ authorised, must be
   declared in the `.proto` when one is loaded, and must resolve to a member the
-  subclass itself implements — the walk stops at `MessageService`.
+  subclass itself implements; the walk stops at `MessageService`.
 - Connection URLs are redacted before they reach a log.
 
-### Fixed — hangs
+### Fixed: hangs
 
 - **A unary RPC used the server's handler budget as the caller's deadline.**
   `MESSAGE_PROCESSING_TIMEOUT` defaults to 600 000 ms, so a call to a service
@@ -506,7 +505,7 @@ the pull request rather than half-fixed here.
   reply the retries were never going to produce. It is now answered at once.
   `ProtocolError` and `InvalidMethodError` are `HandledError`s.
 - **No AMQP heartbeat was negotiated**, so the interval was whatever RabbitMQ
-  proposed — 60 s — and a peer that vanished without closing its socket went
+  proposed (60 s), and a peer that vanished without closing its socket went
   unnoticed for around two minutes while the connection reported itself
   healthy. `AMQP_HEARTBEAT_SECONDS` defaults to 30. A heartbeat already in the
   URL is left alone, `heartbeat=0` included; the rest of the URL is preserved
@@ -516,8 +515,8 @@ the pull request rather than half-fixed here.
   `STREAM_MAX_BUFFERED_CHUNKS` (default 256).
 - **A broken `.proto` came up looking healthy.** `RunnableService.start` wrapped
   schema registration in a bare `except Exception` and registered an empty
-  schema on any failure. Only a genuinely missing `.proto` — the JSON-mode case
-  — is tolerated now.
+  schema on any failure. Only a genuinely missing `.proto` (the JSON-mode case)
+  is tolerated now.
 
 ### Added
 
@@ -531,12 +530,12 @@ the pull request rather than half-fixed here.
 
 - `MessageHandler` may declare an optional fourth positional parameter and
   receive the routing key the delivery arrived on. Handlers that do not declare
-  it are called exactly as before — the arity is resolved once per consumer.
+  it are called exactly as before; the arity is resolved once per consumer.
 - `InvalidMethodError` is now a `HandledError`, so an unknown method is
   answered rather than retried.
 - Tests read their broker URL from `PROTOBUS_TEST_AMQP_URL`. Hardcoding
-  `localhost:5672` is a live hazard: anything else bound to loopback 5672 — a
-  `kubectl port-forward` to a cluster broker is the usual one — silently takes
+  `localhost:5672` is a live hazard: anything else bound to loopback 5672 (a
+  `kubectl port-forward` to a cluster broker is the usual one) silently takes
   precedence over the local docker-compose container, and the suite then
   declares queues and publishes on shared infrastructure while reporting a
   clean pass.
@@ -546,14 +545,14 @@ the pull request rather than half-fixed here.
 - Tests: 135 pass (55 pre-existing + 80 new), against a real RabbitMQ. Every
   new fix was mutation-checked: the fix was reverted one at a time and the test
   naming it confirmed to fail, 18/18. Two of those reverts stayed green on the
-  first attempt and exposed real gaps — the dispatch boundary had to move from
+  first attempt and exposed real gaps: the dispatch boundary had to move from
   MessageService to the whole protobus package, and several refusal assertions
   were being satisfied by an incidental TypeError rather than by the guard.
 - Routing, publisher confirms, `basic.return` and heartbeat negotiation are
   verified against a real broker in `tests/test_audit_broker.py`; they cannot
   be established with mocks.
 
-## [1.4.1] — 2026-08-19
+## [1.4.1] - 2026-08-19
 
 ### Fixed
 
@@ -562,7 +561,7 @@ the pull request rather than half-fixed here.
   previous one without closing it, `MessageDispatcher` additionally built a
   brand-new `CallbackListener` (channel + exclusive queue + consumer) per
   reconnect, and nothing ever unregistered a component's connection event
-  handlers — so discarded components kept opening channels forever and the
+  handlers, so discarded components kept opening channels forever and the
   growth compounded to O(N²) in the number of reconnects. On top of that,
   `Connection._reconnect()` replaced the underlying connection without closing
   the old one or detaching from it; since aio-pika's robust connections
@@ -577,7 +576,7 @@ the pull request rather than half-fixed here.
   re-declared the queue by its previous broker-generated `amq.gen-*` name,
   which the broker refuses (reserved prefix). Anonymous listeners now always
   ask for a fresh queue, named listeners keep their configured name, and
-  direct-exchange listeners re-derive their self-binding — so a callback queue
+  direct-exchange listeners re-derive their self-binding, so a callback queue
   survives a reconnect instead of only working because the dispatcher happened
   to rebuild it.
 
@@ -595,7 +594,7 @@ the pull request rather than half-fixed here.
 - **A hung channel close could block recovery permanently.** Releases run on
   the restore path and are now bounded by `RELEASE_TIMEOUT_S` (5s).
 - `close()` now fails pending RPCs and streams instead of leaving callers to
-  wait out the full timeout — it detaches the handler that used to do that.
+  wait out the full timeout; it detaches the handler that used to do that.
 - `_emit` iterates a copy of the handler list, so a handler that unsubscribes
   itself no longer causes the next one to be skipped.
 - Handler tasks created by `_emit` are strongly referenced, for the same reason
@@ -607,7 +606,7 @@ the pull request rather than half-fixed here.
 ### Added
 
 - `Connection.off(event, callback)` (alias `remove_listener`, matching TS
-  `protobus`) — there was previously no way to unregister an event handler.
+  `protobus`); there was previously no way to unregister an event handler.
   Handlers are detached through `detach_listener()`, which tolerates an
   `IConnection` implemented against 1.4.0 that has no `off()`, so upgrading
   stays drop-in.
@@ -615,8 +614,8 @@ the pull request rather than half-fixed here.
   opposed to `is_initialized`) and `BaseListener.restore()`.
 - `MessageDispatcher.close()` and `EventDispatcher.close()`, mirroring TS
   v1.1.2. `Context.close()` now calls them before closing the connection.
-- `release_amqp_resources()` / `schedule_amqp_release()` in `protobus.connection`
-  — best-effort, never-raising release of a channel and its consumer, shared by
+- `release_amqp_resources()` / `schedule_amqp_release()` in `protobus.connection`:
+  best-effort, never-raising release of a channel and its consumer, shared by
   every component that re-creates its channel on reconnection.
 
 ### Changed
@@ -624,7 +623,7 @@ the pull request rather than half-fixed here.
 - **`max_reconnect_attempts` is now an escalation threshold, not a give-up
   point.** The reconnect loop keeps retrying at `max_reconnect_delay_ms` and
   emits the `error` event exactly once when the budget is exhausted. Before
-  this release the loop stopped there — which was survivable only because the
+  this release the loop stopped there, which was survivable only because the
   abandoned connection healed itself, i.e. because of the leak. With that leak
   fixed, giving up would leave the process permanently mute after any outage
   longer than the budget (under three minutes on the defaults). Verified
@@ -644,14 +643,14 @@ the pull request rather than half-fixed here.
 - The Onit services install this from PyPI (`protobus>=1.4.0`), so the fix only
   reaches running pods once 1.4.1 is published.
 
-## [1.4.0] — 2026-06-04
+## [1.4.0] - 2026-06-04
 
 ### Added
 
 - **Server-streaming RPC.** Methods declared `rpc foo (Req) returns (stream Chunk)`
   in `.proto` return an `AsyncIterator[Chunk]` on the client (consumed with
   `async for`) and accept an async-generator handler on the server. End-of-stream
-  is signaled via the `x-protobus-final` AMQP header — no `ResponseContainer`
+  is signaled via the `x-protobus-final` AMQP header, with no `ResponseContainer`
   schema change. See [`docs/advanced/streaming.md`](docs/advanced/streaming.md).
 - **Cross-language compatibility.** A TS client (`protobus@1.4.0`) drives a
   Python streaming server identically to a Python client. The chat-path
@@ -659,9 +658,9 @@ the pull request rather than half-fixed here.
   verified by `protobus`'s `test/integration/cross-language.test.ts`.
 - New errors: `StreamingError`, `StreamTimeoutError`, `StreamBackpressureError`,
   `StreamClosedError`.
-- New config: `STREAM_IDLE_TIMEOUT_MS` env var (default `60000` ms) — idle
+- New config: `STREAM_IDLE_TIMEOUT_MS` env var (default `60000` ms): idle
   timeout between streaming chunks. Streaming calls do NOT use
-  `MESSAGE_PROCESSING_TIMEOUT` — a stream may legitimately take far longer
+  `MESSAGE_PROCESSING_TIMEOUT`; a stream may legitimately take far longer
   than any single chunk gap.
 - New public API: `Context.publish_streaming_message()`,
   `MessageDispatcher.publish_streaming()`, `MessageFactory.is_streaming_method()`.
@@ -676,7 +675,7 @@ the pull request rather than half-fixed here.
 
 - `MessageHandler` type alias gained an optional `headers` parameter:
   `Callable[[bytes, str, dict], Awaitable[Any]]`. Existing handlers with the
-  old 2-arg signature keep working — `headers` has a default value where the
+  old 2-arg signature keep working; `headers` has a default value where the
   framework calls handlers.
 - Handlers may now return an `AsyncIterator[bytes]` (in addition to
   `Optional[bytes]`) to drive a streaming reply.

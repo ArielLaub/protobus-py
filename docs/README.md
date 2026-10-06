@@ -1,6 +1,6 @@
 <div align="center">
 
-# ProtoBus for Python — Documentation
+# ProtoBus for Python Documentation
 
 **RabbitMQ-native microservices with Protocol Buffers.**
 
@@ -21,8 +21,8 @@
 | **Decide whether to adopt it** | [Why ProtoBus](./why-protobus.md) → [Architecture](./concepts/architecture.md) | 15 min |
 | **Build my first service** | [Getting Started](./guide/getting-started.md) → [CLI](./reference/cli.md) → [Configuration](./reference/configuration.md) | 30 min |
 | **Understand why it is reliable** | [Delivery Guarantees](./concepts/delivery-guarantees.md) | 15 min |
-| **Look something up** | [Reference](#reference) · [Troubleshooting](./operations/troubleshooting.md) | — |
-| **Upgrade from 1.x** | [Migration](./migration.md) · [CHANGELOG](../CHANGELOG.md) | — |
+| **Look something up** | [Reference](#reference) · [Troubleshooting](./operations/troubleshooting.md) | n/a |
+| **Upgrade from 1.x** | [Migration](./migration.md) · [CHANGELOG](../CHANGELOG.md) | n/a |
 
 ### Run the sample in 60 seconds
 
@@ -33,8 +33,8 @@ docker compose up -d
 PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh
 ```
 
-Six services fight a battle royale over the bus — RPC, pub/sub events, and clean
-shutdown in one run — and the script asserts exactly one player survived. Open
+Six services fight a battle royale over the bus (RPC, pub/sub events, and clean
+shutdown in one run), and the script asserts exactly one player survived. Open
 <http://localhost:15672> (`guest`/`guest`) to watch the queues while it runs.
 The source is [`sample/combatGame`](../sample/combatGame).
 
@@ -52,8 +52,8 @@ Read in order. Each page assumes the ones above it.
 | 4 | **[Error Handling](./guide/error-handling.md)** | Retriable vs terminal, the retry ladder, the DLQ |
 | 5 | **[Testing](./guide/testing.md)** | Unit, integration and end-to-end, without a broker where possible |
 | 6 | **[Patterns](./guide/patterns.md)** | Worked examples assembled from all of the above |
-| — | [Streaming RPC](./guide/streaming.md) | `returns (stream Chunk)`, backpressure, cancellation |
-| — | [Message Priority](./guide/priority.md) | Letting control messages overtake a bulk backlog |
+| - | [Streaming RPC](./guide/streaming.md) | `returns (stream Chunk)`, backpressure, cancellation |
+| - | [Message Priority](./guide/priority.md) | Letting control messages overtake a bulk backlog |
 
 ---
 
@@ -82,7 +82,7 @@ How it works. Read once, refer back.
 
 | Class | Use it to | |
 |---|---|---|
-| [Context](./reference/api/context.md) | hold the connection and the proto registry — one per process | |
+| [Context](./reference/api/context.md) | hold the connection and the proto registry, one per process | |
 | [MessageService](./reference/api/message-service.md) | implement a service | base class |
 | [RunnableService](./reference/api/runnable-service.md) | implement a service that owns its process | preferred |
 | [ServiceProxy](./reference/api/service-proxy.md) | call a remote service | |
@@ -95,7 +95,7 @@ Running it in production. None of this is advanced; it is mandatory.
 
 | Page | |
 |---|---|
-| **[Troubleshooting](./operations/troubleshooting.md)** | Symptom, cause, fix — start from the error text |
+| **[Troubleshooting](./operations/troubleshooting.md)** | Symptom, cause, fix; start from the error text |
 | **[Security](./operations/security.md)** | What `actor` does *not* prove, and what leaves the process |
 | **[Logging](./operations/logging.md)** | Levels, your own sink, structured records, payload diagnostics |
 | **[Queue Migration](./operations/queue-migration.md)** | Changing settings on a live queue without losing messages |
@@ -110,7 +110,7 @@ file, against a real broker by
 [`scripts/check-getting-started.sh`](../scripts/check-getting-started.sh), and
 the claims a snippet cannot assert about itself (which wildcard matches which
 topic, what a zero value decodes to, what an operator reads off a DLQ message)
-are pinned in the unit and integration suites — the pages name the test next
+are pinned in the unit and integration suites, and the pages name the test next
 to the claim.
 
 If you change a documented behaviour, one of those will tell you.
@@ -124,13 +124,14 @@ needs only protobuf and an AMQP client.
 
 | Language | Repo | Status |
 |---|---|---|
-| TypeScript / Node | [protobus](https://github.com/ArielLaub/protobus) | stable |
+| TypeScript | [protobus](https://github.com/ArielLaub/protobus) | stable (reference) |
 | Python | [protobus-py](https://github.com/ArielLaub/protobus-py) (this repository) | stable |
 | Go | [protobus-go](https://github.com/ArielLaub/protobus-go) | stable |
+| C++ | [protobus-cpp](https://github.com/ArielLaub/protobus-cpp) | new |
 
 The Python and TypeScript ports are verified wire-compatible in both directions
 on every commit ([`tests/integration/test_cross_language.py`](../tests/integration/test_cross_language.py)).
-The few behavioural differences are recorded per feature — see
+The few behavioural differences are recorded per feature; see
 [Known Issues → Differences from the TypeScript port](./operations/known-issues.md#differences-from-the-typescript-port).
 
 ---

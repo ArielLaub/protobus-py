@@ -10,13 +10,13 @@
 | **Next** | [Configuration](./configuration.md) · [API reference](./api) |
 | **Source** | [`protobus/cli/`](../../protobus/cli) |
 
-**On this page** — [Install](#install) · [`generate`](#protobus-generate) · [`generate:service`](#protobus-generateservice-name) · [`init`](#protobus-init) · [Configuration](#configuration) · [Workflow](#workflow) · [Tips](#tips)
+**On this page:** [Install](#install) · [`generate`](#protobus-generate) · [`generate:service`](#protobus-generateservice-name) · [`init`](#protobus-init) · [Configuration](#configuration) · [Workflow](#workflow) · [Tips](#tips)
 
 ---
 
 ## Install
 
-The CLI ships with protobus — `pip install protobus` puts a `protobus` command
+The CLI ships with protobus: `pip install protobus` puts a `protobus` command
 on your path. There is no `protoc` to install: the `.proto` files are parsed by
 the library itself.
 
@@ -93,13 +93,13 @@ The pieces worth knowing:
 | Generated | What it is for |
 |---|---|
 | `SERVICE_NAME` | the string to pass to `ServiceProxy` and to set as `service_name`. Use it rather than a literal |
-| `Service` | the `Protocol` to annotate a proxy with — `calculator: Service = ServiceProxy(context, SERVICE_NAME)` — so a misnamed rpc or a wrong request shape is a type-checker error at the call site |
-| `AddRequest` / `AddResponse` | the request and response shapes — `total=False`, because proto3 has no required fields |
+| `Service` | the `Protocol` to annotate a proxy with (`calculator: Service = ServiceProxy(context, SERVICE_NAME)`), so a misnamed rpc or a wrong request shape is a type-checker error at the call site |
+| `AddRequest` / `AddResponse` | the request and response shapes, `total=False` because proto3 has no required fields |
 | the method signature | `(request, actor=None, rpc=True, timeout_ms=None, options=None)` for a unary method; `(request, actor=None, idle_timeout_ms=None, options=None)` returning `AsyncIterator[...]` for a server-streaming one |
 
 Field typing follows the [decoding rules](../guide/schema.md#what-a-decoded-message-looks-like): 64-bit integers are `int`, `bytes` is `bytes`, a message field is `Optional[...]`, `repeated` is `List[...]`, a map is `Dict[...]`, an enum is a `Literal` of its value names, and a custom type is whatever its `py_type` says (`datetime` for `timestamp`, `int` for `bigint`).
 
-**Several packages.** When the services in `proto_dir` come from one package, names are emitted as above. When they span several, every name keeps its package as a prefix — `ORDERS_SERVICE_NAME`, `Orders_Service`, `Orders_AddRequest` — because the output is a single module and two packages may well both declare a `Request`.
+**Several packages.** When the services in `proto_dir` come from one package, names are emitted as above. When they span several, every name keeps its package as a prefix (`ORDERS_SERVICE_NAME`, `Orders_Service`, `Orders_AddRequest`), because the output is a single module and two packages may well both declare a `Request`.
 
 ### `protobus generate:service <Name>`
 

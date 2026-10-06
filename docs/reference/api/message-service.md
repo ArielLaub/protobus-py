@@ -10,7 +10,7 @@
 | **Next** | [RunnableService](./runnable-service.md) · [Error Handling](../../guide/error-handling.md) · [Events](../../guide/events.md) |
 | **Source** | [`protobus/message_service.py`](../../../protobus/message_service.py) · [`protobus/message_listener.py`](../../../protobus/message_listener.py) · [`protobus/event_listener.py`](../../../protobus/event_listener.py) |
 
-**On this page** — [The class](#the-class) · [Required members](#required-members) · [Constructor options](#constructor-options) · [What init does](#what-init-does) · [The handler contract](#the-handler-contract) · [Instance names](#instance-names-and-the-contract-they-resolve-to) · [Events](#events) · [When a handler raises](#when-a-handler-raises) · [Shutdown](#shutdown) · [Startup errors](#startup-errors)
+**On this page:** [The class](#the-class) · [Required members](#required-members) · [Constructor options](#constructor-options) · [What init does](#what-init-does) · [The handler contract](#the-handler-contract) · [Instance names](#instance-names-and-the-contract-they-resolve-to) · [Events](#events) · [When a handler raises](#when-a-handler-raises) · [Shutdown](#shutdown) · [Startup errors](#startup-errors)
 
 ---
 
@@ -35,7 +35,7 @@ class MessageService:
     contract_service_name: str | None       # property: the name the .proto declares, once resolved
 ```
 
-`MessageService` extends **nothing**. It *owns* three listeners as private fields — a `MessageListener` for the request queue, an `EventListener` for the events queue and a `CancelListener` for stream cancellations — which is why none of their members appear on your subclass.
+`MessageService` extends **nothing**. It *owns* three listeners as private fields (a `MessageListener` for the request queue, an `EventListener` for the events queue and a `CancelListener` for stream cancellations), which is why none of their members appear on your subclass.
 
 That listing is the entire public surface. There is no `on_initialized`, no `on_before_start`, and no `cleanup()` here; `cleanup()` belongs to [`RunnableService`](./runnable-service.md#cleanup).
 
@@ -47,11 +47,11 @@ That listing is the entire public surface. There is no `on_initialized`, no `on_
 
 The name the service is addressed by. It binds `REQUEST.<service_name>.*` on `proto.bus`, and its events queue is `<service_name>.Events`.
 
-It is normally `<Package>.<Service>` exactly as the `.proto` declares it, but it may carry extra segments — see [Instance names](#instance-names-and-the-contract-they-resolve-to). A class attribute, a `@property`, or the TypeScript spelling `ServiceName` all work.
+It is normally `<Package>.<Service>` exactly as the `.proto` declares it, but it may carry extra segments; see [Instance names](#instance-names-and-the-contract-they-resolve-to). A class attribute, a `@property`, or the TypeScript spelling `ServiceName` all work.
 
 ### `proto_file_name`
 
-A path to the `.proto` file declaring this service. The default `Proto` property reads it and raises `MissingProto("missing_proto_source")` if it is not there — but only if the schema is not already in the factory, so a service whose directory was passed to `Context.init()` never reads the file at all. `proto_file_name = ""` with a `Proto` attribute or property supplying the schema text is the pattern the test suite uses.
+A path to the `.proto` file declaring this service. The default `Proto` property reads it and raises `MissingProto("missing_proto_source")` if it is not there, but only if the schema is not already in the factory, so a service whose directory was passed to `Context.init()` never reads the file at all. `proto_file_name = ""` with a `Proto` attribute or property supplying the schema text is the pattern the test suite uses.
 
 > [!WARNING]
 > A relative path is resolved against the **process working directory**, not against the source file. `os.path.join(os.path.dirname(__file__), "calculator.proto")` is reliable; `"./calculator.proto"` breaks the moment the service is started from anywhere else.
@@ -111,7 +111,7 @@ def build(context: Context) -> CalculatorService:
 > **`late_ack=False` is not a performance setting.** Acking on delivery disables the retry, DLQ and error-reply paths entirely: a failed message is dropped and the caller waits out its full `RPC_CALL_TIMEOUT_MS` for a reply that is never published. Use it only for genuine at-most-once delivery with no error reporting. Combined with `max_priority` it is refused outright.
 
 > [!WARNING]
-> **`max_priority` cannot be added to a queue that already exists.** RabbitMQ fixes queue arguments at declare time, so the changed declare fails with `PRECONDITION_FAILED` and `init()` raises — the service does not start. An operator has to drain and delete the main queue first. Read the "Enabling priority on a queue that already exists" section of [Message Priority](../../guide/priority.md) before turning it on. The floor is `1`, not `0`: `x-max-priority: 0` is a plain queue with a priority queue's overhead, so it is refused ([`protobus/priority.py`](../../../protobus/priority.py), `validate_max_priority`).
+> **`max_priority` cannot be added to a queue that already exists.** RabbitMQ fixes queue arguments at declare time, so the changed declare fails with `PRECONDITION_FAILED` and `init()` raises: the service does not start. An operator has to drain and delete the main queue first. Read the "Enabling priority on a queue that already exists" section of [Message Priority](../../guide/priority.md) before turning it on. The floor is `1`, not `0`: `x-max-priority: 0` is a plain queue with a priority queue's overhead, so it is refused ([`protobus/priority.py`](../../../protobus/priority.py), `validate_max_priority`).
 
 ---
 
@@ -132,13 +132,13 @@ flowchart TD
 Everything after `_resolve_contract()` touches the broker, so a schema problem surfaces before any queue is declared. A failure at any step is logged with the service name and re-raised.
 
 > [!NOTE]
-> The service registers its own schema, so passing a proto directory to `Context.init()` is optional. When you do both, the second registration is a no-op rather than a duplicate-type error — the factory keys on the service name *and* on the schema text.
+> The service registers its own schema, so passing a proto directory to `Context.init()` is optional. When you do both, the second registration is a no-op rather than a duplicate-type error, because the factory keys on the service name *and* on the schema text.
 
 ---
 
 ## The handler contract
 
-An RPC method is a method on your subclass whose name matches an `rpc` in the contract, **spelled exactly as the `.proto` spells it** — `createOrder` stays `createOrder`. It receives three arguments, or four if it declares a fourth:
+An RPC method is a method on your subclass whose name matches an `rpc` in the contract, **spelled exactly as the `.proto` spells it**: `createOrder` stays `createOrder`. It receives three arguments, or four if it declares a fourth:
 
 | # | Parameter | Type | Notes |
 |---|---|---|---|
@@ -175,13 +175,13 @@ class ReportService(MessageService):
 ```
 
 > [!WARNING]
-> **`actor` is not authentication.** The caller sets it and nothing signs or verifies it — any process that can publish to the bus can publish any value. Use it for tracing and audit logging, never to decide whether an operation is permitted. Identity is enforced with per-service broker credentials: [Security model](../../operations/security.md).
+> **`actor` is not authentication.** The caller sets it and nothing signs or verifies it; any process that can publish to the bus can publish any value. Use it for tracing and audit logging, never to decide whether an operation is permitted. Identity is enforced with per-service broker credentials: [Security model](../../operations/security.md).
 
 ### Only methods your subclass defines are dispatchable
 
 The lookup walks the MRO and **stops at the first class from the `protobus` package** ([`protobus/message_service.py`](../../../protobus/message_service.py), `_resolve_own_handler`). A plain `getattr` would resolve an rpc named `init` or `publish_event` to the framework's own member and call it with the caller's arguments; instead such a name resolves to nothing and the caller gets `invalid service method`. Names starting with `_` are never dispatchable.
 
-If a method is on the class and calls still fail, work down this ladder — it is the order `_on_message` checks in, and each step has a distinct message:
+If a method is on the class and calls still fail, work down this ladder. It is the order `_on_message` checks in, and each step has a distinct message:
 
 | Check | Rejected with |
 |---|---|
@@ -198,7 +198,7 @@ If a method is on the class and calls still fail, work down this ladder — it i
 
 <br/>
 
-The method to run comes out of the message body, which is publisher-controlled. Without the cross-check, a client that can publish to the bus picks which method executes regardless of the routing key it was permitted to publish on — which makes RabbitMQ topic permissions unenforceable, and lets one service's request schema be paired with another service's handler.
+The method to run comes out of the message body, which is publisher-controlled. Without the cross-check, a client that can publish to the bus picks which method executes regardless of the routing key it was permitted to publish on, which makes RabbitMQ topic permissions unenforceable, and lets one service's request schema be paired with another service's handler.
 
 The envelope is decoded and checked *before* the payload, because the method name selects the schema the payload is read with.
 
@@ -225,7 +225,7 @@ flowchart LR
 This is how several replicas share one schema while each owns a distinct queue: `Combat.Player.player6` binds `REQUEST.Combat.Player.player6.*` and gets its own `Combat.Player.player6.Events`, but its methods and payload types come from `service Player`. [`sample/combatGame`](../../../sample/combatGame) gives every player its own name this way.
 
 > [!NOTE]
-> `ServiceProxy` resolves names the same way, so `ServiceProxy(context, "Combat.Player.player6")` addresses that instance directly — it routes to `REQUEST.Combat.Player.player6.<method>` and names `Combat.Player.<method>` in the envelope.
+> `ServiceProxy` resolves names the same way, so `ServiceProxy(context, "Combat.Player.player6")` addresses that instance directly: it routes to `REQUEST.Combat.Player.player6.<method>` and names `Combat.Player.<method>` in the envelope.
 
 > [!NOTE]
 > Trimming stops at the first segment. `Combat.Player.player6` will never resolve against a bare `Combat`, and a name with no dot that is not itself a declared service raises immediately.
@@ -242,11 +242,11 @@ This is how several replicas share one schema while each owns a distinct queue: 
 | `content` | `dict` matching that message |
 | `topic` | routing key; omitted or empty means `EVENT.<event_type>` |
 
-Publishing does not require the event's type to belong to this service's schema — any type in the factory root will do.
+Publishing does not require the event's type to belong to this service's schema; any type in the factory root will do.
 
 ### `subscribe_event(event_type, handler, topic=None)`
 
-The handler is `async (event, event_type, topic) -> None`, or a shorter form — `(event)` or `(event, topic)` — called with what it declares. `topic` is a RabbitMQ topic pattern; omitted, it binds `EVENT.<event_type>`.
+The handler is `async (event, event_type, topic) -> None`, or a shorter form (`(event)` or `(event, topic)`) called with what it declares. `topic` is a RabbitMQ topic pattern; omitted, it binds `EVENT.<event_type>`.
 
 > [!IMPORTANT]
 > **Subscribe after `init()`, never before.** `subscribe_event` binds a queue using the channel and queue name that `init()` creates, so calling it on a service that has not been initialised fails on a missing channel.
@@ -271,7 +271,7 @@ async def main(context) -> None:
     await service.subscribe_event("Orders.OrderEvent", on_us_order, "ORDERS.US.*")
 ```
 
-The events queue is `<service_name>.Events`: **durable and not auto-delete**. Events published while every replica is down are still there when one comes back — and an events queue belonging to a service you deleted keeps filling forever. See [Queue Migration](../../operations/queue-migration.md).
+The events queue is `<service_name>.Events`: **durable and not auto-delete**. Events published while every replica is down are still there when one comes back, and an events queue belonging to a service you deleted keeps filling forever. See [Queue Migration](../../operations/queue-migration.md).
 
 > [!NOTE]
 > There is no `unsubscribe`. The topic trie has no removal path ([`protobus/event_listener.py`](../../../protobus/event_listener.py)). A subscription lasts for the life of the process.
@@ -298,7 +298,7 @@ flowchart TD
 ```
 
 > [!WARNING]
-> **A plain exception does not reach the caller immediately.** No reply is published while a message is being retried. At the defaults — `max_retries=3`, `retry_delay_ms=5000` — a permanently failing call blocks its caller for roughly 15 seconds before the error arrives. Size `RPC_CALL_TIMEOUT_MS` against `max_retries × retry_delay_ms`, not against one handler run.
+> **A plain exception does not reach the caller immediately.** No reply is published while a message is being retried. At the defaults (`max_retries=3`, `retry_delay_ms=5000`) a permanently failing call blocks its caller for roughly 15 seconds before the error arrives. Size `RPC_CALL_TIMEOUT_MS` against `max_retries × retry_delay_ms`, not against one handler run.
 
 `HandledError` is the way to say "this is a business outcome, not an infrastructure failure". Its `message` and `code` always cross the wire, and it is never retried.
 
@@ -324,7 +324,7 @@ class OrderService(MessageService):
         if order is None:
             raise NotFoundError(request["orderId"])
 
-        # An exception from here — a dropped database connection, say — is an
+        # An exception from here (a dropped database connection, say) is an
         # infrastructure failure and DOES go round the retry ladder.
         return {"total": order["total"]}
 

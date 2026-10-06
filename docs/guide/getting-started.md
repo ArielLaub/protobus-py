@@ -7,10 +7,10 @@
 | | |
 |---|---|
 | **Prerequisites** | Python 3.10+, Docker (for RabbitMQ), a terminal |
-| **Next** | [Architecture](../concepts/architecture.md) — what you just created in the broker |
+| **Next** | [Architecture](../concepts/architecture.md): what you just created in the broker |
 | **Source** | [`protobus/context.py`](../../protobus/context.py) · [`protobus/message_service.py`](../../protobus/message_service.py) · [`protobus/service_proxy.py`](../../protobus/service_proxy.py) |
 
-**On this page** — [See it work first](#see-it-work-first) · [Set up](#set-up-the-project) · [1. Schema](#1-define-the-schema) · [2. Context](#2-create-the-context) · [3. Service](#3-implement-the-service) · [4. Server](#4-start-the-server) · [5. Client](#5-call-it) · [6. Events](#6-subscribe-to-events) · [Project layout](#project-layout) · [Where next](#where-next)
+**On this page:** [See it work first](#see-it-work-first) · [Set up](#set-up-the-project) · [1. Schema](#1-define-the-schema) · [2. Context](#2-create-the-context) · [3. Service](#3-implement-the-service) · [4. Server](#4-start-the-server) · [5. Client](#5-call-it) · [6. Events](#6-subscribe-to-events) · [Project layout](#project-layout) · [Where next](#where-next)
 
 ---
 
@@ -25,8 +25,8 @@ docker compose up -d
 PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh
 ```
 
-Six services fight a battle royale over the bus — RPC calls, published events and
-a clean shutdown, all in one run — and the script asserts exactly one player
+Six services fight a battle royale over the bus (RPC calls, published events and
+a clean shutdown, all in one run), and the script asserts exactly one player
 survived. Open <http://localhost:15672> (`guest` / `guest`) while it runs and you
 can watch the queues fill and drain.
 
@@ -91,8 +91,8 @@ Conventions worth knowing before you go further:
 - **Package + service name is the full service name.** `package Calculator` plus
   `service Math` gives `Calculator.Math`, which is the name that appears on the
   queue, in the routing key, and in every `ServiceProxy` call.
-- **Request and response types may be fully qualified** in `rpc` declarations —
-  `Calculator.AddRequest` — or relative, `AddRequest`; both resolve.
+- **Request and response types may be fully qualified** in `rpc` declarations
+  (`Calculator.AddRequest`) or relative, `AddRequest`; both resolve.
 - **Events are plain messages**, not part of a `service` block.
   `CalculationEvent` above is published by its fully-qualified type name.
 
@@ -114,7 +114,7 @@ Conventions worth knowing before you go further:
 ## 2. Create the context
 
 The `Context` owns the AMQP connection and the parsed schemas. **One per
-process** — services and proxies share it.
+process**; services and proxies share it.
 
 ```python
 # context.py
@@ -147,7 +147,7 @@ from protobus import RunnableService
 
 
 class CalculatorService(RunnableService):
-    # Required: the full service name from the proto — package + service.
+    # Required: the full service name from the proto (package + service).
     service_name = "Calculator.Math"
 
     # One method per rpc, matching the name in the proto exactly. Every
@@ -170,7 +170,7 @@ TypeScript-style `ServiceName` is accepted too.
 > `service_name` may carry extra segments beyond the contract. A class named
 > `Calculator.Math.worker7` still resolves against `service Math`, because
 > `_resolve_contract` trims segments from the right until one matches. That is
-> how you run per-instance services with their own queues —
+> how you run per-instance services with their own queues;
 > [`sample/combatGame`](../../sample/combatGame) uses it to give each player its
 > own name.
 
@@ -201,13 +201,13 @@ python server.py
 
 `RunnableService.start` installs SIGINT/SIGTERM handlers and, on shutdown, stops
 taking new work, drains in-flight messages, runs your `cleanup()` hook and
-disconnects — in that order. A startup failure runs the same sequence and
+disconnects, in that order. A startup failure runs the same sequence and
 re-raises, so an orchestrator can tell a crash-on-boot from a clean stop.
 `launch()` does the same setup but returns the running service instead of
 blocking, for a process that owns its own loop.
 
 > [!NOTE]
-> `RunnableService` derives `proto_file_name` from `service_name` by convention —
+> `RunnableService` derives `proto_file_name` from `service_name` by convention:
 > `Calculator.Math` → `<PROTO_PATH>/Calculator.proto`, `PROTO_PATH` defaulting to
 > `./proto`. When `Context.init()` already loaded that directory the file is
 > never read; the schema is found by name. Use plain
@@ -251,7 +251,7 @@ $ python client.py
 
 Every proxy method takes the request, then optionally `actor`, `rpc`,
 `timeout_ms` and a `CallOptions`. `actor` is a free string that reaches the
-service as its second argument — see [Security](../operations/security.md) for
+service as its second argument; see [Security](../operations/security.md) for
 what it does *not* prove.
 
 ---
@@ -321,7 +321,7 @@ calculator/
 ```
 
 Run each service as **its own process**. A single asyncio loop is one core, so
-packing several services into one process buys no parallelism — it only
+packing several services into one process buys no parallelism; it only
 couples their failure domains and their deploys. Scale by running more
 processes; use `max_concurrent` to control how many messages one process
 handles at a time.

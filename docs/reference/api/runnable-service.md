@@ -6,11 +6,11 @@
 
 | | |
 |---|---|
-| **Prerequisites** | [MessageService](./message-service.md) — everything there applies here |
+| **Prerequisites** | [MessageService](./message-service.md): everything there applies here |
 | **Next** | [ServiceProxy](./service-proxy.md) · [Patterns](../../guide/patterns.md) · [Configuration](../configuration.md) |
 | **Source** | [`protobus/runnable_service.py`](../../../protobus/runnable_service.py) · [`protobus/message_service.py`](../../../protobus/message_service.py) · [`protobus/connection.py`](../../../protobus/connection.py) |
 
-**On this page** — [What it adds](#what-it-adds) · [proto_file_name](#proto_file_name) · [cleanup](#cleanup) · [start / launch](#runnableservicestartcontext-service_class-options-post_init-option_kwargs) · [run / shutdown](#run-and-shutdown) · [The shutdown sequence](#the-shutdown-sequence) · [Exit codes](#exit-codes) · [When to use which](#when-to-use-which)
+**On this page:** [What it adds](#what-it-adds) · [proto_file_name](#proto_file_name) · [cleanup](#cleanup) · [start / launch](#runnableservicestartcontext-service_class-options-post_init-option_kwargs) · [run / shutdown](#run-and-shutdown) · [The shutdown sequence](#the-shutdown-sequence) · [Exit codes](#exit-codes) · [When to use which](#when-to-use-which)
 
 ---
 
@@ -27,7 +27,7 @@
 | `run()` / `shutdown()` / `request_shutdown()` | methods | the pieces `start()` is made of, for a process that owns its loop |
 | the shutdown sequence | behaviour | stop consuming, drain, clean up, disconnect |
 
-Everything else — `init()`, `publish_event`, `subscribe_event`, `stop_consuming()`, the handler contract, the retry ladder — is inherited unchanged from [`MessageService`](./message-service.md).
+Everything else (`init()`, `publish_event`, `subscribe_event`, `stop_consuming()`, the handler contract, the retry ladder) is inherited unchanged from [`MessageService`](./message-service.md).
 
 ```python
 # calculator_service.py
@@ -53,7 +53,7 @@ def proto_file_name(self) -> str:
     return os.path.join(os.environ.get("PROTO_PATH", "./proto"), f"{package_name}.proto")
 ```
 
-The rule is the **first** dot-separated segment — the package — plus `.proto`, inside `PROTO_PATH` (default `./proto`). It is not "the service name with the last segment replaced", which is what the derivation looks like on a two-segment name and is not what it does on any other.
+The rule is the **first** dot-separated segment (the package) plus `.proto`, inside `PROTO_PATH` (default `./proto`). It is not "the service name with the last segment replaced", which is what the derivation looks like on a two-segment name and is not what it does on any other.
 
 | `service_name` | `proto_file_name` |
 |---|---|
@@ -65,7 +65,7 @@ The rule is the **first** dot-separated segment — the package — plus `.proto
 > [!WARNING]
 > The result is **relative to the process working directory**, not to the source file. A service that runs from the repo root and fails from somewhere else is hitting this, and the error is only `MissingProto: missing_proto_source`.
 
-Two ways out. Either pass the proto directory to [`Context.init()`](./context.md#initamqp_connection_string-proto_locations-options), which loads the schema before the service's own `Proto` property is ever consulted — the file is then never read:
+Two ways out. Either pass the proto directory to [`Context.init()`](./context.md#initamqp_connection_string-proto_locations-options), which loads the schema before the service's own `Proto` property is ever consulted, so the file is never read:
 
 ```python
 context = Context()
@@ -134,7 +134,7 @@ async def launch(cls, context, service_class=None, options=None, post_init=None,
 |---|---|
 | `context` | an **already initialised** context. Neither method calls `context.init()`. |
 | `service_class` | the class to construct. Defaults to `cls`, so `CalculatorService.start(context)` is the usual spelling; `RunnableService.start(context, CalculatorService)` is the TypeScript-style one. |
-| `options` | a `MessageServiceOptions`, forwarded to the constructor — see [Constructor options](./message-service.md#constructor-options) |
+| `options` | a `MessageServiceOptions`, forwarded to the constructor; see [Constructor options](./message-service.md#constructor-options) |
 | `post_init` | a coroutine function called with the service after `init()` and before the "Service ready" log. An exception here takes the startup-failure path. |
 | `**option_kwargs` | the fields of `MessageServiceOptions` as keywords (`max_concurrent=4`), instead of `options`; not both |
 
@@ -172,13 +172,13 @@ asyncio.run(main())
 
 ## `run()` and `shutdown()`
 
-For a process that owns its own loop — one that hosts several services, or has other work to do alongside — the pieces are available separately:
+For a process that owns its own loop (one that hosts several services, or has other work to do alongside), the pieces are available separately:
 
 | Method | What it does |
 |---|---|
 | `run()` | installs the signal handlers and blocks until `shutdown()` completes; returns the exit code |
 | `shutdown(reason="", exit_code=0)` | the [shutdown sequence](#the-shutdown-sequence), once; a second call is a no-op |
-| `request_shutdown(reason="requested")` | schedules `shutdown()` from synchronous code — a health-check handler, a watchdog |
+| `request_shutdown(reason="requested")` | schedules `shutdown()` from synchronous code, such as a health-check handler or a watchdog |
 | `exit_code` | property: `0` for a signal-initiated shutdown, `1` when startup failed |
 
 ```python
@@ -209,7 +209,7 @@ flowchart TD
 The order is load-bearing at every step:
 
 - **Stop before drain.** `cleanup()` running while consumers still deliver means a request can arrive after your resources are closed.
-- **Drain before cleanup.** The drain waits for the reply, retry or DLQ publish that *settles* each in-flight message, not merely for the handler to return.
+- **Drain before cleanup.** The drain waits for the reply, retry or DLQ publish that *settles* each in-flight message; the handler returning is not enough.
 - **The drain is bounded.** If the budget expires, the remaining deliveries stay unacknowledged and RabbitMQ redelivers them to another replica. The log says so explicitly: `Drain deadline reached with N still running; they stay unacknowledged and will be redelivered`.
 - **Nothing calls `sys.exit()`.** `run()` returns and `asyncio.run()` finishes normally, so pending output is flushed and your `main()` can do its own teardown.
 
@@ -223,7 +223,7 @@ The order is load-bearing at every step:
 | `service_class(...)`, `init()` or `post_init` raised | `1` | the exception propagates out of `start()` / `launch()`; an unhandled exception exits non-zero |
 
 > [!IMPORTANT]
-> The non-zero exit on a failed startup is the point. Exiting 0 tells Kubernetes and systemd the process succeeded, so a service that could not start is never restarted and never alerts. On that path `launch()` runs the full shutdown sequence with `exit_code=1` and re-raises — so your own `except` around `main()` still sees the original error, and a bare `asyncio.run(main())` exits 1 with a traceback.
+> The non-zero exit on a failed startup is the point. Exiting 0 tells Kubernetes and systemd the process succeeded, so a service that could not start is never restarted and never alerts. On that path `launch()` runs the full shutdown sequence with `exit_code=1` and re-raises, so your own `except` around `main()` still sees the original error, and a bare `asyncio.run(main())` exits 1 with a traceback.
 
 ---
 
@@ -238,14 +238,14 @@ The order is load-bearing at every step:
 | Bootstrap helper | none | `start()` / `launch()` |
 | Exit code on boot failure | yours to set | `1`, and the exception re-raised |
 
-Use `RunnableService` for anything that owns its process — which is most services. Use `MessageService` when something else owns the lifecycle: a test harness, a DI container, or a process running several services where you want one shutdown path rather than one per service.
+Use `RunnableService` for anything that owns its process, which is most services. Use `MessageService` when something else owns the lifecycle: a test harness, a DI container, or a process running several services where you want one shutdown path rather than one per service.
 
 <details>
 <summary><b>Running a RunnableService without <code>start()</code></b></summary>
 
 <br/>
 
-Nothing forces you through `start()`. Constructing and calling `init()` yourself gives you the convention-based `proto_file_name` and the `cleanup()` hook without the signal handling — you then own the ordering described above, or call `shutdown()` to get it.
+Nothing forces you through `start()`. Constructing and calling `init()` yourself gives you the convention-based `proto_file_name` and the `cleanup()` hook without the signal handling; you then own the ordering described above, or call `shutdown()` to get it.
 
 ```python
 from calculator_service import CalculatorService

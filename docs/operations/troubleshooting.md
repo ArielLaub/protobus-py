@@ -10,7 +10,7 @@
 | **Next** | [Known Issues](./known-issues.md) · [Configuration](../reference/configuration.md) |
 | **Source** | [`protobus/connection.py`](../../protobus/connection.py) · [`protobus/message_service.py`](../../protobus/message_service.py) · [`protobus/logger.py`](../../protobus/logger.py) |
 
-**On this page** — [Find your error](#find-your-error) · [Starting up](#starting-up) · [Connection](#connection) · [Schema](#schema) · [RPC](#rpc) · [Events](#events) · [Performance](#performance) · [Turn on debug logging](#turn-on-debug-logging) · [Look at the broker](#look-at-the-broker)
+**On this page:** [Find your error](#find-your-error) · [Starting up](#starting-up) · [Connection](#connection) · [Schema](#schema) · [RPC](#rpc) · [Events](#events) · [Performance](#performance) · [Turn on debug logging](#turn-on-debug-logging) · [Look at the broker](#look-at-the-broker)
 
 ---
 
@@ -97,7 +97,7 @@ Nothing matched.
    ```
 
 2. **The schema was never loaded.** `context.init(url, paths)` scans each path
-   recursively for `.proto` files. Check the path is the one you think it is —
+   recursively for `.proto` files. Check the path is the one you think it is:
    a relative path is relative to the process working directory.
 
 3. **The name does not match.** It is `package` + `.` + `service`:
@@ -131,7 +131,7 @@ that was not under any of the paths passed to `Context.init()`; or it is a
 typo. The message lists the custom types that *are* registered, which settles
 the first case at a glance.
 
-**Fix.** Register the type on the factory **before** `context.init()` — `init()`
+**Fix.** Register the type on the factory **before** `context.init()`, because `init()`
 parses your protos:
 
 ```python
@@ -162,7 +162,7 @@ rabbitmqctl status               # or, if it is installed natively
 curl -u guest:guest localhost:15672/api/overview   # management API answering
 ```
 
-The default port is 5672 (15672 is the management UI, not the AMQP port — a
+The default port is 5672 (15672 is the management UI, not the AMQP port, a
 surprisingly common mix-up). If the broker is on another host, check the firewall
 allows 5672.
 
@@ -219,7 +219,7 @@ context.connection.on("reconnected", lambda: print("connection restored"))
 
 If reconnection never succeeds, the cause is almost always outside protobus:
 the broker is gone, the credentials were rotated, or a network policy changed.
-Touch `AMQP_HEARTBEAT_SECONDS` only after ruling those out — see
+Touch `AMQP_HEARTBEAT_SECONDS` only after ruling those out; see
 [Configuration](../reference/configuration.md#heartbeats).
 
 At the end of a script you may see `connection error` or `closed unexpectedly`
@@ -306,7 +306,7 @@ If your caller gives up, raise `RPC_CALL_TIMEOUT_MS` (or pass `timeout_ms` on th
 call). If your handler is being cut off mid-work, raise
 `MESSAGE_PROCESSING_TIMEOUT` on the service, or its `processing_timeout_ms`.
 
-**Before raising either**, check that the callee is not simply failing and
+**Before raising either**, check that the callee is not failing and
 retrying: a request that keeps raising climbs the retry ladder without
 publishing a reply, so the caller sees a long silence rather than an error. See
 [Delivery Guarantees](../concepts/delivery-guarantees.md).
@@ -328,7 +328,7 @@ await proxy.init()          # this is what installs the methods
 ```
 
 If `init()` did run, the method name does not match the `rpc` name in the
-`.proto` exactly — including case. `createOrder` in the schema is
+`.proto` exactly, including case. `createOrder` in the schema is
 `proxy.createOrder`, not `proxy.create_order`.
 
 > [!NOTE]
@@ -352,8 +352,8 @@ with a log line just above it naming the field:
 the schema says `int32`, an enum name the enum does not declare, a `list` for a
 scalar. The exception's `__cause__` is a `FieldTypeError` or `FieldValueError`
 naming the field and the value's type; the value itself is deliberately kept
-out of every protobus exception message and log line. (A codec's own error —
-the reason a `bigint` was refused — is chained one level further down, in the
+out of every protobus exception message and log line. (A codec's own error,
+the reason a `bigint` was refused, is chained one level further down, in the
 caller's process only.)
 
 ---
@@ -376,12 +376,12 @@ caller's process only.)
    | `ORDERS.*.SHIPPED` | yes |
    | `ORDERS.#` | yes |
    | `ORDERS.EU.*` | no |
-   | `ORDERS.*` | no — `*` is one segment, and there are two after `ORDERS` |
+   | `ORDERS.*` | no: `*` is one segment, and there are two after `ORDERS` |
 
    The last row catches people. See [Events](../guide/events.md).
 
 3. **The handler has the wrong arity.** A two-parameter handler receives
-   `(event, topic)`, not `(event, type)` — a handler that switches on its
+   `(event, topic)`, not `(event, type)`, so a handler that switches on its
    second argument expecting a type name never matches. Declare all three:
    `(event, event_type, topic)`.
 
@@ -394,7 +394,7 @@ caller's process only.)
 ### The same event is handled twice
 
 **Causes.** Subscribing more than once (subscribe in `init()`, once), or a
-process that died mid-handler — an unacknowledged event delivery is redelivered.
+process that died mid-handler (an unacknowledged event delivery is redelivered).
 
 Delivery is **at-least-once**, so a handler that must not run twice has to be
 idempotent. Key on something stable in the event, not on arrival order:
@@ -431,26 +431,26 @@ service = MyService(context, max_concurrent=10)
 [streaming](../guide/streaming.md).
 
 **Buffered streams.** A consumer slower than its producer buffers chunks in the
-dispatcher, up to `STREAM_MAX_BUFFERED_*` — and fails loudly with
+dispatcher, up to `STREAM_MAX_BUFFERED_*`, and fails loudly with
 `StreamBackpressureError` rather than growing further.
 
 ### Slow processing
 
 Scale by running **more processes**, not by packing more services into one. One
-asyncio loop is one core, so co-locating services buys no parallelism — it only
+asyncio loop is one core, so co-locating services buys no parallelism; it only
 couples their failure domains and their deploys. Each replica competes for the
 same durable queue, which is the whole design; see
 [Architecture](../concepts/architecture.md).
 
 Within one process, raise `max_concurrent` so a replica works on several
-messages while others wait on I/O — and make sure nothing in a handler blocks
+messages while others wait on I/O, and make sure nothing in a handler blocks
 the loop. A synchronous database driver or a CPU-bound loop stalls every other
 in-flight message and the heartbeat with it; wrap it in
 `await asyncio.to_thread(...)`.
 
 > [!NOTE]
 > `ServiceCluster` still exists in protobus-py 2.0 for hosting several
-> services in one process, but it is not a concurrency tool — see above.
+> services in one process, but it is not a concurrency tool; see above.
 
 ---
 
@@ -458,7 +458,7 @@ in-flight message and the heartbeat with it; wrap it in
 
 **Installing a logger is not enough.** Debug is off by default, and
 `Logger.debug` is filtered against the level *before* it reaches your sink
-([`protobus/logger.py`](../../protobus/logger.py)) — so a custom logger with a
+([`protobus/logger.py`](../../protobus/logger.py)), so a custom logger with a
 `debug` method receives nothing and you conclude protobus emits no debug output.
 
 You need **both** a sink and a level:
@@ -507,7 +507,7 @@ questions faster than any log line. From the command line:
 # Which queues exist, how deep, and how many consumers
 rabbitmqctl list_queues name messages consumers
 
-# Just this service — should show 4: the queue, .Events, .Retry, .DLQ
+# Just this service (should show 4: the queue, .Events, .Retry, .DLQ)
 rabbitmqctl list_queues name messages | grep '^MyPackage.MyService'
 
 # The exchanges protobus declares
@@ -525,7 +525,7 @@ rabbitmqctl purge_queue MyPackage.MyService.Events
 
 </details>
 
-A message in `<Service>.DLQ` carries headers saying why it got there —
+A message in `<Service>.DLQ` carries headers saying why it got there:
 `x-retry-count`, `x-last-error`, `x-first-failure-time` and others. They are the
 fastest way to diagnose a failing handler in production; see
 [Delivery Guarantees](../concepts/delivery-guarantees.md).

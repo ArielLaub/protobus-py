@@ -72,7 +72,7 @@ service = AssistantService(context, max_concurrent=8)
 ```
 
 Raise it to the number of concurrent messages one replica should be working on.
-It bounds memory as well as throughput — with late ack, the broker will push up
+It bounds memory as well as throughput: with late ack, the broker will push up
 to this many unacknowledged messages into the process. Each in-flight message
 runs as its own asyncio task; a handler that blocks the loop blocks them all.
 
@@ -80,7 +80,7 @@ runs as its own asyncio task; a handler that blocks the loop blocks them all.
 
 The broker closes a connection after two missed heartbeats, so the interval is
 half the worst-case time to notice a peer that vanished without closing its
-socket — a crashed broker, a network partition, a NAT that dropped the flow.
+socket (a crashed broker, a network partition, a NAT that dropped the flow).
 At the default of 30 seconds that is about a minute.
 
 Left to the broker to propose, RabbitMQ asks for 60 seconds, which is two
@@ -97,7 +97,7 @@ amqp://guest:guest@localhost:5672/?heartbeat=0
 
 Shortening the interval detects failure sooner at the cost of a few extra
 frames per minute per connection. Raising it above the broker's own
-`heartbeat` setting has no effect — the lower of the two is negotiated.
+`heartbeat` setting has no effect; the lower of the two is negotiated.
 
 ## Reconnection Options
 
@@ -244,7 +244,7 @@ await context.init(amqp_url, proto_paths)
 
 **Parameters:**
 - `amqp_connection_string`: AMQP connection string
-- `proto_locations`: a directory, a file, or a list of either — directories are searched recursively for `.proto` files. `proto_dirs=` is the 1.x keyword for the same argument.
+- `proto_locations`: a directory, a file, or a list of either; directories are searched recursively for `.proto` files. `proto_dirs=` is the 1.x keyword for the same argument.
 - `options`: an optional `ContextOptions` carrying `reconnection`
 
 ## Service Configuration

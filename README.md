@@ -10,14 +10,16 @@
 
 Define a service in a `.proto` file, implement it as a class, and call it from
 anywhere on the bus as if it were local. ProtoBus turns each service into **one
-durable RabbitMQ queue with N processes competing for it** — so load balancing,
-failover, backpressure, retries and dead-lettering are the broker's, not
-Python's.
+durable RabbitMQ queue with N processes competing for it**, so load balancing,
+failover, backpressure, retries and dead-lettering are handled by the broker
+instead of in Python.
 
 This is the Python port of [protobus](https://github.com/ArielLaub/protobus)
-(TypeScript). The two are **wire-compatible**: a Python service serves
-TypeScript callers and vice versa, streaming, events, custom types and error
-codes included. Every commit runs a cross-language suite in both directions
+(TypeScript), alongside [protobus-go](https://github.com/ArielLaub/protobus-go) (Go) and
+[protobus-cpp](https://github.com/ArielLaub/protobus-cpp) (C++). All four are
+**wire-compatible**: a Python service serves TypeScript, Go and C++ callers and
+vice versa, streaming, events, custom types and error codes included; see
+[Other languages](docs/README.md#other-languages). Every commit runs a cross-language suite in both directions
 against a live broker and a pinned TypeScript revision (2.5.0) to keep it
 that way; the behavioural differences that remain are listed in
 [Known Issues](docs/operations/known-issues.md#differences-from-the-typescript-port).
@@ -101,7 +103,7 @@ asyncio.run(main())
 
 `RunnableService.start` installs signal handlers and, on shutdown, stops
 taking new work, drains in-flight messages, runs your `cleanup()` hook and
-disconnects — in that order.
+disconnects, in that order.
 
 ### 4. Call it
 
@@ -148,7 +150,7 @@ broker instead of being reimplemented above it:
 |---|---|
 | Load balancing | competing consumers on one queue |
 | Routing | topic exchange bindings (`REQUEST.<Service>.*`) |
-| Redelivery on consumer loss | late ack — an unacked delivery returns to the queue |
+| Redelivery on consumer loss | late ack: an unacked delivery returns to the queue |
 | Retry delay | the retry queue's `x-message-ttl`, drained by DLX |
 | Persistence | durable queues, persistent messages |
 | Dead letters | a real `<Service>.DLQ` |
@@ -158,7 +160,7 @@ A request goes publisher → exchange → queue → consumer. Nothing tracks liv
 instances, so nothing holds a stale one, and a consumer that dies mid-request
 leaves its delivery unacked for the next consumer to take.
 
-The cost of this is written down rather than glossed over — read
+The cost of this is written down rather than glossed over; read
 [Delivery Guarantees](docs/concepts/delivery-guarantees.md) before you rely on
 any of it. If you may need to swap RabbitMQ for another broker, use a
 transport-agnostic framework instead; that is a real feature and protobus does
@@ -166,18 +168,18 @@ not have it.
 
 ### Protocol Buffers, not JSON
 
-- **Usually smaller on the wire** — field numbers and packed integers rather
+- **Usually smaller on the wire**: field numbers and packed integers rather
   than text; how much smaller depends on the payload.
-- **Contract-first** — a `.proto` file is the interface between teams, and
+- **Contract-first**: a `.proto` file is the interface between teams, and
   generated typing (`protobus generate`) tells you when the two drift apart.
-- **Versioning by field number** — adding a field does not break an old peer.
+- **Versioning by field number**: adding a field does not break an old peer.
 
 ### Two runtime dependencies
 
 [`aiormq`](https://github.com/mosquito/aiormq) for AMQP and
 [`protobuf`](https://pypi.org/project/protobuf/) for the wire. The messaging
-behaviour that would be hardest to reimplement — queueing, consumer
-distribution, retry delays, dead-lettering — is RabbitMQ's.
+behaviour that would be hardest to reimplement (queueing, consumer
+distribution, retry delays, dead-lettering) is RabbitMQ's.
 
 ---
 
@@ -315,8 +317,8 @@ docker compose up -d
 PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh
 ```
 
-Six services fight a battle royale over the bus — RPC, published events and
-graceful shutdown in one run — and the script asserts exactly one player
+Six services fight a battle royale over the bus (RPC, published events and
+graceful shutdown in one run), and the script asserts exactly one player
 survived. The source is [`sample/combatGame`](sample/combatGame). A second
 sample, [`sample/tokenStream`](sample/tokenStream), streams tokens like an LLM
 and shows cancellation actually stopping the producer.
@@ -325,7 +327,7 @@ and shows cancellation actually stopping the producer.
 
 ## Requirements
 
-- Python 3.10+ (CI runs 3.10 – 3.13)
+- Python 3.10+ (CI runs 3.10 to 3.13)
 - RabbitMQ 3.8+
 
 ## Development

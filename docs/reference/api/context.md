@@ -6,17 +6,17 @@
 
 | | |
 |---|---|
-| **Prerequisites** | [Getting Started](../../guide/getting-started.md) — you have a context that connects |
+| **Prerequisites** | [Getting Started](../../guide/getting-started.md): you have a context that connects |
 | **Next** | [MessageService](./message-service.md) · [ServiceProxy](./service-proxy.md) · [Configuration](../configuration.md) |
 | **Source** | [`protobus/context.py`](../../../protobus/context.py) · [`protobus/connection.py`](../../../protobus/connection.py) · [`protobus/message_factory.py`](../../../protobus/message_factory.py) |
 
-**On this page** — [The whole surface](#the-whole-surface) · [init](#initamqp_connection_string-proto_locations-options) · [Publishing directly](#publishing-directly) · [Properties](#properties) · [Shutting down](#shutting-down) · [Errors from init](#errors-from-init) · [One per process](#one-context-per-process)
+**On this page:** [The whole surface](#the-whole-surface) · [init](#initamqp_connection_string-proto_locations-options) · [Publishing directly](#publishing-directly) · [Properties](#properties) · [Shutting down](#shutting-down) · [Errors from init](#errors-from-init) · [One per process](#one-context-per-process)
 
 ---
 
 ## The whole surface
 
-`Context` is small on purpose. This table is all of it — five methods and six properties.
+`Context` is small on purpose. This table is all of it: five methods and six properties.
 
 | Member | Signature | Notes |
 |---|---|---|
@@ -32,7 +32,7 @@
 | `is_connected` | `bool` | delegates to `connection.is_connected` |
 | `is_reconnecting` | `bool` | delegates to `connection.is_reconnecting` |
 
-`IContext` is the `typing.Protocol` a service or proxy actually needs from its context — `connection`, `factory`, `is_connected`, `is_reconnecting` and the three `publish_*` methods. Anything satisfying it can stand in for a `Context` in a test.
+`IContext` is the `typing.Protocol` a service or proxy actually needs from its context: `connection`, `factory`, `is_connected`, `is_reconnecting` and the three `publish_*` methods. Anything satisfying it can stand in for a `Context` in a test.
 
 ---
 
@@ -42,7 +42,7 @@
 |---|---|---|
 | `amqp_connection_string` | `str` | AMQP connection string. A `?heartbeat=` already in the URL wins; otherwise `AMQP_HEARTBEAT_SECONDS` (default `30`) is appended. |
 | `proto_locations` | `str \| list[str]` | Directories or files. A directory is scanned recursively for `*.proto`. `proto_dirs=` is the 1.x keyword for the same argument. |
-| `options` | `ContextOptions` | `reconnection`: a `ReconnectionOptions` — `max_retries` (10), `initial_delay_ms` (1000), `max_delay_ms` (30000), `backoff_multiplier` (2.0). See [Configuration → Reconnection](../configuration.md#reconnection-options). |
+| `options` | `ContextOptions` | `reconnection`: a `ReconnectionOptions` with `max_retries` (10), `initial_delay_ms` (1000), `max_delay_ms` (30000), `backoff_multiplier` (2.0). See [Configuration → Reconnection](../configuration.md#reconnection-options). |
 
 The order matters, and it is not the order most people assume:
 
@@ -116,9 +116,9 @@ Publishes an already-encoded request and returns the encoded reply.
 | `options.message_id` | a fresh UUID | The id the consumer deduplicates on; pass your own to make a caller-side republish recognisable. |
 | `priority` | unset | 1.x keyword; folded into `options`. |
 
-An RPC publish sets `mandatory`, so a request routed to a key nothing is bound to fails immediately with `UnroutableError` rather than after the full timeout. A non-RPC publish does not — an event with no subscribers is normal.
+An RPC publish sets `mandatory`, so a request routed to a key nothing is bound to fails immediately with `UnroutableError` rather than after the full timeout. A non-RPC publish does not, because an event with no subscribers is normal.
 
-**Building a request by hand.** Encoding uses the *contract* name — what the `.proto` declares — while routing uses whatever the target service bound:
+**Building a request by hand.** Encoding uses the *contract* name (what the `.proto` declares), while routing uses whatever the target service bound:
 
 ```python
 from protobus import Context, RemoteError
@@ -136,11 +136,11 @@ async def call_by_hand(context: Context, method: str, data: dict) -> dict:
     return response.result.data
 ```
 
-You rarely need this: a `ServiceProxy` can be built for an instance name — `ServiceProxy(context, "Combat.Player.player6")` — and does the same thing. [`sample/combatGame/base_player.py`](../../../sample/combatGame/base_player.py) (`call_player_method`) is the worked example. See [MessageService → Instance names](./message-service.md#instance-names-and-the-contract-they-resolve-to) for why the two names differ.
+You rarely need this: a `ServiceProxy` can be built for an instance name (`ServiceProxy(context, "Combat.Player.player6")`) and does the same thing. [`sample/combatGame/base_player.py`](../../../sample/combatGame/base_player.py) (`call_player_method`) is the worked example. See [MessageService → Instance names](./message-service.md#instance-names-and-the-contract-they-resolve-to) for why the two names differ.
 
 ### `publish_streaming_message(content, routing_key, idle_timeout_ms=None, options=None)`
 
-Returns a `StreamingReply` — an async iterator of raw reply bodies that is also an async context manager. It is **not** a coroutine — there is nothing to await before the `async for`. `idle_timeout_ms` defaults to `Config.stream_idle_timeout_ms()` (`STREAM_IDLE_TIMEOUT_MS`, 60000) and bounds the gap *between* chunks, not the stream's total duration. Full protocol in [Streaming](../../guide/streaming.md).
+Returns a `StreamingReply`: an async iterator of raw reply bodies that is also an async context manager. It is **not** a coroutine; there is nothing to await before the `async for`. `idle_timeout_ms` defaults to `Config.stream_idle_timeout_ms()` (`STREAM_IDLE_TIMEOUT_MS`, 60000) and bounds the gap *between* chunks, not the stream's total duration. Full protocol in [Streaming](../../guide/streaming.md).
 
 ### `publish_event(event_type, content, topic=None)`
 
@@ -216,7 +216,7 @@ asyncio.run(main())
 ```
 
 > [!WARNING]
-> A short-lived client that never closes its context does not exit. This is the single most common way a documented example goes wrong, and it is silent — the work all succeeds and the script simply never returns to the shell.
+> A short-lived client that never closes its context does not exit. This is the single most common way a documented example goes wrong, and it is silent: the work all succeeds and the script never returns to the shell.
 
 `close()` is idempotent and releases the dispatchers (failing any pending RPC futures, closing any in-flight streams) before disconnecting. A long-running server does not need to call it. [`RunnableService.start`](./runnable-service.md#runnableservicestartcontext-service_class-options-post_init-option_kwargs) installs SIGINT/SIGTERM handlers that stop consumers, drain in-flight work, run `cleanup()` and then close the context for you.
 
@@ -228,7 +228,7 @@ asyncio.run(main())
 |---|---|---|
 | `aiormq.exceptions.AMQPConnectionError: … Connect call failed` | no broker at the URL | start it; `docker compose up -d` for the bundled compose file |
 | `aiormq.exceptions.ProbableAuthenticationError: ACCESS_REFUSED` | credentials or vhost wrong in the URL | see [AMQP Connection String](../configuration.md#amqp-connection-string) |
-| `ProtoParseError: … (file, line N)` | the parser rejected a schema — an unknown type, a duplicate, a syntax error | fix the `.proto`; the message names the file and line |
+| `ProtoParseError: … (file, line N)` | the parser rejected a schema: an unknown type, a duplicate, a syntax error | fix the `.proto`; the message names the file and line |
 | `ProtoParseError: unknown type 'X'` for a type another file declares | that file is not under any of the `proto_locations` | pass its directory too |
 | `ReconnectionError` | the connection dropped later and `max_retries` attempts were exhausted | raise `max_retries`, or set it to `0` for infinite retries |
 
@@ -277,14 +277,14 @@ async def main() -> None:
     await context.close()
 ```
 
-The reverse — several *services* in one context — is legal but rarely what you want. One asyncio loop is one core, so co-locating services buys no parallelism; it only couples their failure domains and their deploys. Scale with more processes and raise `max_concurrent`.
+The reverse (several *services* in one context) is legal but rarely what you want. One asyncio loop is one core, so co-locating services buys no parallelism; it only couples their failure domains and their deploys. Scale with more processes and raise `max_concurrent`.
 
 <details>
 <summary><b>What sharing actually saves</b></summary>
 
 <br/>
 
-Per context, at the broker: one connection, one exclusive auto-delete callback queue, and one channel each for the message dispatcher and the event dispatcher. Each `MessageService` adds its own channels on top of that — a request listener, an event listener and a cancel listener.
+Per context, at the broker: one connection, one exclusive auto-delete callback queue, and one channel each for the message dispatcher and the event dispatcher. Each `MessageService` adds its own channels on top of that: a request listener, an event listener and a cancel listener.
 
 Per context, in the process: one parsed descriptor pool. Schemas are the expensive half; a second context re-reads and re-parses every file on the paths.
 

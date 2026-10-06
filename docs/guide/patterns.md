@@ -8,9 +8,9 @@
 |---|---|
 | **Prerequisites** | [Getting Started](./getting-started.md) · [Error Handling](./error-handling.md) |
 | **Next** | [Testing](./testing.md) · [Configuration](../reference/configuration.md) |
-| **Source** | [`sample/combatGame`](../../sample/combatGame) — six services doing most of this at once |
+| **Source** | [`sample/combatGame`](../../sample/combatGame): six services doing most of this at once |
 
-**On this page** — [Concurrency](#concurrency-control) · [Retries](#retry-configuration) · [Events](#event-driven-patterns) · [Service to service](#service-to-service-calls) · [Shutdown](#graceful-shutdown-with-cleanup) · [Scaling out](#load-balancing-multiple-instances) · [Configuration](#environment-based-configuration) · [Docker](#docker-deployment) · [Resilience](#resilience-patterns)
+**On this page:** [Concurrency](#concurrency-control) · [Retries](#retry-configuration) · [Events](#event-driven-patterns) · [Service to service](#service-to-service-calls) · [Shutdown](#graceful-shutdown-with-cleanup) · [Scaling out](#load-balancing-multiple-instances) · [Configuration](#environment-based-configuration) · [Docker](#docker-deployment) · [Resilience](#resilience-patterns)
 
 > [!NOTE]
 > Most snippets below are written against **CLI-generated typing**
@@ -60,13 +60,13 @@ asyncio.run(main())
 
 | Workload Type | Recommended Concurrency |
 |---------------|------------------------|
-| CPU-bound (image processing, encryption) | **1** — one process is one core; run more processes instead, or hand the work to a `ProcessPoolExecutor` |
+| CPU-bound (image processing, encryption) | **1**: one process is one core; run more processes instead, or hand the work to a `ProcessPoolExecutor` |
 | I/O-bound (database, HTTP calls) | 10-50+ depending on downstream capacity |
 | Mixed | Start with 10, tune based on metrics |
 | Sequential required (order processing) | 1 (default) |
 
 > [!NOTE]
-> asyncio concurrency is cooperative. A handler that blocks the loop — a synchronous HTTP client, a CPU-heavy loop — blocks every other in-flight message and the heartbeat with it. Use async libraries, or `await asyncio.to_thread(...)` for the blocking part.
+> asyncio concurrency is cooperative. A handler that blocks the loop (a synchronous HTTP client, a CPU-heavy loop) blocks every other in-flight message and the heartbeat with it. Use async libraries, or `await asyncio.to_thread(...)` for the blocking part.
 
 ### Parallelism Benefits Example
 
@@ -232,7 +232,7 @@ class CheckoutService(RunnableService):
         return {"order_id": payment["transaction_id"]}
 ```
 
-The proxies share the service's context — one connection, one callback queue — so there is nothing extra to close.
+The proxies share the service's context (one connection, one callback queue), so there is nothing extra to close.
 
 ## Graceful Shutdown with Cleanup
 
@@ -308,7 +308,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The library's own timeouts are read from the environment already — `RPC_CALL_TIMEOUT_MS`, `MESSAGE_PROCESSING_TIMEOUT`, `PUBLISH_CONFIRM_TIMEOUT_MS` and the rest — see [Configuration](../reference/configuration.md).
+The library's own timeouts are read from the environment already (`RPC_CALL_TIMEOUT_MS`, `MESSAGE_PROCESSING_TIMEOUT`, `PUBLISH_CONFIRM_TIMEOUT_MS` and the rest); see [Configuration](../reference/configuration.md).
 
 ## Docker Deployment
 
@@ -349,7 +349,7 @@ services:
       replicas: 3  # Run 3 instances for load balancing
 ```
 
-`RunnableService.start` handles `SIGTERM`, so `docker stop` gets a drained, clean shutdown rather than a kill — as long as the Python process is PID 1 or receives the signal, which the exec-form `CMD` above guarantees.
+`RunnableService.start` handles `SIGTERM`, so `docker stop` gets a drained, clean shutdown rather than a kill, as long as the Python process is PID 1 or receives the signal, which the exec-form `CMD` above guarantees.
 
 ---
 
@@ -362,8 +362,8 @@ would around any remote call.
 
 ### Retry a call from the caller's side
 
-Protobus retries on the **server**. A caller that wants its own attempts — for a
-timeout, or a service that was briefly not running — needs its own loop, and must
+Protobus retries on the **server**. A caller that wants its own attempts (for a
+timeout, or a service that was briefly not running) needs its own loop, and must
 not retry a terminal failure:
 
 ```python
@@ -443,7 +443,7 @@ class CircuitBreaker:
 ### Graceful degradation
 
 When a dependency is optional, answer without it rather than failing the whole
-request — but say so in the response, so the caller can tell a real answer from a
+request, but say so in the response, so the caller can tell a real answer from a
 degraded one:
 
 ```python
@@ -472,8 +472,8 @@ def require_fields(request: dict, fields: list[str]) -> None:
         raise HandledError(f"missing required field(s): {', '.join(missing)}", "VALIDATION_ERROR")
 ```
 
-Remember that proto3 scalars decode to their zero value when unset — `""`, `0`,
-`False` — so `is None` catches only absent messages, `optional` fields and
+Remember that proto3 scalars decode to their zero value when unset (`""`, `0`,
+`False`), so `is None` catches only absent messages, `optional` fields and
 `oneof` members. For a required string, test `if not request.get("customer_id")`.
 
 ---

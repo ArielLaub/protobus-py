@@ -1,16 +1,16 @@
 # Custom Types
 
-> Teaching protobuf a scalar it does not have — `bigint`, `timestamp`, or one of your own — and the three rules that make it actually work.
+> Teaching protobuf a scalar it does not have (`bigint`, `timestamp`, or one of your own), and the three rules that make it actually work.
 
 **Read this if** you want a domain type to appear in a `.proto` as though it were built in, or you are looking at `unknown type 'money'` and cannot see what is wrong with your schema.
 
 | | |
 |---|---|
-| **Prerequisites** | [Schema Design](../guide/schema.md) — you have written a `.proto` |
+| **Prerequisites** | [Schema Design](../guide/schema.md): you have written a `.proto` |
 | **Next** | [Context](./api/context.md) · [Configuration](./configuration.md) |
 | **Source** | [`protobus/custom_types.py`](../../protobus/custom_types.py) · [`protobus/message_factory.py`](../../protobus/message_factory.py) · [`tests/unit/test_custom_types.py`](../../tests/unit/test_custom_types.py) |
 
-**On this page** — [What a custom type is](#what-a-custom-type-is) · [The API](#the-api) · [Worked example](#worked-example-money) · [When to register](#when-to-register) · [Registration is global](#registration-is-global) · [The built-ins](#the-built-ins) · [`CustomType` reference](#customtype-reference) · [Cross-language](#cross-language)
+**On this page:** [What a custom type is](#what-a-custom-type-is) · [The API](#the-api) · [Worked example](#worked-example-money) · [When to register](#when-to-register) · [Registration is global](#registration-is-global) · [The built-ins](#the-built-ins) · [`CustomType` reference](#customtype-reference) · [Cross-language](#cross-language)
 
 ---
 
@@ -36,14 +36,14 @@ service Api {
 
 `money` is not a protobuf type. On the wire that field is a one-field wrapper message carrying a plain `string`; in your handler it is whatever your `decode` returns. Nothing else in the message changes, and a peer that has not registered `money` still reads the field as a message with one string field.
 
-Under the hood a registration generates a message descriptor `message money { string value = 1; }` in a synthetic file, and the encoder and decoder convert at that boundary ([`protobus/custom_types.py`](../../protobus/custom_types.py), `wrapper_descriptor`). This is byte-for-byte the shape the TypeScript port produces, which is what makes `bigint` and `timestamp` interoperate.
+Internally, a registration generates a message descriptor `message money { string value = 1; }` in a synthetic file, and the encoder and decoder convert at that boundary ([`protobus/custom_types.py`](../../protobus/custom_types.py), `wrapper_descriptor`). This is byte-for-byte the shape the TypeScript port produces, which is what makes `bigint` and `timestamp` interoperate.
 
 ---
 
 ## The API
 
 > [!IMPORTANT]
-> The working API is **`context.factory.register_type(custom_type)`** — an instance method on `MessageFactory`, reached through `context.factory`.
+> The working API is **`context.factory.register_type(custom_type)`**, an instance method on `MessageFactory`, reached through `context.factory`.
 >
 > The module-level `register_custom_type()` is also exported, but it only fills the process-wide registry; it does not add the type to any factory's root, so a schema parsed by that factory still cannot see it. Use `register_type`.
 
@@ -110,12 +110,12 @@ class BillingApi(RunnableService):
         return {"id": request["id"], "total": Money(total.currency, total.cents + 50)}
 ```
 
-`py_type` is a **string that is emitted verbatim** into generated typing — `total: Money`. It is not checked against anything, and the generator does not import `Money` for you. Point it at a type your generated module can see, or you get typing that does not import.
+`py_type` is a **string that is emitted verbatim** into generated typing: `total: Money`. It is not checked against anything, and the generator does not import `Money` for you. Point it at a type your generated module can see, or you get typing that does not import.
 
 > [!TIP]
 > `encode` is called with whatever the application passed, which will not always be your type: a JSON body, a value round-tripped through a queue, a test fixture. `BigIntType.encode` accepts an `int`, a decimal string, a hex string and a whole-valued float for exactly this reason. Be similarly tolerant, and fail loudly on input you cannot represent rather than coercing it.
 >
-> A value that is *already* in wire form — a `dict` `{"value": ...}` — is accepted as-is, so a message decoded by one process can be re-encoded by another without conversion.
+> A value that is *already* in wire form (a `dict` `{"value": ...}`) is accepted as-is, so a message decoded by one process can be re-encoded by another without conversion.
 
 ---
 
@@ -131,26 +131,26 @@ Registration must happen **before the schema that uses the type is parsed**. Tha
 | `factory.init([])`, then `register_type()`, then `factory.parse(schema)` | works |
 | `factory.init([proto_dir])` where a file in `proto_dir` uses the type, then `register_type()` | **fails**: `ProtoParseError: unknown type 'money' …` |
 
-Both working orders are pinned by tests — `test_allows_registering_custom_types_before_init` and `test_supports_registering_types_after_init` in [`tests/unit/test_custom_types.py`](../../tests/unit/test_custom_types.py).
+Both working orders are pinned by tests: `test_allows_registering_custom_types_before_init` and `test_supports_registering_types_after_init` in [`tests/unit/test_custom_types.py`](../../tests/unit/test_custom_types.py).
 
 Since `Context.init()` calls `factory.init(proto_locations)` as its first statement ([`protobus/context.py`](../../protobus/context.py)), the practical rule for an application is simple:
 
 > [!IMPORTANT]
 > Register on `context.factory` **before** `await context.init(...)`. `context.factory` exists from the moment the `Context` is constructed, so there is no reason to leave it later.
 
-A service that supplies its own schema through `proto_file_name` rather than a proto directory has more room — that schema is parsed during `service.init()` — but the rule above is correct in both cases and costs nothing.
+A service that supplies its own schema through `proto_file_name` rather than a proto directory has more room (that schema is parsed during `service.init()`), but the rule above is correct in both cases and costs nothing.
 
 ---
 
 ## Registration is global
 
 > [!CAUTION]
-> **A custom type is process-wide, not per factory.** `register_type` writes a module-level registry that every `MessageFactory` in the process reads at encode and decode time. Names are therefore global: the last registration of a name wins, and every factory sees it. Two factories cannot hold different definitions of `money`. Namespace your names — `acme_money`, not `money` — if the process hosts more than one schema, or if you publish a library that registers types.
+> **A custom type is process-wide, not per factory.** `register_type` writes a module-level registry that every `MessageFactory` in the process reads at encode and decode time. Names are therefore global: the last registration of a name wins, and every factory sees it. Two factories cannot hold different definitions of `money`. Namespace your names (`acme_money`, not `money`) if the process hosts more than one schema, or if you publish a library that registers types.
 
-Only the addition to a factory's root is per instance — which is why two factories do not otherwise share state (`test_two_factories_do_not_share_state`).
+Only the addition to a factory's root is per instance, which is why two factories do not otherwise share state (`test_two_factories_do_not_share_state`).
 
 > [!NOTE]
-> **Registering the same name twice is allowed** and refreshes its codec, so the last definition of a name wins. Re-registering a built-in "to be safe" — `factory.register_type(BigIntType)` — does what it looks like it does.
+> **Registering the same name twice is allowed** and refreshes its codec, so the last definition of a name wins. Re-registering a built-in "to be safe" (`factory.register_type(BigIntType)`) does what it looks like it does.
 >
 > One re-registration is refused, with `CustomTypeConflictError`: one that changes `wire_type`. The wrapper message is fixed at first registration, so accepting it would go on encoding in the original wire format while the caller believed it had changed.
 
@@ -164,7 +164,7 @@ Only the addition to a factory's root is per instance — which is why two facto
 
 | | |
 |---|---|
-| Wire type | `bytes` — **up to 32 bytes, big-endian, unsigned** (uint256-compatible); encoded at the full 32 bytes |
+| Wire type | `bytes`: **up to 32 bytes, big-endian, unsigned** (uint256-compatible); encoded at the full 32 bytes |
 | Decodes to | `int` |
 | Accepts | `int`, decimal string, `0x` hex string, whole-valued `float`; `None` encodes as 0 |
 | Range | `0` … `2^256 - 1` (`BIGINT_MAX`) |
@@ -183,21 +183,21 @@ from protobus import bigint_to_bytes, bytes_to_bigint
 wire = bigint_to_bytes("0xdeadbeef")      # 32 bytes, big-endian
 print(len(wire))                          # 32
 print(bytes_to_bigint(wire))              # 3735928559
-print(bytes_to_bigint(b""))               # 0 — empty decodes to zero
+print(bytes_to_bigint(b""))               # 0: empty decodes to zero
 ```
 
 ### `timestamp`
 
 | | |
 |---|---|
-| Wire type | `int64` — milliseconds since the Unix epoch |
+| Wire type | `int64`: milliseconds since the Unix epoch |
 | Decodes to | a **timezone-aware UTC** `datetime` |
 | Accepts | `datetime`, `int`/`float` (ms), ISO-8601 string (a trailing `Z` is understood) |
 
-A naive `datetime` is read in the process's local timezone, which is what `datetime.timestamp()` does — pass aware datetimes when the process timezone is not the one you mean (`test_a_naive_datetime_is_read_in_local_time`). Decoding to UTC rather than local time means the value round-trips identically on every machine and compares equal to what the TypeScript port's `Date` represents: an absolute instant.
+A naive `datetime` is read in the process's local timezone, which is what `datetime.timestamp()` does; pass aware datetimes when the process timezone is not the one you mean (`test_a_naive_datetime_is_read_in_local_time`). Decoding to UTC rather than local time means the value round-trips identically on every machine and compares equal to what the TypeScript port's `Date` represents: an absolute instant.
 
 > [!NOTE]
-> `timestamp` is protobus's own type, unrelated to `google.protobuf.Timestamp`. On the wire it is a single `int64`, not a `{seconds, nanos}` message, so a non-protobus consumer reading the field sees milliseconds. That is deliberate — it is cheaper and it survives a peer that knows nothing about custom types — but it is not interchangeable with the well-known type.
+> `timestamp` is protobus's own type, unrelated to `google.protobuf.Timestamp`. On the wire it is a single `int64`, not a `{seconds, nanos}` message, so a non-protobus consumer reading the field sees milliseconds. That is deliberate (it is cheaper and it survives a peer that knows nothing about custom types), but it is not interchangeable with the well-known type.
 
 ---
 
@@ -239,13 +239,13 @@ message Holding {
 
 Map keys are untouched; an empty map stays empty.
 
-Custom types nest. A `bigint` three messages deep round-trips correctly, including inside self-referential messages — `test_round_trips_a_bigint_one_two_and_three_levels_deep` and `test_encodes_a_self_referential_message` pin it.
+Custom types nest. A `bigint` three messages deep round-trips correctly, including inside self-referential messages; `test_round_trips_a_bigint_one_two_and_three_levels_deep` and `test_encodes_a_self_referential_message` pin it.
 
 ---
 
 ## Cross-language
 
-The wrapper-message encoding is shared with the TypeScript port, so a `bigint` or `timestamp` written by one is read by the other — [`tests/integration/test_cross_language.py`](../../tests/integration/test_cross_language.py) round-trips both through a TypeScript server. A custom type of your own interoperates the same way provided both sides register the same `name` with the same `wire_type` and agree on the bytes; `py_type` and `tsType` are local to each port's code generator and never travel.
+The wrapper-message encoding is shared with the TypeScript port, so a `bigint` or `timestamp` written by one is read by the other. [`tests/integration/test_cross_language.py`](../../tests/integration/test_cross_language.py) round-trips both through a TypeScript server. A custom type of your own interoperates the same way provided both sides register the same `name` with the same `wire_type` and agree on the bytes; `py_type` and `tsType` are local to each port's code generator and never travel.
 
 ---
 
