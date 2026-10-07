@@ -15,9 +15,10 @@ failover, backpressure, retries and dead-lettering are handled by the broker
 instead of in Python.
 
 This is the Python port of [protobus](https://github.com/ArielLaub/protobus)
-(TypeScript), alongside [protobus-go](https://github.com/ArielLaub/protobus-go) (Go) and
-[protobus-cpp](https://github.com/ArielLaub/protobus-cpp) (C++). All four are
-**wire-compatible**: a Python service serves TypeScript, Go and C++ callers and
+(TypeScript), alongside [protobus-go](https://github.com/ArielLaub/protobus-go) (Go),
+[protobus-cpp](https://github.com/ArielLaub/protobus-cpp) (C++) and
+[protobus-java](https://github.com/ArielLaub/protobus-java) (Java). All five are
+**wire-compatible**: a Python service serves TypeScript, Go, C++ and Java callers and
 vice versa, streaming, events, custom types and error codes included; see
 [Other languages](docs/README.md#other-languages). Every commit runs a cross-language suite in both directions
 against a live broker and a pinned TypeScript revision (2.5.0) to keep it
