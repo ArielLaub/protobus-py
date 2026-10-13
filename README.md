@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ArielLaub/protobus-py/main/docs/assets/banner.jpg" alt="ProtoBus: many languages, one message bus. A thin layer over Protocol Buffers and RabbitMQ." width="100%">
+</p>
+
 # ProtoBus for Python
 
 **RabbitMQ-native microservices for Python, with Protocol Buffers on the wire.**
@@ -6,7 +10,7 @@
 [![python](https://img.shields.io/badge/python-%E2%89%A53.10-3776AB?logo=python&logoColor=white)](https://www.python.org)
 [![RabbitMQ](https://img.shields.io/badge/RabbitMQ-%E2%89%A53.8-FF6600?logo=rabbitmq&logoColor=white)](https://www.rabbitmq.com)
 [![CI](https://github.com/ArielLaub/protobus-py/actions/workflows/ci.yml/badge.svg)](https://github.com/ArielLaub/protobus-py/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/ArielLaub/protobus-py/blob/main/LICENSE)
 
 Define a service in a `.proto` file, implement it as a class, and call it from
 anywhere on the bus as if it were local. ProtoBus turns each service into **one
@@ -15,15 +19,15 @@ failover, backpressure, retries and dead-lettering are handled by the broker
 instead of in Python.
 
 This is the Python port of [protobus](https://github.com/ArielLaub/protobus)
-(TypeScript), alongside [protobus-go](https://github.com/ArielLaub/protobus-go) (Go),
-[protobus-cpp](https://github.com/ArielLaub/protobus-cpp) (C++) and
-[protobus-java](https://github.com/ArielLaub/protobus-java) (Java). All five are
-**wire-compatible**: a Python service serves TypeScript, Go, C++ and Java callers and
-vice versa, streaming, events, custom types and error codes included; see
-[Other languages](docs/README.md#other-languages). Every commit runs a cross-language suite in both directions
-against a live broker and a pinned TypeScript revision (2.5.0) to keep it
-that way; the behavioural differences that remain are listed in
-[Known Issues](docs/operations/known-issues.md#differences-from-the-typescript-port).
+(TypeScript). The ports are **wire-compatible**: a Python service serves callers
+written for any of them and the other way round, with streaming, events, custom
+types and error codes included. They are listed under
+[Wire compatibility](#wire-compatibility).
+
+**Status: stable.** 2.0.0 is the current release. Every commit runs a
+cross-language suite in both directions against a live broker and a pinned
+TypeScript revision (2.5.0); the behavioural differences that remain are listed
+in [Known Issues](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/known-issues.md#differences-from-the-typescript-port).
 
 ---
 
@@ -33,13 +37,18 @@ that way; the behavioural differences that remain are listed in
 pip install protobus
 ```
 
+No `protoc` is needed: `.proto` files are parsed at runtime. `protobus
+generate` writes Python typing for them when you want it (see
+[CLI](https://github.com/ArielLaub/protobus-py/blob/main/docs/reference/cli.md)).
+The runtime depends on [aiormq](https://github.com/mosquito/aiormq) for AMQP
+and [protobuf](https://pypi.org/project/protobuf/) for the wire.
+
 You also need a RabbitMQ 3.8+ broker:
 
 ```bash
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management-alpine
+export AMQP_URL=amqp://guest:guest@localhost:5672/
 ```
-
-No `protoc` is needed: `.proto` files are parsed at runtime.
 
 ---
 
@@ -68,7 +77,9 @@ service Math {
 }
 ```
 
-Package plus service name is the service's name on the bus: `Calculator.Math`.
+The package plus the service name is the service's name on the bus:
+`Calculator.Math`. The file is an ordinary protobus schema, shared as-is with
+the other languages.
 
 ### 2. Implement it
 
@@ -135,8 +146,11 @@ $ python client.py
 5 + 3 = 8
 ```
 
-Full walkthrough, including events and the project layout:
-**[Getting Started](docs/guide/getting-started.md)**.
+A call is bounded by `RPC_CALL_TIMEOUT_MS` (10 minutes by default, as in the
+other ports) unless you pass `timeout_ms`.
+
+The full walkthrough adds events, error handling and the project layout:
+**[Getting Started](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/getting-started.md)**.
 
 ---
 
@@ -152,7 +166,7 @@ broker instead of being reimplemented above it:
 | Load balancing | competing consumers on one queue |
 | Routing | topic exchange bindings (`REQUEST.<Service>.*`) |
 | Redelivery on consumer loss | late ack: an unacked delivery returns to the queue |
-| Retry delay | the retry queue's `x-message-ttl`, drained by DLX |
+| Retry delay | the retry queue's `x-message-ttl`, drained by a dead-letter exchange |
 | Persistence | durable queues, persistent messages |
 | Dead letters | a real `<Service>.DLQ` |
 | Priority | native queue priorities |
@@ -162,189 +176,249 @@ instances, so nothing holds a stale one, and a consumer that dies mid-request
 leaves its delivery unacked for the next consumer to take.
 
 The cost of this is written down rather than glossed over; read
-[Delivery Guarantees](docs/concepts/delivery-guarantees.md) before you rely on
-any of it. If you may need to swap RabbitMQ for another broker, use a
-transport-agnostic framework instead; that is a real feature and protobus does
-not have it.
+[Delivery Guarantees](https://github.com/ArielLaub/protobus-py/blob/main/docs/concepts/delivery-guarantees.md)
+before you rely on any of it. If you may need to swap RabbitMQ for another
+broker, use a transport-agnostic framework instead. That is a real feature and
+protobus does not have it.
 
 ### Protocol Buffers, not JSON
 
-- **Usually smaller on the wire**: field numbers and packed integers rather
-  than text; how much smaller depends on the payload.
-- **Contract-first**: a `.proto` file is the interface between teams, and
-  generated typing (`protobus generate`) tells you when the two drift apart.
-- **Versioning by field number**: adding a field does not break an old peer.
+- **Contract-first.** The `.proto` file is the interface between teams and
+  languages, and generated typing (`protobus generate`) tells you when the two
+  drift apart.
+- **Versioning by field number.** Adding a field does not break an old peer.
+- **Usually smaller on the wire**, since fields travel as numbers and packed
+  binary rather than text.
 
-### Two runtime dependencies
+### A small protocol, a small port
 
-[`aiormq`](https://github.com/mosquito/aiormq) for AMQP and
-[`protobuf`](https://pypi.org/project/protobuf/) for the wire. The messaging
-behaviour that would be hardest to reimplement (queueing, consumer
-distribution, retry delays, dead-lettering) is RabbitMQ's.
+The protocol protobus adds on top of AMQP is small and documented: five
+envelope messages, a routing-key convention, an error encoding and two
+streaming headers. Because queueing, consumer distribution and retry delays
+belong to the broker, a port adapts that protocol to another AMQP client
+rather than reimplementing messaging. This port has two runtime dependencies,
+[aiormq](https://github.com/mosquito/aiormq) for AMQP and
+[protobuf](https://pypi.org/project/protobuf/) for the wire, and brings no
+framework: a service is a class with one `async def` per rpc.
 
 ---
 
-## Streaming, cancellation, events, priority
+## Features
+
+- **Retries and dead-lettering.** An unhandled exception or a processing
+  timeout parks the request on `<Service>.Retry` and redelivers it; after
+  `max_retries` (3 by default, 5 seconds apart) it lands on `<Service>.DLQ`,
+  and the caller is answered with the final error. A `HandledError` is an
+  answer and is never retried. See
+  [Error Handling](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/error-handling.md).
+- **Server streaming.** A method declared `returns (stream T)` is implemented
+  as an async generator and consumed with `async for`. Closing the stream
+  early, or firing an abort signal, stops the producer on the server. See
+  [Streaming](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/streaming.md).
+- **Events.** `publish_event` publishes on a topic exchange; `subscribe_event`
+  receives events by message type, topic pattern (`*`, `#`) or both, with
+  optional per-listener retries and a dead-letter queue. See
+  [Events](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/events.md).
+- **Custom types.** `bigint` (unsigned 256-bit, decoded to `int`) and
+  `timestamp` (milliseconds since the epoch, decoded to a timezone-aware
+  `datetime`) are built in as `BigIntType` and `TimestampType`, already
+  registered. Register your own `CustomType` and it becomes a field type in
+  your schemas. See
+  [Custom Types](https://github.com/ArielLaub/protobus-py/blob/main/docs/reference/custom-types.md).
+- **Priority.** `max_priority` makes a service queue a priority queue, and a
+  call's `priority` lets a control message overtake a bulk backlog. See
+  [Priority](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/priority.md).
+- **Instance-named services.** Many instances can serve one contract under
+  their own names (`Combat.Player.player6`), each addressed by its own proxy.
+- **Processing timeout.** `processing_timeout_ms` caps one attempt at a unary
+  request; the handler's `context.signal` fires and the attempt counts as
+  failed.
+- **Reconnection.** A lost connection is re-established with capped
+  exponential backoff, and every queue, binding and consumer is restored
+  before the connection reports itself ready. Calls made meanwhile wait for
+  it; calls in flight when it dropped fail with `DisconnectedError`.
+- **Publisher confirms.** Every publish waits for the broker's confirm. A
+  failure is a `PublishError` that says whether the outcome is definite or
+  ambiguous, and a caller-supplied `message_id` makes a republish safe to
+  deduplicate. This is at-least-once territory, written down in
+  [Delivery Guarantees](https://github.com/ArielLaub/protobus-py/blob/main/docs/concepts/delivery-guarantees.md).
+- **Logging, your way.** Structured records for your own sink, or plain lines
+  through the `logging` module. See
+  [Logging](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/logging.md).
+- **CLI.** `protobus generate` writes Python typing (`TypedDict` / `Protocol`)
+  from your schemas, `protobus generate:service Name` a runnable service stub,
+  configured from `[tool.protobus]` in `pyproject.toml`. See
+  [CLI](https://github.com/ArielLaub/protobus-py/blob/main/docs/reference/cli.md).
+- **Graceful shutdown.** `RunnableService` stops intake on SIGINT/SIGTERM, lets
+  in-flight work finish, runs your `cleanup()`, then disconnects.
+
+### A short tour
 
 ```python
-# A server-streaming rpc (`returns (stream Token)`) is an async generator.
-async def generate(self, request, actor, correlation_id, context):
-    for i, word in enumerate(words):
-        if context.signal.aborted:      # the caller stopped listening
-            return
-        yield {"index": i, "text": word}
+from protobus import Config, Context, RetryOptions, RunnableService, ServiceProxy
 
-# The client consumes it with `async for`; closing the stream tells the
-# server to stop producing.
-async with assistant.generate({"prompt": "..."}) as stream:
-    async for token in stream:
-        print(token["text"], end="")
-        if enough:
-            break
+
+class CalculatorService(RunnableService):
+    service_name = "Calculator.Math"
+
+    async def add(self, request: dict, actor: str, correlation_id: str) -> dict:
+        return {"result": request["a"] + request["b"]}
+
+
+async def on_calculated(event: dict, event_type: str, topic: str) -> None:
+    print(event["operation"])
+
+
+async def tour(context: Context) -> None:
+    # Options on a service: concurrency, retries, a processing timeout and a
+    # priority queue. launch() returns the running service; start() blocks.
+    service = await CalculatorService.launch(
+        context,
+        max_concurrent=16,
+        retry=RetryOptions(max_retries=5, retry_delay_ms=10000),
+        processing_timeout_ms=30000,
+        max_priority=Config.RECOMMENDED_MAX_PRIORITY,
+    )
+
+    # Options on a call: an actor, a timeout and a priority.
+    calculator = ServiceProxy(context, "Calculator.Math")
+    await calculator.init()
+    await calculator.add({"a": 1, "b": 2}, "billing-job", True, 5000, priority=Config.PRIORITY_HIGH)
+
+    # Events: subscribe by type, publish from anywhere on the bus.
+    await service.subscribe_event("Calculator.Calculated", on_calculated)
+    await context.publish_event("Calculator.Calculated", {"operation": "add"})
 ```
-
-Events are published to a topic exchange and matched with `*` and `#`
-wildcards; an opt-in retry ladder gives event handlers the same retry/DLQ
-treatment requests get. Priority queues let a control message overtake a bulk
-backlog. See [Streaming](docs/guide/streaming.md),
-[Events](docs/guide/events.md) and [Priority](docs/guide/priority.md).
-
----
-
-## Custom types
-
-Protobuf's scalars do not cover everything. Register a custom type and it becomes
-usable as a field type in your schemas, encoded and decoded transparently:
 
 ```python
-from protobus import Context, CustomType
+from protobus import MessageService
 
-UuidType = CustomType(
-    name="uuid",            # how it is written in the .proto
-    wire_type="string",     # how it travels
-    encode=lambda value: str(value),
-    decode=lambda data: data,
-    py_type="str",          # what generated typing calls it
-)
 
-context = Context()
-# Register before init(): init() parses your .proto files, and a schema
-# using `uuid` cannot be parsed until the type exists.
-context.factory.register_type(UuidType)
-await context.init("amqp://localhost", ["./proto"])
+# Streaming, server side: an async generator; each yield is one chunk.
+class Assistant(MessageService):
+    service_name = "Chat.Assistant"
+    proto_file_name = "chat.proto"
+
+    async def generate(self, request, actor, correlation_id, context):
+        for index, text in enumerate(["hello", "from", "python"]):
+            if context.signal.aborted:      # the caller has gone: stop producing
+                return
+            yield {"index": index, "text": text}
+
+
+# Client side: `async for` over the proxy's stream; leaving the `async with`
+# block tells the server to stop.
+async def read(assistant):
+    async with assistant.generate({"prompt": "hi"}) as stream:
+        async for token in stream:
+            print(token["text"], end=" ")
+            if token["index"] == 1:
+                break
 ```
-
-```protobuf
-syntax = "proto3";
-package Accounts;
-
-message Account {
-    uuid id = 1;
-}
-```
-
-`BigIntType` (an unsigned 256-bit integer, decoded to `int`) and
-`TimestampType` (milliseconds since the epoch, decoded to a timezone-aware
-`datetime`) ship with the library and are already registered. They are the
-same wire format the TypeScript port uses.
-**[Custom Types](docs/reference/custom-types.md)**.
 
 ---
 
-## CLI
+## Concurrency
 
-```bash
-protobus generate               # .proto -> Python typing (TypedDict / Protocol)
-protobus generate:service Name  # a runnable service stub from Name.proto
-protobus init                   # print project setup instructions
-```
+One process is one asyncio event loop. Handlers run concurrently as
+coroutines, never in parallel, so they share state freely; a handler that
+blocks the loop (a synchronous driver, `time.sleep`, a CPU-bound loop) stalls
+every other in-flight message on that replica, so hand blocking work to
+`asyncio.to_thread` or run more replicas. The number in flight is bounded by
+the consumer's prefetch: `max_concurrent` for a service (default 1, one
+request at a time), `DEFAULT_PREFETCH` for event handling (also 1). A
+streaming handler holds its slot for the life of its stream.
 
-Configured from `pyproject.toml`:
+Create one `Context` per process and share it between services and proxies.
+See
+[Architecture](https://github.com/ArielLaub/protobus-py/blob/main/docs/concepts/architecture.md)
+and
+[Patterns](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/patterns.md).
 
-```toml
-[tool.protobus]
-proto_dir = "./proto"
-types_output = "./types/proto.py"
-services_dir = "./services"
-```
+---
 
-All three keys are optional; the defaults above are what the CLI uses.
-**[CLI reference](docs/reference/cli.md)**.
+## Wire compatibility
+
+protobus-py speaks the protobus wire protocol exactly as TypeScript protobus
+2.5 and the other ports do: the same exchanges, queues, envelopes (byte for
+byte), headers and error codes, and the same environment variables for
+configuration. Replicas of one service in different languages can share its
+queue and climb one retry ladder together. The cross-language suite runs
+Python against the TypeScript library over a real broker, in both directions,
+and every newer port runs its own suite against this one.
+
+| Language | Repo | Status |
+|---|---|---|
+| TypeScript | [protobus](https://github.com/ArielLaub/protobus) | stable (reference) |
+| Python | [protobus-py](https://github.com/ArielLaub/protobus-py) (this repository) | stable |
+| Go | [protobus-go](https://github.com/ArielLaub/protobus-go) | stable |
+| C++ | [protobus-cpp](https://github.com/ArielLaub/protobus-cpp) | new |
+| Java | [protobus-java](https://github.com/ArielLaub/protobus-java) | new |
+| C# | [protobus-csharp](https://github.com/ArielLaub/protobus-csharp) | new |
+| Rust | [protobus-rs](https://github.com/ArielLaub/protobus-rs) | new |
+
+The wire format and the round trip are in
+**[Message Flow](https://github.com/ArielLaub/protobus-py/blob/main/docs/concepts/message-flow.md)**;
+the behavioural differences from the TypeScript port are in
+**[Known Issues](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/known-issues.md#differences-from-the-typescript-port)**.
 
 ---
 
 ## Documentation
 
-Full index: **[docs/](docs/README.md)**
+Full index: **[docs/](https://github.com/ArielLaub/protobus-py/blob/main/docs/README.md)**
 
 | Start | |
 |---|---|
-| [Getting Started](docs/guide/getting-started.md) | zero to a working RPC, plus events |
-| [Schema Design](docs/guide/schema.md) | writing the `.proto` that is your contract |
-| [Events](docs/guide/events.md) | publish/subscribe and wildcard topics |
-| [Error Handling](docs/guide/error-handling.md) | retriable vs terminal, the retry ladder, the DLQ |
-| [Testing](docs/guide/testing.md) | unit, integration and end-to-end |
+| [Getting Started](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/getting-started.md) | zero to a working RPC, plus events |
+| [Schema Design](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/schema.md) | writing the `.proto` that is your contract |
+| [Events](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/events.md) | publish/subscribe and wildcard topics |
+| [Streaming](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/streaming.md) | server streaming and cancellation |
+| [Error Handling](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/error-handling.md) | retriable vs terminal, the retry ladder, the DLQ |
+| [Patterns](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/patterns.md) | concurrency, retries, service-to-service calls, deployment |
+| [Testing](https://github.com/ArielLaub/protobus-py/blob/main/docs/guide/testing.md) | unit, integration and end-to-end |
 
 | Understand it | |
 |---|---|
-| [Architecture](docs/concepts/architecture.md) | what a service creates in the broker, and why |
-| [Message Flow](docs/concepts/message-flow.md) | the wire format and the round trip |
-| [Delivery Guarantees](docs/concepts/delivery-guarantees.md) | acks, confirms, duplicates, the parked caller |
+| [Architecture](https://github.com/ArielLaub/protobus-py/blob/main/docs/concepts/architecture.md) | what a service creates in the broker, and why |
+| [Message Flow](https://github.com/ArielLaub/protobus-py/blob/main/docs/concepts/message-flow.md) | the wire format and the round trip |
+| [Delivery Guarantees](https://github.com/ArielLaub/protobus-py/blob/main/docs/concepts/delivery-guarantees.md) | acks, confirms, duplicates, the parked caller |
 
 | Look it up | |
 |---|---|
-| [Configuration](docs/reference/configuration.md) | every environment variable and its default |
-| [API reference](docs/reference/api) | Context, MessageService, RunnableService, ServiceProxy |
-| [Errors](docs/reference/errors.md) | every exported error class and when it is raised |
-| [Custom Types](docs/reference/custom-types.md) | extending the type system |
+| [Configuration](https://github.com/ArielLaub/protobus-py/blob/main/docs/reference/configuration.md) | every environment variable and its default |
+| [API reference](https://github.com/ArielLaub/protobus-py/tree/main/docs/reference/api) | Context, MessageService, RunnableService, ServiceProxy |
+| [Errors](https://github.com/ArielLaub/protobus-py/blob/main/docs/reference/errors.md) | every exported error class and when it is raised |
+| [Custom Types](https://github.com/ArielLaub/protobus-py/blob/main/docs/reference/custom-types.md) | extending the type system |
+| [CLI](https://github.com/ArielLaub/protobus-py/blob/main/docs/reference/cli.md) | `generate`, `generate:service`, `init` |
 
 | Run it | |
 |---|---|
-| [Troubleshooting](docs/operations/troubleshooting.md) | symptom, cause, fix |
-| [Security](docs/operations/security.md) | what `actor` does and does not prove |
-| [Logging](docs/operations/logging.md) | levels, structured records, your own sink |
-| [Queue Migration](docs/operations/queue-migration.md) | changing settings on live queues |
-| [Known Issues](docs/operations/known-issues.md) | current limitations |
-| [Migration Guide](docs/migration.md) | upgrading from 1.x to 2.0 |
+| [Troubleshooting](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/troubleshooting.md) | symptom, cause, fix |
+| [Security](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/security.md) | what `actor` does and does not prove |
+| [Logging](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/logging.md) | levels, structured records, your own sink |
+| [Queue Migration](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/queue-migration.md) | changing settings on live queues |
+| [Known Issues](https://github.com/ArielLaub/protobus-py/blob/main/docs/operations/known-issues.md) | current limitations |
+| [Migration Guide](https://github.com/ArielLaub/protobus-py/blob/main/docs/migration.md) | upgrading from 1.x to 2.0 |
 
 ---
 
-## See a real system in a minute
+## Examples
+
+| Example | Shows |
+|---|---|
+| [`sample/combatGame`](https://github.com/ArielLaub/protobus-py/tree/main/sample/combatGame) | Six instances of one service playing a game over RPC and events, with graceful shutdown |
+| [`sample/tokenStream`](https://github.com/ArielLaub/protobus-py/tree/main/sample/tokenStream) | Streaming tokens like a language model, with cancellation stopping the producer |
 
 ```bash
 git clone https://github.com/ArielLaub/protobus-py && cd protobus-py
 python -m venv venv && venv/bin/pip install -e ".[dev]"
 docker compose up -d
-PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh
+PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh   # asserts that exactly one player survived
 ```
-
-Six services fight a battle royale over the bus (RPC, published events and
-graceful shutdown in one run), and the script asserts exactly one player
-survived. The source is [`sample/combatGame`](sample/combatGame). A second
-sample, [`sample/tokenStream`](sample/tokenStream), streams tokens like an LLM
-and shows cancellation actually stopping the producer.
 
 ---
 
-## Requirements
-
-- Python 3.10+ (CI runs 3.10 to 3.13)
-- RabbitMQ 3.8+
-
-## Development
-
-```bash
-python -m pytest tests/unit                 # unit suite, no broker needed
-docker compose up -d
-python -m pytest tests/integration          # against RabbitMQ (management API at :15672 for the recovery tests)
-PYTHON=$PWD/venv/bin/python scripts/run-combat-sample.sh
-```
-
-The cross-language suite (`tests/integration/test_cross_language.py`) expects
-the TypeScript checkout built beside this repo, or `PROTOBUS_TS` pointing at
-it; the mirror test in that repo drives a Python server from a TypeScript
-client.
-
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/ArielLaub/protobus-py/blob/main/LICENSE).
